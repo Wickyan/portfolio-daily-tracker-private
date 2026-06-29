@@ -4,10 +4,11 @@ services:
     build:
       context: ./dashboard
       dockerfile: backend/Dockerfile
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     volumes:
       - ./engine/portfolio:/app/portfolio:ro
+      - ./dashboard/data:/app/data
       - ./dashboard/config.json:/app/config.json
     environment:
       - PORTFOLIO_DIR=/app/portfolio
@@ -18,9 +19,22 @@ services:
     build:
       context: ./dashboard/frontend
       dockerfile: Dockerfile
-    ports:
-      - "55589:3000"
+    expose:
+      - "3000"
     depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Internal access gateway with Basic Auth
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "55589:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - frontend
       - backend
     restart: unless-stopped
 
