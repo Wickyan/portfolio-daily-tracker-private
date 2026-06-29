@@ -12,10 +12,15 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+.cache/
 
 # Logs
 *.log
 logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # ── Engine: keep examples, ignore user data ──
 engine/portfolio/config.json
@@ -46,6 +51,14 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # ── Docker ──
 .env
+.env.*
+!.env.example
+docker-compose.override.yml
