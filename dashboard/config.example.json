@@ -40,6 +40,22 @@
         }
       ]
     },
+    "deepseek": {
+      "name": "DeepSeek",
+      "description": "DeepSeek OpenAI-compatible API",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "headers": null,
+      "provider_type": "openai",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek Chat",
+          "description": "DeepSeek chat model",
+          "supports_vision": false
+        }
+      ]
+    },
     "openai_compatible": {
       "name": "OpenAI-Compatible API",
       "description": "Any OpenAI-compatible API endpoint (DeepSeek, Qwen, etc.)",

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Settings as SettingsIcon, Server, Cpu, Save, DollarSign, Loader2 } from 'lucide-react'
+import { Settings as SettingsIcon, Server, Cpu, Save, DollarSign, Loader2, KeyRound } from 'lucide-react'
 
 interface ModelInfo {
   id: string
@@ -22,6 +22,14 @@ interface ConfigResponse {
   available_models: ModelInfo[]
 }
 
+interface LLMConfigResponse {
+  api_group: string
+  base_url: string
+  model: string
+  api_key_configured: boolean
+  api_key_masked: string
+}
+
 export default function Settings() {
   const queryClient = useQueryClient()
   const [apiUrl] = useState('http://localhost:8000')
@@ -29,12 +37,26 @@ export default function Settings() {
   const [selectedApiGroup, setSelectedApiGroup] = useState('')
   const [cash, setCash] = useState(50000)
   const [saveMessage, setSaveMessage] = useState('')
+  const [llmMessage, setLlmMessage] = useState('')
+  const [llmApiGroup, setLlmApiGroup] = useState('deepseek')
+  const [llmBaseUrl, setLlmBaseUrl] = useState('https://api.deepseek.com/v1')
+  const [llmApiKey, setLlmApiKey] = useState('')
+  const [llmModel, setLlmModel] = useState('deepseek-chat')
 
   // 获取配置
   const { data: config, isLoading } = useQuery<ConfigResponse>({
     queryKey: ['settings'],
     queryFn: async () => {
       const res = await fetch('/api/settings/config')
+      return res.json()
+    }
+  })
+
+  const { data: llmConfig } = useQuery<LLMConfigResponse>({
+    queryKey: ['settings', 'llm'],
+    queryFn: async () => {
+      const res = await fetch('/api/settings/llm')
+      if (!res.ok) throw new Error('获取 LLM 配置失败')
       return res.json()
     }
   })
@@ -61,6 +83,15 @@ export default function Settings() {
       setCash(portfolio.cash)
     }
   }, [portfolio])
+
+  useEffect(() => {
+    if (llmConfig) {
+      setLlmApiGroup(llmConfig.api_group || 'deepseek')
+      setLlmBaseUrl(llmConfig.base_url || 'https://api.deepseek.com/v1')
+      setLlmModel(llmConfig.model || 'deepseek-chat')
+      setLlmApiKey('')
+    }
+  }, [llmConfig])
 
   // 当API组改变时，重置模型选择为该组的第一个模型
   useEffect(() => {
@@ -124,6 +155,65 @@ export default function Settings() {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
       setSaveMessage('现金余额更新成功！')
       setTimeout(() => setSaveMessage(''), 3000)
+    }
+  })
+
+  const testLlmMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/settings/llm/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_group: llmApiGroup,
+          base_url: llmBaseUrl,
+          api_key: llmApiKey,
+          model: llmModel
+        })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.message || '测试连接失败')
+      }
+      return data
+    },
+    onSuccess: (data) => {
+      setLlmMessage(data.message || '连接成功')
+      setTimeout(() => setLlmMessage(''), 5000)
+    },
+    onError: (error) => {
+      setLlmMessage(error instanceof Error ? error.message : '测试连接失败')
+      setTimeout(() => setLlmMessage(''), 5000)
+    }
+  })
+
+  const saveLlmMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/settings/llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_group: llmApiGroup,
+          base_url: llmBaseUrl,
+          api_key: llmApiKey,
+          model: llmModel
+        })
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.detail || '保存配置失败')
+      }
+      return data
+    },
+    onSuccess: () => {
+      setLlmApiKey('')
+      queryClient.invalidateQueries({ queryKey: ['settings'] })
+      queryClient.invalidateQueries({ queryKey: ['settings', 'llm'] })
+      setLlmMessage('DeepSeek API 配置已保存并热重载')
+      setTimeout(() => setLlmMessage(''), 5000)
+    },
+    onError: (error) => {
+      setLlmMessage(error instanceof Error ? error.message : '保存配置失败')
+      setTimeout(() => setLlmMessage(''), 5000)
     }
   })
 
@@ -206,6 +296,93 @@ export default function Settings() {
                 可用模型: {currentGroup?.models.length || 0} 个
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* DeepSeek API 配置 */}
+      <div className="bg-slate-800 rounded-lg p-6">
+        <h2 className="text-xl font-semibold flex items-center mb-4">
+          <KeyRound className="h-5 w-5 mr-2" />
+          DeepSeekAPI配置
+        </h2>
+        {llmMessage && (
+          <div className={`mb-4 border rounded-lg p-3 ${
+            llmMessage.includes('失败') || llmMessage.includes('错误') || llmMessage.includes('不能为空')
+              ? 'bg-red-500/10 border-red-500 text-red-400'
+              : 'bg-green-500/10 border-green-500 text-green-400'
+          }`}>
+            {llmMessage}
+          </div>
+        )}
+        <div className="space-y-4">
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">API组</label>
+            <select
+              value={llmApiGroup}
+              onChange={(e) => setLlmApiGroup(e.target.value)}
+              className="w-full bg-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            >
+              <option value="deepseek">deepseek</option>
+              <option value="openai_compatible">openai_compatible</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">BaseURL</label>
+            <input
+              type="text"
+              value={llmBaseUrl}
+              onChange={(e) => setLlmBaseUrl(e.target.value)}
+              placeholder="https://api.deepseek.com/v1"
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">APIKey</label>
+            <input
+              type="password"
+              value={llmApiKey}
+              onChange={(e) => setLlmApiKey(e.target.value)}
+              placeholder="留空表示不修改现有APIKey"
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+            {llmConfig?.api_key_configured && (
+              <div className="text-xs text-slate-500 mt-2">
+                已配置：{llmConfig.api_key_masked}
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">Model</label>
+            <input
+              type="text"
+              value={llmModel}
+              onChange={(e) => setLlmModel(e.target.value)}
+              placeholder="deepseek-chat"
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <button
+              onClick={() => testLlmMutation.mutate()}
+              disabled={testLlmMutation.isPending}
+              className="flex items-center px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors disabled:opacity-50"
+            >
+              {testLlmMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              测试连接
+            </button>
+            <button
+              onClick={() => saveLlmMutation.mutate()}
+              disabled={saveLlmMutation.isPending}
+              className="flex items-center px-4 py-2 bg-primary-600 hover:bg-primary-500 rounded-lg transition-colors disabled:opacity-50"
+            >
+              {saveLlmMutation.isPending ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Save className="h-4 w-4 mr-2" />
+              )}
+              保存并重载
+            </button>
           </div>
         </div>
       </div>
