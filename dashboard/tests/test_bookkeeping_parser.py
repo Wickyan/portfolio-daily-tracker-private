@@ -98,6 +98,29 @@ class BookkeepingParserTest(unittest.TestCase):
         self.assertIn("existing_position", parsed["missing_fields"])
         self.assertTrue(any("暂不支持卖空" in warning for warning in parsed["warnings"]))
 
+    def test_existing_nvidia_and_total_amount_are_inferred(self) -> None:
+        positions = [{
+            "account": "IBKR",
+            "name": "NVIDIA/英伟达",
+            "code": "NVDA",
+            "currency": "USD",
+            "asset_type": "stock",
+            "quantity": 10,
+            "cost_price": 135.6,
+        }]
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=positions):
+            parsed = parse_bookkeeping_message("在长桥买了200股nVidia 一共40000刀")
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "长桥")
+        self.assertEqual(change["name"], "NVIDIA/英伟达")
+        self.assertEqual(change["code"], "NVDA")
+        self.assertEqual(change["currency"], "USD")
+        self.assertEqual(change["asset_type"], "stock")
+        self.assertEqual(change["quantity"], 200)
+        self.assertEqual(change["total_cost"], 40000)
+        self.assertEqual(change["cost_price"], 200)
+        self.assertEqual(parsed["missing_fields"], [])
+
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")
         self.assertEqual(parsed["intent"], "chat_only")

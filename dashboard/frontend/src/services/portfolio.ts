@@ -92,6 +92,11 @@ export const portfolioService = {
     return response.data
   },
 
+  async getPending(pendingId: string): Promise<PendingAction> {
+    const response = await api.get<PendingAction>(`/portfolio/pending/${encodeURIComponent(pendingId)}`)
+    return response.data
+  },
+
   async getOperations(): Promise<OperationSummary[]> {
     const response = await api.get<{ operations: OperationSummary[] }>('/portfolio/operations')
     return response.data.operations

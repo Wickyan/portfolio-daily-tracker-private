@@ -232,10 +232,22 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
             asset_type = asset_type or matched.get("asset_type")
 
     if not name:
+        message_lower = message.lower()
         for position in existing_positions:
-            if position.get("name") and position["name"] in message:
-                name = position["name"]
-                code = code or position.get("code")
+            position_name = str(position.get("name") or "")
+            position_code = str(position.get("code") or "")
+            name_tokens = [
+                token.strip().lower()
+                for token in re.split(r"[/|\s]+", position_name)
+                if token.strip()
+            ]
+            matched_existing = (
+                bool(position_code and position_code.lower() in message_lower)
+                or any(len(token) >= 2 and token in message_lower for token in name_tokens)
+            )
+            if matched_existing:
+                name = position_name or position_code
+                code = code or position_code
                 currency = currency or position.get("currency")
                 asset_type = asset_type or position.get("asset_type")
                 break
@@ -258,7 +270,7 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
         code = code or "MSFT"
         currency = currency or "USD"
         asset_type = asset_type or "stock"
-    elif "英伟达" in message:
+    elif "英伟达" in message or "nvidia" in message.lower():
         name = "NVIDIA/英伟达"
         code = code or "NVDA"
         currency = currency or "USD"
@@ -409,12 +421,17 @@ def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[flo
     fee = parse_number_after(message, ("fee", "手续费"))
 
     if total_cost is None:
-        total_match = re.search(r"(?:一共|总共|总计)?(?:花了|金额)\s*([0-9]+(?:\.[0-9]+)?)", message)
+        total_match = re.search(
+            r"(?:(?:一共|总共|总计)\s*(?:花了|金额)?|(?:花了|总金额)\s*)"
+            r"([0-9]+(?:\.[0-9]+)?)\s*(?:美元|港币|人民币|元|刀|USD|HKD|CNY)?",
+            message,
+            re.IGNORECASE,
+        )
         if total_match:
             total_cost = to_float(total_match.group(1))
-    if cost_price is None:
-        price_match = re.search(r"(?:均价|成本价|成交价)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:一股|每股|/股|美元|港币|元)?\s*$", message)
-        if price_match and "花了" not in message and "总" not in message:
+    if cost_price is None and total_cost is None:
+        price_match = re.search(r"(?:均价|成本价|成交价)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:一股|每股|/股|美元|港币|元|刀)?\s*$", message, re.IGNORECASE)
+        if price_match and "花了" not in message and "总" not in message and "一共" not in message:
             cost_price = to_float(price_match.group(1))
     if cost_price is None and quantity and total_cost is not None:
         cost_price = total_cost / quantity

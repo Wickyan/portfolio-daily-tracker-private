@@ -145,6 +145,40 @@ export default function ChatPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, currentResponse])
 
+  // 页面刷新后恢复当前聊天，并向后端校准pending状态。
+  useEffect(() => {
+    const pendingEntries = messages
+      .map((message, index) => ({ index, pending: message.pendingAction }))
+      .filter(({ pending }) => Boolean(pending?.pending_id))
+
+    if (pendingEntries.length === 0) return
+
+    let cancelled = false
+    void Promise.all(
+      pendingEntries.map(async ({ index, pending }) => {
+        try {
+          const latest = await portfolioService.getPending(pending!.pending_id!)
+          return { index, latest }
+        } catch {
+          return null
+        }
+      }),
+    ).then((results) => {
+      if (cancelled) return
+      const updates = new Map(
+        results.filter(Boolean).map((result) => [result!.index, result!.latest]),
+      )
+      if (updates.size === 0) return
+      setMessages(messages.map((message, index) =>
+        updates.has(index) ? { ...message, pendingAction: updates.get(index) } : message,
+      ))
+    })
+
+    return () => { cancelled = true }
+    // 只在组件首次挂载时校准，避免每次卡片更新都重复请求。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // 处理图片选择（文件或拖拽）
   const handleImageFile = useCallback((file: File) => {
     if (!file.type.startsWith('image/')) {

@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { createJSONStorage, persist } from 'zustand/middleware'
 import type { ChatMessage, Suggestion, Risk, Portfolio, UserMemory } from '@/types'
 
 interface AppState {
@@ -30,40 +31,42 @@ interface AppState {
   clearMessages: () => void
 }
 
-export const useAppStore = create<AppState>((set) => ({
-  // 初始状态
-  messages: [],
-  isLoading: false,
-  currentResponse: '',
-  suggestions: [],
-  risks: [],
-  portfolio: null,
-  memory: null,
+export const useAppStore = create<AppState>()(
+  persist(
+    (set) => ({
+      messages: [],
+      isLoading: false,
+      currentResponse: '',
+      suggestions: [],
+      risks: [],
+      portfolio: null,
+      memory: null,
 
-  // 动作
-  addMessage: (message) =>
-    set((state) => ({
-      messages: [...state.messages, message],
-    })),
-
-  setMessages: (messages) => set({ messages }),
-
-  setLoading: (isLoading) => set({ isLoading }),
-
-  setCurrentResponse: (currentResponse) => set({ currentResponse }),
-
-  appendToCurrentResponse: (chunk) =>
-    set((state) => ({
-      currentResponse: state.currentResponse + chunk,
-    })),
-
-  setSuggestions: (suggestions) => set({ suggestions }),
-
-  setRisks: (risks) => set({ risks }),
-
-  setPortfolio: (portfolio) => set({ portfolio }),
-
-  setMemory: (memory) => set({ memory }),
-
-  clearMessages: () => set({ messages: [], currentResponse: '' }),
-}))
+      addMessage: (message) =>
+        set((state) => ({ messages: [...state.messages, message] })),
+      setMessages: (messages) => set({ messages }),
+      setLoading: (isLoading) => set({ isLoading }),
+      setCurrentResponse: (currentResponse) => set({ currentResponse }),
+      appendToCurrentResponse: (chunk) =>
+        set((state) => ({ currentResponse: state.currentResponse + chunk })),
+      setSuggestions: (suggestions) => set({ suggestions }),
+      setRisks: (risks) => set({ risks }),
+      setPortfolio: (portfolio) => set({ portfolio }),
+      setMemory: (memory) => set({ memory }),
+      clearMessages: () => set({ messages: [], currentResponse: '' }),
+    }),
+    {
+      name: 'portfolio-bookkeeper-current-chat',
+      storage: createJSONStorage(() => localStorage),
+      partialize: (state) => ({
+        messages: state.messages.map((message) => ({
+          ...message,
+          image: undefined,
+          images: undefined,
+        })),
+        suggestions: state.suggestions,
+        risks: state.risks,
+      }),
+    },
+  ),
+)
