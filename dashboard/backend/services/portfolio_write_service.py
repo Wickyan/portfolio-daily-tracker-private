@@ -333,7 +333,15 @@ class PortfolioWriteService:
             if qty is None:
                 continue
 
-            new_qty = (to_float(position.get("quantity"), 0.0) or 0.0) - qty
+            current_qty = to_float(position.get("quantity"), 0.0) or 0.0
+            if qty <= 0:
+                raise ValueError("卖出数量必须大于0")
+            if qty > current_qty:
+                raise ValueError(
+                    f"卖出数量{qty:g}超过现有持仓{current_qty:g}，暂不支持卖空"
+                )
+
+            new_qty = current_qty - qty
             if new_qty > 0:
                 position["quantity"] = new_qty
                 position["available_qty"] = min(

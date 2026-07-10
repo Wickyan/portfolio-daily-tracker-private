@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from backend.api.portfolio_ai import parse_bookkeeping_message
 
@@ -33,6 +34,69 @@ class BookkeepingParserTest(unittest.TestCase):
         self.assertEqual(revised["changes"][0]["account"], "IBKR")
         self.assertEqual(revised["missing_fields"], [])
         self.assertFalse(any("新账户分组" in warning for warning in revised["warnings"]))
+
+    def test_sell_uses_only_existing_account(self) -> None:
+        positions = [{
+            "account": "IBKR",
+            "name": "NVIDIA/英伟达",
+            "code": "NVDA",
+            "currency": "USD",
+            "asset_type": "stock",
+            "quantity": 10,
+            "cost_price": 135.6,
+        }]
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=positions):
+            parsed = parse_bookkeeping_message("卖5股英伟达，均价2000美元")
+        self.assertEqual(parsed["action_type"], "sell")
+        self.assertEqual(parsed["changes"][0]["account"], "IBKR")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertTrue(any("自动选择账户：IBKR" in warning for warning in parsed["warnings"]))
+
+    def test_sell_requires_choice_when_multiple_accounts_hold_asset(self) -> None:
+        positions = [
+            {"account": "IBKR", "name": "NVIDIA/英伟达", "code": "NVDA", "currency": "USD", "asset_type": "stock", "quantity": 10, "cost_price": 135.6},
+            {"account": "长桥", "name": "NVIDIA/英伟达", "code": "NVDA", "currency": "USD", "asset_type": "stock", "quantity": 3, "cost_price": 150},
+        ]
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=positions):
+            parsed = parse_bookkeeping_message("卖2股英伟达，均价200美元")
+        self.assertNotIn("account", parsed["changes"][0])
+        self.assertIn("account", parsed["missing_fields"])
+        self.assertTrue(any("IBKR、长桥" in warning for warning in parsed["warnings"]))
+
+    def test_sell_account_choice_is_validated(self) -> None:
+        positions = [
+            {"account": "IBKR", "name": "NVIDIA/英伟达", "code": "NVDA", "currency": "USD", "asset_type": "stock", "quantity": 10, "cost_price": 135.6},
+            {"account": "长桥", "name": "NVIDIA/英伟达", "code": "NVDA", "currency": "USD", "asset_type": "stock", "quantity": 2, "cost_price": 150},
+        ]
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=positions):
+            first = parse_bookkeeping_message("卖5股英伟达，均价200美元")
+            pending = {
+                "changes": first["changes"],
+                "missing_fields": first["missing_fields"],
+                "warnings": first["warnings"],
+                "action_type": first["action_type"],
+            }
+            revised = parse_bookkeeping_message("长桥", previous=pending)
+        self.assertEqual(revised["changes"][0]["account"], "长桥")
+        self.assertIn("available_quantity", revised["missing_fields"])
+        self.assertTrue(any("暂不支持卖空" in warning for warning in revised["warnings"]))
+
+    def test_sell_more_than_holding_is_not_confirmable(self) -> None:
+        positions = [{
+            "account": "IBKR", "name": "NVIDIA/英伟达", "code": "NVDA",
+            "currency": "USD", "asset_type": "stock", "quantity": 3, "cost_price": 135.6,
+        }]
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=positions):
+            parsed = parse_bookkeeping_message("卖5股英伟达，均价200美元")
+        self.assertEqual(parsed["changes"][0]["account"], "IBKR")
+        self.assertIn("available_quantity", parsed["missing_fields"])
+        self.assertTrue(any("暂不支持卖空" in warning for warning in parsed["warnings"]))
+
+    def test_sell_without_existing_holding_is_not_confirmable(self) -> None:
+        with patch("backend.api.portfolio_ai.compact_positions", return_value=[]):
+            parsed = parse_bookkeeping_message("卖5股英伟达，均价200美元")
+        self.assertIn("existing_position", parsed["missing_fields"])
+        self.assertTrue(any("暂不支持卖空" in warning for warning in parsed["warnings"]))
 
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")

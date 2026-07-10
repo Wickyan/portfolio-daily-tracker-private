@@ -104,6 +104,17 @@ class PositionSchemaTest(unittest.TestCase):
         self.assertEqual(ibkr["quantity"], 3)
         self.assertAlmostEqual(ibkr["cost_price"], 500 / 3)
 
+    def test_sell_cannot_create_negative_position(self) -> None:
+        self.service.safe_add_positions([self.position("IBKR", 3, 100)], summary="seed")
+        with self.assertRaisesRegex(ValueError, "暂不支持卖空"):
+            self.service.safe_add_positions([{
+                **self.position("IBKR", 5, 120),
+                "action_type": "sell",
+            }], summary="oversell")
+        positions = self.service.load_portfolio()["positions"]
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["quantity"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

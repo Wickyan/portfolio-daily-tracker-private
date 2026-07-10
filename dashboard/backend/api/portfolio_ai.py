@@ -326,8 +326,65 @@ def match_existing(name: str, positions: List[Dict[str, Any]]) -> Optional[Dict[
     return None
 
 
+def find_position_matches(asset: Dict[str, Any], positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Find existing holdings for a parsed asset, preferring code+currency."""
+    code = str(asset.get("code") or "").upper().strip()
+    currency = str(asset.get("currency") or "").upper().strip()
+    name = str(asset.get("name") or "").strip()
+
+    matches: List[Dict[str, Any]] = []
+    for position in positions:
+        position_code = str(position.get("code") or "").upper().strip()
+        position_currency = str(position.get("currency") or "").upper().strip()
+        position_name = str(position.get("name") or "").strip()
+
+        if code and position_code == code:
+            if not currency or not position_currency or position_currency == currency:
+                matches.append(position)
+            continue
+
+        if not code and name and position_name:
+            if name == position_name or name in position_name or position_name in name:
+                matches.append(position)
+
+    return matches
+
+
+def resolve_sell_account(
+    account: Optional[str],
+    asset: Dict[str, Any],
+    positions: List[Dict[str, Any]],
+    warnings: List[str],
+) -> tuple[Optional[str], List[Dict[str, Any]]]:
+    """Use the only existing holding account; otherwise require a user choice."""
+    matches = find_position_matches(asset, positions)
+    if account:
+        selected = [
+            position for position in matches
+            if str(position.get("account") or "").strip() == account
+        ]
+        if not selected:
+            warnings.append(f"账户{account}中未找到该持仓，暂不支持卖空")
+        return account, selected
+
+    accounts = sorted({
+        str(position.get("account") or "").strip()
+        for position in matches
+        if str(position.get("account") or "").strip()
+    })
+    if len(accounts) == 1:
+        warnings.append(f"根据现有持仓自动选择账户：{accounts[0]}")
+        return accounts[0], matches
+    if len(accounts) > 1:
+        warnings.append(f"检测到多个账户持有该标的：{'、'.join(accounts)}，请选择卖出账户")
+        return None, matches
+
+    warnings.append("当前账户中未找到该持仓，暂不支持卖空")
+    return None, []
+
+
 def infer_action(message: str) -> str:
-    if any(token in message for token in ["卖了", "卖出"]):
+    if any(token in message for token in ["卖了", "卖出", "清仓", "减持"]) or re.search(r"卖(?:掉)?\s*[0-9]", message):
         return "sell"
     if any(token in message for token in ["入金", "现金增加", "转入"]):
         return "deposit"
@@ -411,11 +468,32 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
             warnings = [
                 warning for warning in previous.get("warnings", [])
                 if "新账户分组" not in warning
+                and "检测到多个账户持有该标的" not in warning
+                and "当前账户中未找到该持仓" not in warning
             ]
+            action_type = previous.get("action_type", "add_or_update")
             if account not in COMMON_ACCOUNTS:
                 warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
             updated = service.normalize_position(updated)
-            missing = build_missing(updated, previous.get("action_type", "add_or_update"))
+            missing = build_missing(updated, action_type)
+            if action_type == "sell":
+                matches = find_position_matches(updated, existing_positions)
+                selected = [
+                    position for position in matches
+                    if str(position.get("account") or "").strip() == account
+                ]
+                if not selected:
+                    missing.append("existing_position")
+                    warnings.append(f"账户{account}中未找到该持仓，暂不支持卖空")
+                else:
+                    available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
+                    sell_qty = to_float(updated.get("quantity"), 0.0) or 0.0
+                    if sell_qty > available:
+                        missing.append("available_quantity")
+                        warnings.append(f"卖出数量{sell_qty:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
+                    else:
+                        warnings.append(f"已选择卖出账户：{account}")
+                missing = list(dict.fromkeys(missing))
             return {
                 "intent": "bookkeeping",
                 "summary": "已补充账户分组",
@@ -441,6 +519,12 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
     quantity = parse_quantity(text)
     cost_price, total_cost, fee = parse_amounts(text, quantity)
 
+    sell_matches: List[Dict[str, Any]] = []
+    if action_type == "sell":
+        account, sell_matches = resolve_sell_account(
+            account, asset, existing_positions, warnings
+        )
+
     if account and account not in COMMON_ACCOUNTS and account_source in {"candidate", "single", "explicit"}:
         warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
 
@@ -461,8 +545,24 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
     change = {k: v for k, v in change.items() if v is not None}
     change = service.normalize_position(change)
     missing = build_missing(change, action_type)
+    if action_type == "sell":
+        if not sell_matches:
+            missing.append("existing_position")
+        elif account:
+            selected = [
+                position for position in sell_matches
+                if str(position.get("account") or "").strip() == account
+            ]
+            if not selected:
+                missing.append("existing_position")
+            else:
+                available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
+                if quantity is not None and quantity > available:
+                    missing.append("available_quantity")
+                    warnings.append(f"卖出数量{quantity:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
     if "market" in missing:
         missing.remove("market")
+    missing = list(dict.fromkeys(missing))
 
     return {
         "intent": "bookkeeping",
@@ -554,11 +654,14 @@ async def ai_confirm(request: ConfirmRequest):
         if missing:
             raise HTTPException(status_code=400, detail=f"无法确认，缺少: {', '.join(missing)}")
 
-    result = service.safe_add_positions(
-        pending.get("changes", []),
-        summary=pending.get("summary", "AI确认写入"),
-        pending_action=pending,
-    )
+    try:
+        result = service.safe_add_positions(
+            pending.get("changes", []),
+            summary=pending.get("summary", "AI确认写入"),
+            pending_action=pending,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     pending["status"] = "confirmed"
     pending["confirmed_at"] = utc_now_iso()
     pending["operation_id"] = result["operation_id"]
