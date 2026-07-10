@@ -129,6 +129,53 @@ class BookkeepingParserTest(unittest.TestCase):
         self.assertEqual(change["cost_price"], 200)
         self.assertEqual(parsed["missing_fields"], [])
 
+
+    def test_cash_deposit_is_parsed(self) -> None:
+        parsed = parse_bookkeeping_message("IBKR入金500美元")
+        self.assertEqual(parsed["action_type"], "deposit")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "IBKR")
+        self.assertEqual(change["currency"], "USD")
+        self.assertEqual(change["amount"], 500)
+
+    def test_cash_withdraw_is_parsed(self) -> None:
+        parsed = parse_bookkeeping_message("银河出金1000元")
+        self.assertEqual(parsed["action_type"], "withdraw")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertEqual(parsed["changes"][0]["amount"], 1000)
+
+    def test_cash_balance_is_parsed(self) -> None:
+        parsed = parse_bookkeeping_message("长桥账户现金5000港币")
+        self.assertEqual(parsed["action_type"], "set_cash")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "长桥")
+        self.assertEqual(change["currency"], "HKD")
+        self.assertEqual(change["amount"], 5000)
+
+    def test_code_bearing_lof_is_stock_type(self) -> None:
+        parsed = parse_bookkeeping_message(
+            "账户：银河 名称：海外科技LOF 代码：501312 币种：CNY 类型：fund 数量：100 成本价：90"
+        )
+        self.assertEqual(parsed["changes"][0]["asset_type"], "stock")
+
+
+    def test_ib_with_leading_zai_is_account_alias(self) -> None:
+        parsed = parse_bookkeeping_message("在IB买10股nvidia一共花了2000刀")
+        self.assertEqual(parsed["changes"][0]["account"], "IBKR")
+
+    def test_asset_name_is_not_mistaken_for_account(self) -> None:
+        parsed = parse_bookkeeping_message("半导体ETF买了200份，一共20000元")
+        self.assertNotIn("account", parsed["changes"][0])
+        self.assertEqual(parsed["changes"][0]["name"], "半导体ETF")
+
+    def test_cash_phrase_with_number_between_have_and_cash(self) -> None:
+        parsed = parse_bookkeeping_message("IB有2000美元现金")
+        self.assertEqual(parsed["action_type"], "set_cash")
+        self.assertEqual(parsed["changes"][0]["account"], "IBKR")
+        self.assertEqual(parsed["changes"][0]["amount"], 2000)
+
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")
         self.assertEqual(parsed["intent"], "chat_only")

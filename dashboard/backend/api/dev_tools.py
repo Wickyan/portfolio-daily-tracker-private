@@ -84,6 +84,7 @@ def _reset_portfolio_file() -> None:
     payload = {
         "positions": [],
         "cash": 0.0,
+        "cash_accounts": [],
         "updated_at": datetime.now().isoformat(),
     }
 

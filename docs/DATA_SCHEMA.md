@@ -65,3 +65,36 @@ symbol→code
 ```
 
 任何新写入都会转换成规范字段，`portfolio.json`不会再次保存旧别名。
+
+## asset_type口径
+
+- 所有有标准代码、按“数量×价格”估值的交易标的统一记为`stock`，包括普通股票、ETF、LOF和其他上市基金。
+- 无标准代码的自定义资产记为`custom`。
+- 现金不存入positions，按账户和币种存入`cash_accounts`；旧的标量`cash`只保留兼容。
+- 旧数据中的`fund`、`etf`、`fund_or_custom`在读取和再次保存时会归一化为`stock`。
+
+
+## 账户现金
+
+```json
+{
+  "cash_accounts": [
+    {
+      "account": "IBKR",
+      "currency": "USD",
+      "amount": 1000,
+      "updated_at": "2026-07-11T01:00:00"
+    }
+  ]
+}
+```
+
+现金唯一身份为`account+currency`。支持设置余额、入金、出金、操作日志和定向回滚；出金后余额不得小于0。
+
+## 总资产与汇率
+
+- 每条持仓先按原币种计算`quantity×current_price`。
+- USD和HKD使用实时汇率折算为CNY；CNY汇率恒为1。
+- 顶部`total_market_value`、`cash`、`total_assets`、`total_profit`统一为CNY折算值。
+- API同时返回原币种数值、`market_value_cny`、`profit_cny`、`fx_rate`、`fx_rates`和`fx_updated_at`。
+- 新增或确认持仓后，后端先刷新实时行情再返回，前端随后重新获取总资产。

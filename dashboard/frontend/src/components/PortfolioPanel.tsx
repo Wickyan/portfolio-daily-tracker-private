@@ -7,7 +7,7 @@ export default function PortfolioPanel() {
   const queryClient = useQueryClient()
   const { data: portfolio, isLoading } = useQuery({
     queryKey: ['portfolio'],
-    queryFn: portfolioService.getPortfolio,
+    queryFn: portfolioService.getLivePortfolio,
     refetchInterval: 60000,
     refetchOnWindowFocus: false,
   })
@@ -25,6 +25,18 @@ export default function PortfolioPanel() {
       currency: 'CNY',
       minimumFractionDigits: 2,
     }).format(value)
+  }
+
+  const formatCurrency = (value: number, currency: string) => {
+    try {
+      return new Intl.NumberFormat('zh-CN', {
+        style: 'currency',
+        currency,
+        minimumFractionDigits: 2,
+      }).format(value)
+    } catch {
+      return `${currency} ${value.toFixed(2)}`
+    }
   }
 
   const formatPercent = (value: number) => {
@@ -52,7 +64,7 @@ export default function PortfolioPanel() {
         </div>
 
         <div className="text-right">
-          <div className="font-medium">{position.current_price.toFixed(2)}</div>
+          <div className="font-medium">{formatCurrency(position.current_price, position.currency)}</div>
           <div
             className={`flex items-center justify-end gap-1 text-sm ${
               isProfit ? 'profit-positive' : 'profit-negative'
@@ -63,7 +75,7 @@ export default function PortfolioPanel() {
             ) : (
               <TrendingDown className="h-4 w-4" />
             )}
-            <span>{formatMoney(position.profit)}</span>
+            <span>{formatCurrency(position.profit, position.currency)}</span>
             <span>({formatPercent(position.profit_pct)})</span>
           </div>
         </div>

@@ -659,51 +659,17 @@ class AgentService:
     # ==================== 持仓接口 ====================
 
     async def get_portfolio(self) -> Dict[str, Any]:
-        """获取持仓"""
-        from backend.services.portfolio_write_service import PortfolioWriteService, to_float
+        """Return live-valued portfolio totals converted to CNY."""
+        from backend.services.fx_rate_service import FXRateService
+        from backend.services.portfolio_valuation import calculate_portfolio_valuation
+        from backend.services.portfolio_write_service import PortfolioWriteService
 
         raw_portfolio = PortfolioWriteService().load_portfolio()
-        positions = []
-        total_market_value = 0.0
-        total_profit = 0.0
-
-        for raw in raw_portfolio.get("positions", []):
-            quantity = to_float(raw.get("quantity"), 0.0) or 0.0
-            cost_price = to_float(raw.get("cost_price"), 0.0) or 0.0
-            current_price = to_float(raw.get("current_price"), cost_price) or cost_price
-            market_value = quantity * current_price
-            profit = market_value - (quantity * cost_price)
-            profit_pct = (profit / (quantity * cost_price) * 100) if quantity * cost_price > 0 else 0.0
-            code = raw.get("code", "")
-            total_market_value += market_value
-            total_profit += profit
-            positions.append({
-                "account": raw.get("account", ""),
-                "code": code,
-                "name": raw.get("name", ""),
-                "currency": raw.get("currency", ""),
-                "asset_type": raw.get("asset_type", "custom"),
-                "quantity": quantity,
-                "available_qty": to_float(raw.get("available_qty"), quantity) or quantity,
-                "cost_price": cost_price,
-                "current_price": current_price,
-                "total_cost": to_float(raw.get("total_cost"), quantity * cost_price) or quantity * cost_price,
-                "fee": to_float(raw.get("fee"), None),
-                "note": raw.get("note", ""),
-                "source": raw.get("source", "manual"),
-                "profit": profit,
-                "profit_pct": profit_pct,
-                "market_value": market_value
-            })
-
-        cash = to_float(raw_portfolio.get("cash"), 0.0) or 0.0
-        return {
-            "positions": positions,
-            "cash": cash,
-            "total_market_value": total_market_value,
-            "total_assets": total_market_value + cash,
-            "total_profit": total_profit
-        }
+        fx_service = FXRateService()
+        fx_rates = await fx_service.get_rates()
+        result = calculate_portfolio_valuation(raw_portfolio, fx_rates)
+        result["fx_updated_at"] = fx_service.cache_timestamp()
+        return result
 
     async def add_position(
         self,

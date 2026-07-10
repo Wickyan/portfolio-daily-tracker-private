@@ -4,7 +4,7 @@ export interface Position {
   code: string
   name: string
   currency: 'CNY' | 'USD' | 'HKD' | string
-  asset_type: 'stock' | 'fund' | 'etf' | 'cash' | 'custom' | 'fund_or_custom' | string
+  asset_type: 'stock' | 'custom' | string
   quantity: number
   available_qty: number
   cost_price: number
@@ -14,13 +14,38 @@ export interface Position {
   source?: string
   current_price: number
   profit: number
+  profit_cny?: number | null
   profit_pct: number
   market_value: number
+  market_value_cny?: number | null
+  fx_rate?: number | null
+}
+
+export interface CashAccount {
+  account: string
+  currency: string
+  amount: number
+  fx_rate?: number | null
+  amount_cny?: number | null
+  updated_at?: string
 }
 
 export interface Portfolio {
   positions: Position[]
+  cash_accounts: CashAccount[]
   cash: number
+  legacy_cash_cny?: number
+  base_currency: string
+  fx_rates: Record<string, number>
+  fx_updated_at?: string | null
+  currency_totals?: Record<string, {
+    market_value: number
+    cash: number
+    profit: number
+    market_value_cny: number
+    cash_cny: number
+    profit_cny: number
+  }>
   total_market_value: number
   total_assets: number
   total_profit: number
@@ -89,6 +114,7 @@ export interface PendingChange {
   fee?: number | null
   note?: string
   source?: string
+  amount?: number | null
 }
 
 export interface InstrumentCandidate {

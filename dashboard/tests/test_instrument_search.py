@@ -15,7 +15,7 @@ class InstrumentSearchTest(unittest.IsolatedAsyncioTestCase):
                 "code": "501312",
                 "name": "海外科技LOF",
                 "currency": "CNY",
-                "asset_type": "fund",
+                "asset_type": "stock",
                 "score": 180,
                 "classify": "Fund",
                 "source": "test",
@@ -24,7 +24,7 @@ class InstrumentSearchTest(unittest.IsolatedAsyncioTestCase):
                 "code": "017204",
                 "name": "华宝海外科技股票(QDII-LOF)C",
                 "currency": "CNY",
-                "asset_type": "fund",
+                "asset_type": "stock",
                 "score": 85,
                 "classify": "OTCFUND",
                 "source": "test",
@@ -37,9 +37,16 @@ class InstrumentSearchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(change["code"], "501312")
         self.assertEqual(change["name"], "海外科技LOF")
         self.assertEqual(change["currency"], "CNY")
-        self.assertEqual(change["asset_type"], "fund")
+        self.assertEqual(change["asset_type"], "stock")
         self.assertNotIn("code", enriched["missing_fields"])
         self.assertTrue(any("已联网匹配" in warning for warning in enriched["warnings"]))
+
+
+    def test_company_search_penalizes_leveraged_etfs(self) -> None:
+        service = InstrumentSearchService()
+        company = {"Code": "GOOG", "Name": "谷歌-C", "Classify": "UsStock", "MarketType": "7"}
+        leveraged = {"Code": "GGLL", "Name": "二倍做多谷歌ETF-Direxion", "Classify": "UsStock", "MarketType": "7"}
+        self.assertGreater(service._score("Google", company), service._score("Google", leveraged))
 
     def test_equal_top_scores_are_not_auto_selected(self) -> None:
         candidates = [

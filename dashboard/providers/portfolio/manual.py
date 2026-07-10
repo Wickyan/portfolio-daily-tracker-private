@@ -56,10 +56,7 @@ class ManualPortfolioProvider(PortfolioProvider):
 
     @staticmethod
     def _infer_asset_type(symbol: str) -> str:
-        symbol = str(symbol or "")
-        if symbol.isdigit() and len(symbol) == 6 and symbol.startswith(("15", "16", "50", "51", "52", "56", "58")):
-            return "fund"
-        return "stock" if symbol else "custom"
+        return "stock" if str(symbol or "").strip() else "custom"
 
     @staticmethod
     def _identity(account: str, code: str, currency: str) -> Tuple[str, str, str]:
@@ -89,7 +86,7 @@ class ManualPortfolioProvider(PortfolioProvider):
 
                 account = str(raw.get("account") or raw.get("group") or "").strip()
                 currency = str(raw.get("currency") or self._infer_currency(code)).upper()
-                asset_type = str(raw.get("asset_type") or self._infer_asset_type(code))
+                asset_type = "stock" if code else "custom"
                 internal_market = self._infer_internal_market(code, currency)
                 stock = Stock(
                     symbol=code,
@@ -133,7 +130,7 @@ class ManualPortfolioProvider(PortfolioProvider):
             "code": position.stock.symbol,
             "name": position.stock.name,
             "currency": str(getattr(position, "currency", "") or self._infer_currency(position.stock.symbol)).upper(),
-            "asset_type": str(getattr(position, "asset_type", "") or self._infer_asset_type(position.stock.symbol)),
+            "asset_type": self._infer_asset_type(position.stock.symbol),
             "quantity": quantity,
             "available_qty": position.available_qty,
             "cost_price": cost_price,

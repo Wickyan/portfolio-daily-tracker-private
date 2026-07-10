@@ -102,7 +102,7 @@ function AddPositionDialog({ onClose, onSave }: {
     name: '',
     code: '',
     currency: 'CNY',
-    asset_type: 'fund',
+    asset_type: 'stock',
     quantity: '',
     cost_price: '',
     fee: '',
@@ -174,11 +174,8 @@ function AddPositionDialog({ onClose, onSave }: {
               onChange={(e) => setField('asset_type', e.target.value)}
               className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
             >
-              <option value="stock">stock</option>
-              <option value="fund">fund</option>
-              <option value="etf">etf</option>
-              <option value="custom">custom</option>
-              <option value="fund_or_custom">fund_or_custom</option>
+              <option value="stock">stock（股票/ETF/LOF等）</option>
+              <option value="custom">custom（无标准代码资产）</option>
             </select>
           </div>
           <div className="col-span-2">
@@ -298,6 +295,19 @@ export default function Portfolio() {
     }).format(num)
   }
 
+  const formatCurrency = (num: number, currency: string) => {
+    try {
+      return new Intl.NumberFormat('zh-CN', {
+        style: 'currency',
+        currency,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(num)
+    } catch {
+      return `${currency} ${formatNumber(num)}`
+    }
+  }
+
   const formatPercent = (num: number) => {
     return new Intl.NumberFormat('zh-CN', {
       minimumFractionDigits: 2,
@@ -326,25 +336,51 @@ export default function Portfolio() {
       {/* 资产概览 */}
       <div className="grid grid-cols-4 gap-4">
         <div className="bg-slate-800 rounded-lg p-6">
-          <div className="text-sm text-slate-400 mb-2">总资产</div>
+          <div className="text-sm text-slate-400 mb-2">总资产(CNY折算)</div>
           <div className="text-2xl font-bold">¥{formatNumber(totalAssets)}</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
-          <div className="text-sm text-slate-400 mb-2">持仓市值</div>
+          <div className="text-sm text-slate-400 mb-2">持仓市值(CNY)</div>
           <div className="text-2xl font-bold">¥{formatNumber(totalMarketValue)}</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
-          <div className="text-sm text-slate-400 mb-2">可用现金</div>
+          <div className="text-sm text-slate-400 mb-2">账户现金(CNY)</div>
           <div className="text-2xl font-bold text-green-400">¥{formatNumber(cash)}</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
-          <div className="text-sm text-slate-400 mb-2">总盈亏</div>
+          <div className="text-sm text-slate-400 mb-2">总盈亏(CNY)</div>
           <div className={`text-2xl font-bold ${totalProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
             {totalProfit >= 0 ? '+' : ''}¥{formatNumber(totalProfit)}
             <span className="text-sm ml-2">({formatPercent(profitPercent)}%)</span>
           </div>
         </div>
       </div>
+
+      {portfolio?.cash_accounts && portfolio.cash_accounts.length > 0 && (
+        <div className="bg-slate-800 rounded-lg p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold">账户现金</h2>
+            <div className="text-xs text-slate-500">
+              汇率更新时间：{portfolio.fx_updated_at ? new Date(portfolio.fx_updated_at).toLocaleString() : '暂无'}
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {portfolio.cash_accounts.map((item) => (
+              <div key={`${item.account}-${item.currency}`} className="rounded-lg bg-slate-900/60 px-4 py-3">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">{item.account}</span>
+                  <span className="text-xs text-slate-500">{item.currency}</span>
+                </div>
+                <div className="mt-2 text-lg font-semibold">{formatCurrency(item.amount, item.currency)}</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  折合¥{formatNumber(item.amount_cny || 0)}
+                  {item.fx_rate ? `（汇率${item.fx_rate.toFixed(4)}）` : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 持仓明细 */}
       <div className="bg-slate-800 rounded-lg">
@@ -418,7 +454,7 @@ export default function Portfolio() {
                       <td className={`px-6 py-4 text-right font-medium ${profitClass}`}>
                         <div className="flex items-center justify-end">
                           {isProfit ? <TrendingUp className="h-4 w-4 mr-1" /> : <TrendingDown className="h-4 w-4 mr-1" />}
-                          {isProfit ? '+' : ''}¥{formatNumber(position.profit)}
+                          {isProfit ? '+' : ''}{formatCurrency(position.profit, position.currency)}
                         </div>
                       </td>
                       <td className="px-6 py-4 text-right">
@@ -426,11 +462,14 @@ export default function Portfolio() {
                         <div className="text-xs text-slate-500">{position.available_qty}</div>
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <div className="text-sm text-slate-400">¥{formatNumber(position.cost_price)}</div>
-                        <div className={`text-sm font-medium ${profitClass}`}>¥{formatNumber(position.current_price)}</div>
+                        <div className="text-sm text-slate-400">{formatCurrency(position.cost_price, position.currency)}</div>
+                        <div className={`text-sm font-medium ${profitClass}`}>{formatCurrency(position.current_price, position.currency)}</div>
                       </td>
                       <td className="px-6 py-4 text-right font-medium">
-                        ¥{formatNumber(position.market_value)}
+                        <div>{formatCurrency(position.market_value, position.currency)}</div>
+                        {position.market_value_cny !== null && position.market_value_cny !== undefined && position.currency !== 'CNY' && (
+                          <div className="text-xs text-slate-500">≈¥{formatNumber(position.market_value_cny)}</div>
+                        )}
                       </td>
                       <td className={`px-6 py-4 text-right font-bold ${profitClass}`}>
                         {formatPercent(position.profit_pct)}%

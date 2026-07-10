@@ -6,7 +6,7 @@ export default function Header() {
   const queryClient = useQueryClient()
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio'],
-    queryFn: portfolioService.getPortfolio,
+    queryFn: portfolioService.getLivePortfolio,
     refetchInterval: 60000,
     refetchOnWindowFocus: false,
   })
@@ -29,25 +29,25 @@ export default function Header() {
     <header className="flex h-16 items-center justify-between border-b border-slate-700 bg-slate-800 px-6">
       <div className="flex items-center space-x-8">
         <div>
-          <div className="text-sm text-slate-400">总资产</div>
+          <div className="text-sm text-slate-400">总资产(CNY折算)</div>
           <div className="text-lg font-semibold">
             {portfolio ? formatMoney(portfolio.total_assets) : '--'}
           </div>
         </div>
         <div>
-          <div className="text-sm text-slate-400">持仓市值</div>
+          <div className="text-sm text-slate-400">持仓市值(CNY)</div>
           <div className="text-lg font-semibold">
             {portfolio ? formatMoney(portfolio.total_market_value) : '--'}
           </div>
         </div>
         <div>
-          <div className="text-sm text-slate-400">可用现金</div>
+          <div className="text-sm text-slate-400">账户现金(CNY)</div>
           <div className="text-lg font-semibold">
             {portfolio ? formatMoney(portfolio.cash) : '--'}
           </div>
         </div>
         <div>
-          <div className="text-sm text-slate-400">总盈亏</div>
+          <div className="text-sm text-slate-400">总盈亏(CNY)</div>
           <div
             className={`text-lg font-semibold ${
               !portfolio || portfolio.total_profit >= 0 ? 'profit-positive' : 'profit-negative'

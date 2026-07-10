@@ -47,6 +47,23 @@ AI 不直接写入 portfolio，只生成 preview。
 
 Portfolio 页面“新增持仓”也走统一安全写入服务，会生成 backup 和 operation，可通过 operation rollback。
 
+## 账户现金与总资产
+
+账户现金按`account+currency`记录，支持：
+
+- AI自然语言设置余额、入金和出金
+- Settings页面手动设置指定账户/币种余额
+- backup、operation和rollback
+- USD/HKD按实时汇率折算为CNY
+
+总资产口径为：
+
+```text
+Σ(持仓数量×实时价格×CNY汇率)+Σ(账户现金×CNY汇率)
+```
+
+持仓明细保留原币种价格和市值，顶部汇总统一显示CNY折算值。
+
 ## 测试工具
 
-Settings 中的 reset 工具只用于测试环境清理数据。联网查代码、用户别名、多币种 cash 账本是后续任务，本次不做。
+Settings中的reset工具只用于测试环境清理数据，不删除DeepSeek配置、Nginx密码和备份。

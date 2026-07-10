@@ -65,6 +65,20 @@ class PositionSchemaTest(unittest.TestCase):
         for forbidden in ("group", "symbol", "market", "exchange", "canonical_symbol"):
             self.assertNotIn(forbidden, stored)
 
+
+    def test_listed_fund_types_are_normalized_to_stock(self) -> None:
+        self.service.safe_add_positions([{
+            "account": "银河",
+            "name": "海外科技LOF",
+            "code": "501312",
+            "currency": "CNY",
+            "asset_type": "fund",
+            "quantity": 100,
+            "cost_price": 90,
+        }], summary="legacy listed fund")
+        position = self.service.load_portfolio()["positions"][0]
+        self.assertEqual(position["asset_type"], "stock")
+
     def test_same_code_in_different_accounts_is_isolated(self) -> None:
         self.service.safe_add_positions(
             [self.position("IBKR"), self.position("长桥", quantity=2, cost_price=110)],
@@ -157,6 +171,53 @@ class PositionSchemaTest(unittest.TestCase):
             self.service.rollback_operation(operation_id)
         with self.assertRaisesRegex(ValueError, "回滚操作本身"):
             self.service.rollback_operation(rollback["rollback_operation_id"])
+
+
+
+    def test_backups_are_unique_within_same_second(self) -> None:
+        first = self.service.backup_portfolio()
+        second = self.service.backup_portfolio()
+        self.assertNotEqual(first, second)
+        self.assertTrue(Path(first.replace("dashboard/", "")).exists())
+        self.assertTrue(Path(second.replace("dashboard/", "")).exists())
+
+    def test_account_cash_set_deposit_withdraw_and_rollback(self) -> None:
+        set_result = self.service.safe_set_cash_account("IBKR", "USD", 1000)
+        portfolio = self.service.load_portfolio()
+        self.assertEqual(portfolio["cash_accounts"][0]["amount"], 1000)
+
+        deposit = self.service.safe_add_positions([{
+            "action_type": "deposit",
+            "account": "IBKR",
+            "currency": "USD",
+            "amount": 250,
+        }], summary="deposit")
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 1250)
+
+        withdraw = self.service.safe_add_positions([{
+            "action_type": "withdraw",
+            "account": "IBKR",
+            "currency": "USD",
+            "amount": 200,
+        }], summary="withdraw")
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 1050)
+
+        self.service.rollback_operation(withdraw["operation_id"])
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 1250)
+        self.service.rollback_operation(deposit["operation_id"])
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 1000)
+        self.service.rollback_operation(set_result["operation_id"])
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"], [])
+
+    def test_cash_withdraw_cannot_go_negative(self) -> None:
+        self.service.safe_set_cash_account("银河", "CNY", 100)
+        with self.assertRaisesRegex(ValueError, "现金不足"):
+            self.service.safe_add_positions([{
+                "action_type": "withdraw",
+                "account": "银河",
+                "currency": "CNY",
+                "amount": 101,
+            }], summary="overspend")
 
     def test_selective_rollback_preserves_later_unrelated_position(self) -> None:
         first = self.service.safe_add_positions(

@@ -37,7 +37,9 @@ export default function Settings() {
   const [apiUrl] = useState('http://localhost:8000')
   const [selectedModel, setSelectedModel] = useState('')
   const [selectedApiGroup, setSelectedApiGroup] = useState('')
-  const [cash, setCash] = useState(50000)
+  const [cashAccount, setCashAccount] = useState('')
+  const [cashCurrency, setCashCurrency] = useState('CNY')
+  const [cashAmount, setCashAmount] = useState(0)
   const [saveMessage, setSaveMessage] = useState('')
   const [llmMessage, setLlmMessage] = useState('')
   const [llmApiGroup, setLlmApiGroup] = useState('deepseek')
@@ -82,12 +84,6 @@ export default function Settings() {
       setSelectedApiGroup(config.current_api_group)
     }
   }, [config])
-
-  useEffect(() => {
-    if (portfolio?.cash !== undefined) {
-      setCash(portfolio.cash)
-    }
-  }, [portfolio])
 
   useEffect(() => {
     if (llmConfig) {
@@ -148,17 +144,23 @@ export default function Settings() {
 
   // 更新现金
   const updateCashMutation = useMutation({
-    mutationFn: async (newCash: number) => {
-      const res = await fetch('/api/settings/cash', {
+    mutationFn: async (data: { account: string; currency: string; amount: number }) => {
+      const res = await fetch('/api/portfolio/cash', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cash: newCash })
+        body: JSON.stringify(data)
       })
-      return res.json()
+      const payload = await res.json()
+      if (!res.ok) throw new Error(payload.detail || '现金余额更新失败')
+      return payload
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-      setSaveMessage('现金余额更新成功！')
+      setSaveMessage('账户现金更新成功！')
+      setTimeout(() => setSaveMessage(''), 3000)
+    },
+    onError: (error) => {
+      setSaveMessage(error instanceof Error ? error.message : '现金余额更新失败')
       setTimeout(() => setSaveMessage(''), 3000)
     }
   })
@@ -265,9 +267,6 @@ export default function Settings() {
     }
     if (selectedModel !== config?.current_model) {
       switchModelMutation.mutate(selectedModel)
-    }
-    if (cash !== portfolio?.cash) {
-      updateCashMutation.mutate(cash)
     }
   }
 
@@ -486,26 +485,81 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 现金设置 */}
+      {/* 账户现金设置 */}
       <div className="bg-slate-800 rounded-lg p-6">
         <h2 className="text-xl font-semibold flex items-center mb-4">
           <DollarSign className="h-5 w-5 mr-2" />
-          现金余额
+          账户现金
         </h2>
-        <div className="space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div>
-            <label className="text-sm text-slate-400 mb-2 block">可用现金（元）</label>
+            <label className="text-sm text-slate-400 mb-2 block">账户</label>
             <input
-              type="number"
-              value={cash}
-              onChange={(e) => setCash(parseFloat(e.target.value) || 0)}
-              step="1000"
+              value={cashAccount}
+              onChange={(e) => setCashAccount(e.target.value)}
+              placeholder="例如IBKR、银河、长桥"
               className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
             />
-            <div className="text-xs text-slate-500 mt-2">
-              设置账户中的可用现金余额，用于资产统计和建议计算
-            </div>
           </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">币种</label>
+            <select
+              value={cashCurrency}
+              onChange={(e) => setCashCurrency(e.target.value)}
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            >
+              <option value="CNY">CNY</option>
+              <option value="USD">USD</option>
+              <option value="HKD">HKD</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">余额</label>
+            <input
+              type="number"
+              value={cashAmount}
+              onChange={(e) => setCashAmount(parseFloat(e.target.value) || 0)}
+              step="0.01"
+              min="0"
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+          <div className="flex items-end">
+            <button
+              onClick={() => updateCashMutation.mutate({
+                account: cashAccount.trim(),
+                currency: cashCurrency,
+                amount: cashAmount,
+              })}
+              disabled={updateCashMutation.isPending || !cashAccount.trim() || cashAmount < 0}
+              className="w-full px-4 py-2 bg-primary-600 hover:bg-primary-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-lg transition-colors"
+            >
+              保存账户现金
+            </button>
+          </div>
+        </div>
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+          {(portfolio?.cash_accounts || []).map((item: any) => (
+            <button
+              key={`${item.account}-${item.currency}`}
+              onClick={() => {
+                setCashAccount(item.account)
+                setCashCurrency(item.currency)
+                setCashAmount(item.amount)
+              }}
+              className="rounded-lg bg-slate-700 px-4 py-3 text-left hover:bg-slate-600"
+            >
+              <div className="flex justify-between">
+                <span className="font-medium">{item.account}</span>
+                <span className="text-slate-400">{item.currency}</span>
+              </div>
+              <div className="mt-1 text-lg">{item.amount}</div>
+              <div className="text-xs text-slate-500">折合CNY：{(item.amount_cny || 0).toFixed(2)}</div>
+            </button>
+          ))}
+        </div>
+        <div className="text-xs text-slate-500 mt-3">
+          这里设置的是指定账户和币种的现金余额；入金/出金也可以直接在AI记账对话中输入。
         </div>
       </div>
 

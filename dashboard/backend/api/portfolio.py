@@ -22,6 +22,13 @@ class AddPositionRequest(BaseModel):
     source: str = "manual"
 
 
+
+
+class SetCashAccountRequest(BaseModel):
+    account: str
+    currency: str
+    amount: float
+
 class UpdatePositionRequest(BaseModel):
     """account+code+currency共同定位持仓。"""
     account: str
@@ -58,7 +65,7 @@ async def get_live_portfolio():
 
 @router.post("/add")
 async def add_position(request: AddPositionRequest):
-    from backend.api.portfolio_ai import reload_agent_portfolio_provider
+    from backend.api.portfolio_ai import reload_and_refresh_portfolio_provider
     from backend.services.portfolio_write_service import PortfolioWriteService
 
     write_service = PortfolioWriteService()
@@ -75,16 +82,38 @@ async def add_position(request: AddPositionRequest):
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    reload_agent_portfolio_provider()
+    refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=True)
     return {
         **result,
+        "quote_refresh": refresh_result,
         "message": f"已添加持仓: {request.account}/{request.name}({request.code})",
     }
 
 
+
+
+@router.post("/cash")
+async def set_cash_account(request: SetCashAccountRequest):
+    from backend.api.portfolio_ai import reload_and_refresh_portfolio_provider
+    from backend.services.portfolio_write_service import PortfolioWriteService
+
+    try:
+        result = PortfolioWriteService().safe_set_cash_account(
+            account=request.account,
+            currency=request.currency.upper(),
+            amount=request.amount,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await reload_and_refresh_portfolio_provider(refresh_quotes=False)
+    return {
+        **result,
+        "message": f"已设置账户现金: {request.account}/{request.currency.upper()}={request.amount:g}",
+    }
+
 @router.put("/{code}")
 async def update_position(code: str, request: UpdatePositionRequest):
-    from backend.api.portfolio_ai import reload_agent_portfolio_provider
+    from backend.api.portfolio_ai import reload_and_refresh_portfolio_provider
     from backend.services.portfolio_write_service import PortfolioWriteService
 
     if request.quantity is None and request.cost_price is None:
@@ -105,9 +134,10 @@ async def update_position(code: str, request: UpdatePositionRequest):
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    reload_agent_portfolio_provider()
+    refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=True)
     return {
         **result,
+        "quote_refresh": refresh_result,
         "message": f"已更新持仓: {request.account}/{code}/{request.currency.upper()}",
     }
 
@@ -118,7 +148,7 @@ async def remove_position(
     account: str = Query(..., min_length=1),
     currency: str = Query(..., min_length=3),
 ):
-    from backend.api.portfolio_ai import reload_agent_portfolio_provider
+    from backend.api.portfolio_ai import reload_and_refresh_portfolio_provider
     from backend.services.portfolio_write_service import PortfolioWriteService
 
     try:
@@ -132,9 +162,10 @@ async def remove_position(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    reload_agent_portfolio_provider()
+    refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=True)
     return {
         **result,
+        "quote_refresh": refresh_result,
         "message": f"已删除持仓: {account}/{code}/{currency.upper()}",
     }
 

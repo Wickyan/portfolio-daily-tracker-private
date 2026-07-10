@@ -146,9 +146,12 @@ class UpdateCashRequest(BaseModel):
 
 @router.post("/cash")
 async def update_cash(request: UpdateCashRequest, service = Depends(get_agent_service)):
-    """更新现金"""
-    service.portfolio_provider.set_cash(request.cash)
-    return {"success": True, "cash": request.cash}
+    """兼容旧设置页：写入未分组/CNY账户现金，并保留安全日志和回滚。"""
+    from backend.services.portfolio_write_service import PortfolioWriteService
+
+    result = PortfolioWriteService().safe_set_cash_account("未分组", "CNY", request.cash)
+    service._init_portfolio_provider()
+    return {"success": True, "cash": request.cash, "operation_id": result["operation_id"]}
 
 
 class LLMConfigResponse(BaseModel):

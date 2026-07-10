@@ -47,15 +47,25 @@ function PendingActionCard({
       <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
       <div className="rounded bg-slate-900/60 px-3 py-2">
         {field('账户分组', change.account)}
-        {field('标的', change.name)}
-        {field('代码', change.code)}
-        {field('币种', change.currency)}
-        {field('类型', change.asset_type)}
-        {field('操作', pending.action_type)}
-        {field('数量', change.quantity)}
-        {field('成本价', change.cost_price)}
-        {field('总成本', change.total_cost)}
-        {field('手续费', change.fee ?? '未提供')}
+        {['deposit', 'withdraw', 'set_cash'].includes(pending.action_type || '') ? (
+          <>
+            {field('币种', change.currency)}
+            {field('金额', change.amount)}
+            {field('操作', pending.action_type)}
+          </>
+        ) : (
+          <>
+            {field('标的', change.name)}
+            {field('代码', change.code)}
+            {field('币种', change.currency)}
+            {field('类型', change.asset_type)}
+            {field('操作', pending.action_type)}
+            {field('数量', change.quantity)}
+            {field('成本价', change.cost_price)}
+            {field('总成本', change.total_cost)}
+            {field('手续费', change.fee ?? '未提供')}
+          </>
+        )}
       </div>
       {pending.missing_fields?.length > 0 && (
         <div className="text-sm text-amber-300">缺少：{pending.missing_fields.join('、')}</div>

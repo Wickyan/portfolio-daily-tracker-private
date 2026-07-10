@@ -41,15 +41,13 @@ class InstrumentSearchService:
     def _metadata(item: Dict[str, Any]) -> tuple[str, str]:
         classify = str(item.get("Classify") or "")
         market_type = str(item.get("MarketType") or "")
-        security_name = str(item.get("SecurityTypeName") or "")
-        name = str(item.get("Name") or "")
 
         if classify == "UsStock" or market_type == "7":
-            return "USD", "etf" if "ETF" in name.upper() else "stock"
+            return "USD", "stock"
         if classify in {"HKStock", "HK"} or market_type in {"3", "116"}:
-            return "HKD", "etf" if "ETF" in name.upper() else "stock"
-        if classify in {"Fund", "OTCFUND"} or security_name == "基金":
-            return "CNY", "etf" if "ETF" in name.upper() else "fund"
+            return "HKD", "stock"
+        # A-share stocks, ETF, LOF and fund products are all handled by the
+        # same quantity × price bookkeeping path, so expose one type.
         return "CNY", "stock"
 
     @classmethod
@@ -79,6 +77,12 @@ class InstrumentSearchService:
         # Prefer exchange-traded instruments for brokerage-style wording.
         if classify == "Fund":
             score += 10
+        query_mentions_etf = "etf" in query
+        candidate_is_etf = "etf" in name
+        if candidate_is_etf and not query_mentions_etf:
+            score -= 70
+        if classify == "UsStock" and not candidate_is_etf:
+            score += 25
         return score
 
     async def search(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -142,6 +146,6 @@ class InstrumentSearchService:
         first = candidates[0]
         second_score = int(candidates[1]["score"]) if len(candidates) > 1 else -1
         first_score = int(first["score"])
-        if first_score >= 140 and first_score - second_score >= 25:
+        if first_score >= 180 and first_score - second_score >= 25:
             return first
         return None

@@ -84,8 +84,7 @@ def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]
     if ":" in upper:
         prefix, rest = upper.split(":", 1)
         if prefix in {"SHE", "SHA"}:
-            inferred_type = "fund" if rest.startswith(("15", "16", "50", "51", "52", "56", "58")) else "stock"
-            return rest, "CNY", inferred_type
+            return rest, "CNY", "stock"
         if prefix == "HKG":
             return rest.zfill(4), "HKD", "stock"
         if prefix in {"NASDAQ", "NYSE", "AMEX"}:
@@ -106,18 +105,18 @@ def infer_position_defaults(position: Dict[str, Any]) -> Dict[str, Any]:
         elif code.isascii() and code and not code.isdigit():
             currency = "USD"
 
-    if not asset_type:
-        if code.isdigit() and len(code) == 6:
-            asset_type = "fund" if code.startswith(("15", "16", "50", "51", "52", "56", "58")) else "stock"
-        elif code.isdigit() and len(code) == 4:
-            asset_type = "stock"
-        elif code:
-            asset_type = "stock"
-        else:
-            asset_type = "custom"
+    # This ledger treats every code-bearing tradable instrument uniformly as
+    # a stock-like position. ETF/LOF/fund labels from older data are legacy
+    # classifications only and do not affect valuation.
+    if code:
+        asset_type = "stock"
+    elif asset_type in {"stock", "cash"}:
+        asset_type = asset_type
+    else:
+        asset_type = "custom"
 
     position["currency"] = currency
-    position["asset_type"] = asset_type or "custom"
+    position["asset_type"] = asset_type
     return position
 
 
@@ -136,7 +135,7 @@ class PortfolioWriteService:
 
     def load_portfolio(self) -> Dict[str, Any]:
         if not self.portfolio_file.exists():
-            return {"positions": [], "cash": 0.0, "updated_at": utc_now_iso()}
+            return {"positions": [], "cash": 0.0, "cash_accounts": [], "updated_at": utc_now_iso()}
 
         try:
             with open(self.portfolio_file, "r", encoding="utf-8") as f:
@@ -145,9 +144,15 @@ class PortfolioWriteService:
             data = {}
 
         positions = [self.normalize_position(p, for_storage=True) for p in data.get("positions", [])]
+        cash_accounts = [
+            self.normalize_cash_account(item)
+            for item in data.get("cash_accounts", [])
+            if self.normalize_cash_account(item).get("account")
+        ]
         return {
             "positions": positions,
             "cash": to_float(data.get("cash"), 0.0) or 0.0,
+            "cash_accounts": cash_accounts,
             "updated_at": data.get("updated_at") or utc_now_iso(),
         }
 
@@ -156,6 +161,11 @@ class PortfolioWriteService:
         data = {
             "positions": [self.normalize_position(p, for_storage=True) for p in portfolio.get("positions", [])],
             "cash": to_float(portfolio.get("cash"), 0.0) or 0.0,
+            "cash_accounts": [
+                self.normalize_cash_account(item)
+                for item in portfolio.get("cash_accounts", [])
+                if self.normalize_cash_account(item).get("account")
+            ],
             "updated_at": utc_now_iso(),
         }
         tmp_path = self.portfolio_file.with_suffix(".json.tmp")
@@ -166,8 +176,8 @@ class PortfolioWriteService:
 
     def backup_portfolio(self) -> str:
         ensure_data_dirs()
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = BACKUPS_DIR / f"portfolio.json.bak-{stamp}"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = BACKUPS_DIR / f"portfolio.json.bak-{stamp}-{uuid4().hex[:8]}"
         portfolio = self.load_portfolio()
         with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(portfolio, f, ensure_ascii=False, indent=2)
@@ -208,9 +218,15 @@ class PortfolioWriteService:
         if explicit_currency or inferred_currency:
             position["currency"] = explicit_currency or inferred_currency
 
-        asset_type = str(raw_position.get("asset_type") or "").strip()
-        if asset_type or inferred_asset_type:
-            position["asset_type"] = asset_type or inferred_asset_type
+        asset_type = str(raw_position.get("asset_type") or "").strip().lower()
+        if code:
+            # Canonical user-facing type: all listed/tradable code-bearing
+            # instruments (stocks, ETF, LOF, listed funds) are stock.
+            position["asset_type"] = "stock"
+        elif asset_type in {"stock", "cash"}:
+            position["asset_type"] = asset_type
+        elif asset_type or inferred_asset_type:
+            position["asset_type"] = "custom"
 
         quantity = to_float(raw_position.get("quantity"), None)
         cost_price = to_float(raw_position.get("cost_price"), None)
@@ -256,7 +272,31 @@ class PortfolioWriteService:
 
         return position
 
+    def normalize_cash_account(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        account = str((raw or {}).get("account") or "").strip()
+        currency = str((raw or {}).get("currency") or "").upper().strip()
+        amount = to_float((raw or {}).get("amount"), 0.0) or 0.0
+        return {
+            "account": account,
+            "currency": currency,
+            "amount": amount,
+            "updated_at": str((raw or {}).get("updated_at") or utc_now_iso()),
+        }
+
     def validate_confirmable_change(self, change: Dict[str, Any]) -> List[str]:
+        action_type = str(change.get("action_type") or change.get("action") or "add_or_update")
+        if action_type in {"deposit", "withdraw", "set_cash"}:
+            missing = []
+            if not str(change.get("account") or "").strip():
+                missing.append("account")
+            if not str(change.get("currency") or "").strip():
+                missing.append("currency")
+            amount = to_float(change.get("amount"), None)
+            if amount is None:
+                missing.append("amount")
+            elif amount < 0:
+                missing.append("amount_non_negative")
+            return missing
         normalized = self.normalize_position(change)
         missing = []
         if not normalized.get("account"):
@@ -274,10 +314,43 @@ class PortfolioWriteService:
     def apply_changes(self, portfolio: Dict[str, Any], changes: List[Dict[str, Any]]) -> tuple[Dict[str, Any], int]:
         result = deepcopy(portfolio)
         positions = [self.normalize_position(p, for_storage=True) for p in result.get("positions", [])]
+        cash_accounts = [self.normalize_cash_account(item) for item in result.get("cash_accounts", [])]
         imported = 0
 
         for raw_change in changes:
             action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
+
+            if action_type in {"deposit", "withdraw", "set_cash"}:
+                account = str(raw_change.get("account") or "").strip()
+                currency = str(raw_change.get("currency") or "").upper().strip()
+                amount = to_float(raw_change.get("amount"), None)
+                if not account or not currency or amount is None or amount < 0:
+                    raise ValueError("现金操作缺少有效的account/currency/amount")
+                matches = [item for item in cash_accounts if item["account"] == account and item["currency"] == currency]
+                if len(matches) > 1:
+                    raise ValueError(f"检测到重复现金账户: {(account, currency)}")
+                current = matches[0]["amount"] if matches else 0.0
+                if action_type == "deposit":
+                    target = current + amount
+                elif action_type == "withdraw":
+                    target = current - amount
+                    if target < -1e-8:
+                        raise ValueError(f"{account}/{currency}现金不足，当前{current:g}，出金{amount:g}")
+                else:
+                    target = amount
+                if matches:
+                    matches[0]["amount"] = max(target, 0.0)
+                    matches[0]["updated_at"] = utc_now_iso()
+                else:
+                    cash_accounts.append({
+                        "account": account,
+                        "currency": currency,
+                        "amount": max(target, 0.0),
+                        "updated_at": utc_now_iso(),
+                    })
+                imported += 1
+                continue
+
             change = self.normalize_position(raw_change, for_storage=True)
 
             if action_type in {"sell", "delete"}:
@@ -315,6 +388,7 @@ class PortfolioWriteService:
             imported += 1
 
         result["positions"] = positions
+        result["cash_accounts"] = [item for item in cash_accounts if abs(item.get("amount", 0.0)) > 1e-12]
         result["updated_at"] = utc_now_iso()
         return result, imported
 
@@ -534,6 +608,27 @@ class PortfolioWriteService:
                         template[key] = before_position[key]
             current_map[identity] = self.normalize_position(template, for_storage=True)
 
+        def cash_map(snapshot: Dict[str, Any]) -> Dict[tuple[str, str], float]:
+            return {
+                (str(item.get("account") or "").strip(), str(item.get("currency") or "").upper().strip()):
+                to_float(item.get("amount"), 0.0) or 0.0
+                for item in snapshot.get("cash_accounts", [])
+                if str(item.get("account") or "").strip() and str(item.get("currency") or "").strip()
+            }
+
+        before_cash_accounts = cash_map(before)
+        after_cash_accounts = cash_map(after)
+        current_cash_accounts = cash_map(current)
+        for identity in set(before_cash_accounts) | set(after_cash_accounts):
+            delta = after_cash_accounts.get(identity, 0.0) - before_cash_accounts.get(identity, 0.0)
+            target = current_cash_accounts.get(identity, 0.0) - delta
+            if target < -epsilon:
+                raise ValueError(f"无法单独撤回现金操作{identity}：后续操作已使用相关现金")
+            if abs(target) <= epsilon:
+                current_cash_accounts.pop(identity, None)
+            else:
+                current_cash_accounts[identity] = target
+
         current_cash = to_float(current.get("cash"), 0.0) or 0.0
         before_cash = to_float(before.get("cash"), 0.0) or 0.0
         after_cash = to_float(after.get("cash"), 0.0) or 0.0
@@ -543,6 +638,10 @@ class PortfolioWriteService:
 
         result = deepcopy(current)
         result["positions"] = list(current_map.values())
+        result["cash_accounts"] = [
+            {"account": account, "currency": currency, "amount": amount, "updated_at": utc_now_iso()}
+            for (account, currency), amount in current_cash_accounts.items()
+        ]
         result["cash"] = 0.0 if abs(target_cash) <= epsilon else target_cash
         result["updated_at"] = utc_now_iso()
         return result
@@ -614,6 +713,22 @@ class PortfolioWriteService:
                 description = f"{description}，数量{quantity:g}" if isinstance(quantity, (int, float)) else f"{description}，数量{quantity}"
             result["description"] = description
         return result
+
+    def safe_set_cash_account(self, account: str, currency: str, amount: float) -> Dict[str, Any]:
+        change = {
+            "action_type": "set_cash",
+            "account": account,
+            "currency": currency,
+            "amount": amount,
+            "source": "manual",
+        }
+        missing = self.validate_confirmable_change(change)
+        if missing:
+            raise ValueError(f"现金操作缺少: {', '.join(missing)}")
+        return self.safe_add_positions(
+            [change],
+            summary=f"设置账户现金 {account}/{currency}={amount:g}",
+        )
 
     def safe_add_positions(
         self,

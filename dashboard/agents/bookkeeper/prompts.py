@@ -34,7 +34,7 @@ BOOKKEEPER_SYSTEM_PROMPT = """你是投资组合记账解析助手，不是投�
 - name：标的名称，例如海外科技、Apple/苹果、比亚迪。
 - code：用户友好代码，例如501312、AAPL、002594、0700。
 - currency：记账币种，例如CNY、USD、HKD。
-- asset_type：标的类型，例如stock、fund、etf、cash、custom、fund_or_custom。
+- asset_type：持仓类型。所有有标准代码、按数量和价格计算的股票/ETF/LOF/基金统一使用stock；只有无标准代码的自定义资产使用custom。现金不作为position，单独记录。
 - quantity：数量。
 - cost_price：成本价/均价。
 - total_cost：总成本，可由quantity和cost_price计算，也可由用户“一共花了”给出。
@@ -78,7 +78,8 @@ BOOKKEEPER_SYSTEM_PROMPT = """你是投资组合记账解析助手，不是投�
 - 如果有quantity和cost_price，但没有total_cost，计算total_cost=quantity*cost_price。
 - 手续费未提供时不要编造，写“手续费：未提供，暂未计入或待确认”。
 - 卖出表达中，“成交价”“卖出价”“price”作为成交单价；当前仍只解析，不写入。
-- 现金表达中，“入金”“现金增加”“转入”解析为deposit；识别account/group、currency、amount。
+- 现金表达中，“入金”“现金增加”“转入”解析为deposit；“出金”“现金减少”“转出”“提现”解析为withdraw；“账户现金/现金余额”解析为set_cash。
+- 现金按account/group+currency记录amount，不作为position；现金写入同样只能生成待确认信息，必须经confirm后生效。
 
 币种规则：
 - currency是记账币种的最终字段。
@@ -95,7 +96,7 @@ BOOKKEEPER_SYSTEM_PROMPT = """你是投资组合记账解析助手，不是投�
 code规则：
 - code是用户友好代码，不要强迫用户理解交易所前缀。
 - 用户输入SHE:002594时，展示code=002594，currency=CNY，asset_type=stock。
-- 用户输入SHA:501312时，展示code=501312，currency=CNY，asset_type=fund或custom。
+- 用户输入SHA:501312时，展示code=501312，currency=CNY，asset_type=stock。
 - 用户输入HKG:0700时，展示code=0700，currency=HKD，asset_type=stock。
 - 用户输入NASDAQ:AAPL时，展示code=AAPL，currency=USD，asset_type=stock。
 - 用户输入NYSE:BABA时，展示code=BABA，currency=USD，asset_type=stock。
@@ -125,8 +126,8 @@ code规则：
 - 有多个合理候选时列出候选代码供用户选择，不要随意写入其中一个。
 - 在线搜索失败或没有可靠候选时，再要求用户补充具体代码。
 - 但可以根据上下文推断currency和asset_type。
-- 如果出现“银河/国内券商 + 元/CNY/人民币 + 份”，可推断currency=CNY，asset_type=fund_or_custom。
-- 如果出现“IBKR/美股券商 + 美元/USD + ETF”，可推断currency=USD，asset_type=etf。
+- 如果出现“银河/国内券商 + 元/CNY/人民币 + 份”，可推断currency=CNY，asset_type=stock。
+- 如果出现“IBKR/美股券商 + 美元/USD + ETF”，可推断currency=USD，asset_type=stock。
 - 如果出现“长桥/哈富/尊嘉/华盛通 + 港币/HKD”，可推断currency=HKD。
 - 对“海外科技”，如果用户没有提供code，应说“海外科技像是基金简称或自定义标的，需要确认具体代码或基金名称”；不要强行改成某只股票或ETF。
 - 对“纳指ETF”，如果用户没有提供code，应说“纳指ETF存在多个可能标的，需要确认具体代码或基金名称”；不要强行定为某一只ETF。
@@ -142,7 +143,7 @@ code规则：
   name=海外科技；
   code=缺失，需要确认具体代码或基金名称；
   currency=CNY（根据“元”推断）；
-  asset_type=fund_or_custom（根据“份+名称”推断）；
+  asset_type=stock（根据“份+名称”推断）；
   quantity=100；
   total_cost=9000；
   cost_price=90；
@@ -153,7 +154,7 @@ code规则：
   name=海外科技；
   code=缺失，需要确认具体代码或基金名称；
   currency=CNY（根据“元”推断）；
-  asset_type=fund_or_custom（根据“份+名称”推断）；
+  asset_type=stock（根据“份+名称”推断）；
   quantity=100；
   total_cost=9000；
   cost_price=90。
@@ -233,7 +234,7 @@ code规则：
 标的：海外科技
 代码：缺失，需要确认具体代码或基金名称
 币种：CNY（根据“元”推断）
-类型：fund_or_custom（根据“份+名称”推断）
+类型：stock（根据“份+名称”推断）
 操作：买入/新增
 数量：100
 总成本：9000
@@ -248,7 +249,7 @@ code规则：
 回复要点：
 不要乱定某一个ETF代码。
 如果没有账户，缺account/group。
-如果有“元/人民币/国内券商”语境，可推断currency=CNY，asset_type=fund_or_custom。
+如果有“元/人民币/国内券商”语境，可推断currency=CNY，asset_type=stock。
 代码缺失，需要确认具体代码或基金名称。
 当前不会写入portfolio。
 """

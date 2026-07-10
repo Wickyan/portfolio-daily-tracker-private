@@ -83,12 +83,27 @@ def load_pending(pending_id: str) -> Dict[str, Any]:
 
 
 def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_changes = []
+    service = PortfolioWriteService()
+    for raw_change in pending.get("changes", []):
+        action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
+        if action_type in {"deposit", "withdraw", "set_cash"}:
+            normalized_changes.append({
+                "action_type": action_type,
+                "account": str(raw_change.get("account") or "").strip(),
+                "currency": str(raw_change.get("currency") or "").upper().strip(),
+                "amount": to_float(raw_change.get("amount"), None),
+                "note": str(raw_change.get("note") or ""),
+                "source": str(raw_change.get("source") or "ai"),
+            })
+        else:
+            normalized_changes.append(service.normalize_position(raw_change))
     return {
         "ok": True,
         "pending_id": pending.get("pending_id"),
         "summary": pending.get("summary"),
         "action_type": pending.get("action_type"),
-        "changes": pending.get("changes", []),
+        "changes": normalized_changes,
         "missing_fields": pending.get("missing_fields", []),
         "warnings": pending.get("warnings", []),
         "requires_confirmation": pending.get("requires_confirmation", False),
@@ -194,7 +209,17 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
     if allow_single and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff]{2,12}", text):
         return normalize_account(text), "single"
 
-    account_match = re.search(r"(?:账户|券商|分组)(?:还是|为|是|:|：)?\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})", text)
+    # Prefer known broker names before generic "账户:" parsing so phrases
+    # like "长桥账户现金5000港币" do not treat "现金5000港币" as the account.
+    known_account_tokens = COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES)
+    for account in sorted(known_account_tokens, key=len, reverse=True):
+        if re.search(rf"(?:^|在|从|转入|转出){re.escape(account)}(?:账户)?", text, re.IGNORECASE):
+            return normalize_account(account), "explicit"
+
+    account_match = re.search(
+        r"(?:账户|券商|分组)(?:还是|为|是|:|：)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
+        text,
+    )
     if account_match:
         return normalize_account(account_match.group(1)), "explicit"
 
@@ -202,14 +227,12 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
     if same_match:
         return normalize_account(same_match.group(1)), "explicit"
 
-    for account in sorted(COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS, key=len, reverse=True):
-        if re.search(rf"{re.escape(account)}(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入)", text, re.IGNORECASE):
-            return normalize_account(account), "explicit"
-
-    prefix_match = re.match(r"^([A-Za-z0-9\u4e00-\u9fff]{2,12})(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入)", text, re.IGNORECASE)
+    prefix_match = re.match(r"^([A-Za-z0-9\u4e00-\u9fff]{2,12})(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入|出金|现金减少|转出|提现|现金余额|账户现金)", text, re.IGNORECASE)
     if prefix_match:
         prefix = prefix_match.group(1)
-        if prefix not in COMMON_ASSET_WORDS:
+        looks_like_asset = bool(re.search(r"ETF|LOF|基金|股票|科技|互联|指数|债|黄金|原油", prefix, re.IGNORECASE))
+        looks_like_broker = bool(re.search(r"证券|银行|资本|投资|券商", prefix))
+        if prefix not in COMMON_ASSET_WORDS and not looks_like_asset and looks_like_broker:
             return normalize_account(prefix), "candidate"
     return None, None
 
@@ -255,13 +278,32 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
                 asset_type = asset_type or position.get("asset_type")
                 break
 
+    if not name and not code:
+        # Extract an unknown instrument phrase so online search can resolve it.
+        # Examples: "IBKR买了2股亚马逊" / "买入100份纳指ETF" / "腾讯卖出10股".
+        asset_token = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff]{1,29}"
+        patterns = [
+            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)\s*({asset_token})",
+            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*({asset_token})\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
+            rf"({asset_token}?)(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
+            rf"({asset_token}?)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip()
+                candidate = re.sub(r"^(?:在)?(?:长桥|哈富|IBKR|IB|尊嘉|华盛通|银河|富途|老虎|雪盈)", "", candidate, flags=re.IGNORECASE)
+                if len(candidate) >= 2:
+                    name = candidate
+                    break
+
     if "海外科技" in message and not code:
         name = "海外科技"
-        asset_type = asset_type or "fund_or_custom"
+        asset_type = asset_type or "stock"
         warnings.append("海外科技像是基金简称或自定义标的，需要确认具体代码或基金名称")
     elif "纳指ETF" in message and not code:
         name = "纳指ETF"
-        asset_type = asset_type or ("fund_or_custom" if currency == "CNY" else "etf")
+        asset_type = asset_type or "stock"
         warnings.append("纳指ETF存在多个可能标的，需要确认具体代码或基金名称")
     elif "苹果" in message:
         name = "Apple/苹果"
@@ -317,14 +359,14 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
 
     if not asset_type and code:
         if re.fullmatch(r"\d{6}", code):
-            asset_type = "fund" if code.startswith(("15", "16", "50", "51", "52", "56", "58")) else "stock"
+            asset_type = "stock"
         elif re.fullmatch(r"\d{4}", code) or re.fullmatch(r"[A-Z.]{1,8}", code):
             asset_type = "stock"
 
     if not currency and ("份" in message or "海外科技" in message) and re.search(r"\d+\s*元", message):
         currency = "CNY"
     if not asset_type and "份" in message:
-        asset_type = "fund_or_custom"
+        asset_type = "stock"
 
     return {
         "name": name or "",
@@ -401,8 +443,12 @@ def resolve_sell_account(
 def infer_action(message: str) -> str:
     if any(token in message for token in ["卖了", "卖出", "清仓", "减持"]) or re.search(r"卖(?:掉)?\s*[0-9]", message):
         return "sell"
-    if any(token in message for token in ["入金", "现金增加", "转入"]):
+    if any(token in message for token in ["出金", "现金减少", "转出", "提现"]):
+        return "withdraw"
+    if any(token in message for token in ["入金", "现金增加", "转入", "存入", "充值"]):
         return "deposit"
+    if any(token in message for token in ["现金余额", "账户现金", "现金有", "有现金"]) or re.search(r"有\s*[0-9]+(?:\.[0-9]+)?.*现金", message):
+        return "set_cash"
     if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "录入"]):
         return "add_or_update"
     # Accept concise bookkeeping such as "海外科技100股，一共花了9000元"
@@ -449,10 +495,26 @@ def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[flo
     return cost_price, total_cost, fee
 
 
+def parse_cash_amount(message: str) -> Optional[float]:
+    explicit = parse_number_after(message, ("amount", "金额", "现金余额", "账户现金"))
+    if explicit is not None:
+        return explicit
+    patterns = [
+        r"(?:入金|出金|转入|转出|存入|提现|充值|现金增加|现金减少)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"(?:现金余额|账户现金|现金有|有现金)\s*(?:是|为|:|：)?\s*([0-9]+(?:\.[0-9]+)?)",
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:美元|港币|人民币|元|刀|USD|HKD|CNY)\s*(?:现金)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            return to_float(match.group(1), None)
+    return None
+
+
 def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
     if action_type == "chat_only":
         return []
-    if action_type == "deposit":
+    if action_type in {"deposit", "withdraw", "set_cash"}:
         missing = []
         if not change.get("account"):
             missing.append("account")
@@ -500,7 +562,10 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
             action_type = previous.get("action_type", "add_or_update")
             if account not in COMMON_ACCOUNTS:
                 warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
-            updated = service.normalize_position(updated)
+            if action_type in {"deposit", "withdraw", "set_cash"}:
+                updated["account"] = account
+            else:
+                updated = service.normalize_position(updated)
             missing = build_missing(updated, action_type)
             if action_type == "sell":
                 matches = find_position_matches(updated, existing_positions)
@@ -541,6 +606,30 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
         }
 
     account, account_source = infer_account(text)
+    if action_type in {"deposit", "withdraw", "set_cash"}:
+        currency = (parse_first_key_value(text, ("currency", "币种")) or infer_currency(text) or "").upper() or None
+        amount = parse_cash_amount(text)
+        warnings: List[str] = []
+        if account and account not in COMMON_ACCOUNTS and account_source in {"candidate", "single", "explicit"}:
+            warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
+        change = {
+            "action_type": action_type,
+            "account": account,
+            "currency": currency,
+            "amount": amount,
+            "note": "",
+            "source": "ai",
+        }
+        change = {key: value for key, value in change.items() if value is not None}
+        return {
+            "intent": "bookkeeping",
+            "summary": "识别到1条待确认账户现金信息",
+            "action_type": action_type,
+            "changes": [change],
+            "missing_fields": build_missing(change, action_type),
+            "warnings": warnings,
+        }
+
     asset, warnings = infer_asset(text, existing_positions)
     quantity = parse_quantity(text)
     cost_price, total_cost, fee = parse_amounts(text, quantity)
@@ -795,7 +884,14 @@ async def ai_confirm(request: ConfirmRequest):
     pending["confirmed_at"] = utc_now_iso()
     pending["operation_id"] = result["operation_id"]
     save_pending(pending)
-    reload_agent_portfolio_provider()
+    refresh_result = await reload_and_refresh_portfolio_provider(
+        refresh_quotes=any(
+            str(change.get("action_type") or change.get("action") or "add_or_update")
+            not in {"deposit", "withdraw", "set_cash"}
+            for change in pending.get("changes", [])
+        )
+    )
+    result["quote_refresh"] = refresh_result
     return result
 
 
@@ -828,7 +924,7 @@ async def rollback_latest():
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    reload_agent_portfolio_provider()
+    result["quote_refresh"] = await reload_and_refresh_portfolio_provider(refresh_quotes=True)
     return result
 
 
@@ -841,8 +937,24 @@ async def rollback(operation_id: str):
         raise HTTPException(status_code=404, detail="operation 不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    reload_agent_portfolio_provider()
+    result["quote_refresh"] = await reload_and_refresh_portfolio_provider(refresh_quotes=True)
     return result
+
+
+async def reload_and_refresh_portfolio_provider(refresh_quotes: bool = False) -> Dict[str, Any]:
+    try:
+        from backend.main import get_agent_service
+
+        service = get_agent_service()
+        if service is None:
+            return {"ok": False, "error": "服务尚未初始化"}
+        service._init_portfolio_provider()
+        if refresh_quotes:
+            return await service.refresh_portfolio()
+        return {"ok": True, "refreshed": False}
+    except Exception as exc:
+        print(f"[PortfolioAI] 持仓provider重载/刷新失败: {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 def reload_agent_portfolio_provider() -> None:

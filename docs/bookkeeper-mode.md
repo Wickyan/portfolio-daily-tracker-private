@@ -58,3 +58,8 @@ Bookkeeper 只展示用户友好字段：
 - AI preview API: `dashboard/backend/api/portfolio_ai.py`
 - 安全写入服务: `dashboard/backend/services/portfolio_write_service.py`
 - 写入流程: preview → revise → confirm → rollback。
+
+
+## 账户现金
+
+bookkeeper支持`deposit`、`withdraw`和`set_cash`三类现金操作。现金按`account+currency`保存，不作为position。所有现金写入仍必须经过preview和confirm，并可通过operation回滚。
