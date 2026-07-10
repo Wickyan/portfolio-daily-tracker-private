@@ -14,6 +14,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -52,6 +53,7 @@ POSITION_STORAGE_FIELDS = {
 }
 
 PositionIdentity = Tuple[str, str, str]
+PORTFOLIO_MUTATION_LOCK = RLock()
 
 
 def utc_now_iso() -> str:
@@ -743,26 +745,46 @@ class PortfolioWriteService:
         summary: str,
         pending_action: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        before = self.load_portfolio()
-        backup_path = self.backup_portfolio()
-        after, imported = self.apply_changes(before, changes)
-        self.save_portfolio_atomic(after)
-        operation = self.create_operation(
-            operation_type="manual_add" if not pending_action else "ai_confirm",
-            summary=summary,
-            before_snapshot=before,
-            after_snapshot=after,
-            pending_action=pending_action,
-            backup_path=backup_path,
-            imported_positions=imported,
-        )
-        return {
-            "ok": True,
-            "operation_id": operation["operation_id"],
-            "imported_positions": imported,
-            "backup_path": backup_path,
-            "portfolio_updated": True,
-        }
+        with PORTFOLIO_MUTATION_LOCK:
+            before = self.load_portfolio()
+            backup_path = self.backup_portfolio()
+            after, imported = self.apply_changes(before, changes)
+            self.save_portfolio_atomic(after)
+            operation = self.create_operation(
+                operation_type="manual_add" if not pending_action else "ai_confirm",
+                summary=summary,
+                before_snapshot=before,
+                after_snapshot=after,
+                pending_action=pending_action,
+                backup_path=backup_path,
+                imported_positions=imported,
+            )
+            return {
+                "ok": True,
+                "operation_id": operation["operation_id"],
+                "imported_positions": imported,
+                "backup_path": backup_path,
+                "portfolio_updated": True,
+            }
+
+    def safe_update_prices(self, prices: Dict[PositionIdentity, float]) -> Dict[str, Any]:
+        """Patch quote prices into the latest ledger without replacing cash/positions."""
+        with PORTFOLIO_MUTATION_LOCK:
+            portfolio = self.load_portfolio()
+            updated = 0
+            for position in portfolio.get("positions", []):
+                identity = position_identity(position)
+                if identity not in prices:
+                    continue
+                price = to_float(prices[identity], None)
+                if price is None:
+                    continue
+                position["current_price"] = price
+                position["updated_at"] = utc_now_iso()
+                updated += 1
+            if updated:
+                self.save_portfolio_atomic(portfolio)
+            return {"ok": True, "updated_prices": updated}
 
     def safe_update_position(
         self,

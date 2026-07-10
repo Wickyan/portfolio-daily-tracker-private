@@ -145,9 +145,17 @@ class ManualPortfolioProvider(PortfolioProvider):
         }
 
     def _save(self) -> None:
+        cash_accounts: List[Dict[str, Any]] = []
+        if self.data_file.exists():
+            try:
+                with open(self.data_file, "r", encoding="utf-8") as f:
+                    cash_accounts = list((json.load(f) or {}).get("cash_accounts", []))
+            except Exception:
+                cash_accounts = []
         data = {
             "positions": [self._position_to_record(p) for p in self._portfolio.positions],
             "cash": self._portfolio.cash,
+            "cash_accounts": cash_accounts,
             "updated_at": datetime.now().isoformat(),
         }
         self.data_file.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +164,23 @@ class ManualPortfolioProvider(PortfolioProvider):
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
         tmp_path.replace(self.data_file)
+
+    def _save_refreshed_prices(self) -> None:
+        """Persist only refreshed prices into the latest ledger snapshot.
+
+        The market provider may have been loaded before a cash/position write.
+        Rewriting its whole in-memory portfolio would therefore delete newer
+        cash accounts or positions. Always reload the canonical ledger and
+        patch only current_price for identities that still exist.
+        """
+        from backend.services.portfolio_write_service import PortfolioWriteService
+
+        write_service = PortfolioWriteService(self.data_file)
+        prices = {
+            self._position_identity(position): position.current_price
+            for position in self._portfolio.positions
+        }
+        write_service.safe_update_prices(prices)
 
     async def get_portfolio(self) -> Portfolio:
         return self._portfolio
@@ -199,7 +224,7 @@ class ManualPortfolioProvider(PortfolioProvider):
             *(refresh_market_positions(market, positions) for market, positions in positions_by_market.items())
         )
         self._last_update = datetime.now()
-        self._save()
+        self._save_refreshed_prices()
 
     # Legacy provider methods remain for compatibility. New user-visible writes
     # go through PortfolioWriteService and identify positions by account+code+currency.
