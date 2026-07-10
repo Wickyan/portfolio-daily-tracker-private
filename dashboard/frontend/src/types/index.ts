@@ -102,6 +102,7 @@ export interface PendingAction {
   requires_confirmation: boolean
   intent?: 'bookkeeping' | 'chat_only' | string
   status?: string
+  operation_id?: string
 }
 
 export interface OperationSummary {
@@ -111,6 +112,7 @@ export interface OperationSummary {
   summary: string
   imported_positions: number
   can_rollback: boolean
+  status?: string
 }
 
 // 建议相关类型

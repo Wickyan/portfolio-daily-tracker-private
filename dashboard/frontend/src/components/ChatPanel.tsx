@@ -67,6 +67,8 @@ function PendingActionCard({
       )}
       {pending.status === 'confirmed' ? (
         <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>
+      ) : pending.status === 'rolled_back' ? (
+        <div className="text-sm text-amber-300">该次写入已撤回，Portfolio 已恢复。</div>
       ) : pending.status === 'cancelled' ? (
         <div className="text-sm text-slate-400">已取消。</div>
       ) : (
@@ -278,11 +280,15 @@ export default function ChatPanel() {
     const normalizedCommand = userMessage.replace(/\s+/g, '')
     const confirmCommands = new Set(['确认', '确认写入', '写入', '保存', '录入', '提交'])
     const cancelCommands = new Set(['取消', '取消写入', '不写了'])
+    const isRollbackCommand = /撤回|撤销|回滚|undo/i.test(normalizedCommand)
 
     let latestPendingIndex = -1
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const pending = messages[i].pendingAction
-      if (pending?.pending_id && pending.status !== 'confirmed' && pending.status !== 'cancelled') {
+      if (
+        pending?.pending_id
+        && !['confirmed', 'cancelled', 'rolled_back', 'expired'].includes(pending.status || 'pending')
+      ) {
         latestPendingIndex = i
         break
       }
@@ -291,6 +297,57 @@ export default function ChatPanel() {
     // 立即清空输入和图片
     setInput('')
     clearAllImages()
+
+    // “撤回/撤销/回滚”直接撤回最近一次尚未撤回的真实写入。
+    if (currentImages.length === 0 && isRollbackCommand) {
+      const userEntry: ChatMessage = { role: 'user', content: userMessage }
+      setLoading(true)
+      try {
+        const result = await portfolioService.rollbackLatest()
+        let targetIndex = messages.findIndex(
+          (message) => message.pendingAction?.operation_id === result.rolled_back_operation_id,
+        )
+        if (targetIndex < 0) {
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            if (messages[i].pendingAction?.status === 'confirmed') {
+              targetIndex = i
+              break
+            }
+          }
+        }
+
+        const nextMessages = messages.map((message, index) => {
+          if (index !== targetIndex || !message.pendingAction) return message
+          return {
+            ...message,
+            pendingAction: {
+              ...message.pendingAction,
+              status: 'rolled_back',
+              requires_confirmation: false,
+              operation_id: result.rolled_back_operation_id,
+            },
+          }
+        })
+        const description = result.description ? `：${result.description}` : ''
+        setMessages([
+          ...nextMessages,
+          userEntry,
+          { role: 'assistant', content: `已撤回最近一次写入${description}。Portfolio已恢复。` },
+        ])
+        queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+        queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+        await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+      } catch (error) {
+        setMessages([
+          ...messages,
+          userEntry,
+          { role: 'assistant', content: `撤回失败：${getApiErrorMessage(error)}` },
+        ])
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
 
     // “确认/写入/取消”只操作最近一条pending，不再作为普通聊天发送。
     if (currentImages.length === 0 && (confirmCommands.has(normalizedCommand) || cancelCommands.has(normalizedCommand))) {
@@ -317,6 +374,16 @@ export default function ChatPanel() {
 
       setLoading(true)
       try {
+        let operationId = latestPending.operation_id
+        if (cancelCommands.has(normalizedCommand)) {
+          await portfolioService.aiCancel(latestPending.pending_id!)
+        } else {
+          const result = await portfolioService.aiConfirm(latestPending.pending_id!)
+          operationId = result.operation_id
+          queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+          queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+          await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+        }
         const nextMessages = messages.map((message, index) => {
           if (index !== latestPendingIndex || !message.pendingAction) return message
           return {
@@ -325,18 +392,10 @@ export default function ChatPanel() {
               ...message.pendingAction,
               status: cancelCommands.has(normalizedCommand) ? 'cancelled' : 'confirmed',
               requires_confirmation: false,
+              operation_id: operationId,
             },
           }
         })
-
-        if (cancelCommands.has(normalizedCommand)) {
-          await portfolioService.aiCancel(latestPending.pending_id!)
-        } else {
-          await portfolioService.aiConfirm(latestPending.pending_id!)
-          queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-          queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
-          await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-        }
         setMessages([...nextMessages, userEntry])
       } catch (error) {
         setMessages([
@@ -517,10 +576,16 @@ export default function ChatPanel() {
               }}
               onConfirm={async () => {
                 if (!message.pendingAction?.pending_id) return
-                await portfolioService.aiConfirm(message.pendingAction.pending_id)
+                const result = await portfolioService.aiConfirm(message.pendingAction.pending_id)
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+                queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
                 await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-                updatePendingMessage(index, { ...message.pendingAction, status: 'confirmed', requires_confirmation: false })
+                updatePendingMessage(index, {
+                  ...message.pendingAction,
+                  status: 'confirmed',
+                  requires_confirmation: false,
+                  operation_id: result.operation_id,
+                })
               }}
               onCancel={async () => {
                 if (!message.pendingAction?.pending_id) return

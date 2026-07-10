@@ -93,6 +93,7 @@ def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
         "requires_confirmation": pending.get("requires_confirmation", False),
         "intent": pending.get("intent", "bookkeeping"),
         "status": pending.get("status", "pending"),
+        "operation_id": pending.get("operation_id"),
     }
 
 
@@ -705,6 +706,19 @@ async def get_pending(pending_id: str):
 async def list_operations():
     service = PortfolioWriteService()
     return {"operations": service.list_operations()}
+
+
+@router.post("/rollback-latest")
+async def rollback_latest():
+    service = PortfolioWriteService()
+    try:
+        result = service.rollback_latest_operation()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    reload_agent_portfolio_provider()
+    return result
 
 
 @router.post("/rollback/{operation_id}")

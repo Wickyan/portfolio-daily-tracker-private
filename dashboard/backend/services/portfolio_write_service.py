@@ -386,24 +386,61 @@ class PortfolioWriteService:
             f.write("\n")
         return operation
 
-    def list_operations(self, limit: int = 30) -> List[Dict[str, Any]]:
+    def _load_all_operations(self) -> List[Dict[str, Any]]:
         ensure_data_dirs()
-        operations = []
+        operations: List[Dict[str, Any]] = []
         for path in sorted(OPERATIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    operation = json.load(f)
+                    operations.append(json.load(f))
             except Exception:
                 continue
-            operations.append({
-                "operation_id": operation.get("operation_id"),
+        return operations
+
+    def _rolled_back_operation_ids(self, operations: Optional[List[Dict[str, Any]]] = None) -> set[str]:
+        all_operations = operations if operations is not None else self._load_all_operations()
+        return {
+            str(operation.get("pending_action", {}).get("rolled_back_operation_id"))
+            for operation in all_operations
+            if operation.get("type") == "rollback"
+            and operation.get("pending_action", {}).get("rolled_back_operation_id")
+        }
+
+    def list_operations(self, limit: int = 30) -> List[Dict[str, Any]]:
+        operations = self._load_all_operations()
+        rolled_back_ids = self._rolled_back_operation_ids(operations)
+        summaries = []
+        for operation in operations:
+            operation_id = str(operation.get("operation_id") or "")
+            operation_type = str(operation.get("type") or "")
+            can_rollback = (
+                operation_type != "rollback"
+                and bool(operation.get("before_snapshot"))
+                and operation_id not in rolled_back_ids
+            )
+            summaries.append({
+                "operation_id": operation_id,
                 "created_at": operation.get("created_at"),
-                "type": operation.get("type"),
+                "type": operation_type,
                 "summary": operation.get("summary"),
                 "imported_positions": operation.get("imported_positions", 0),
-                "can_rollback": bool(operation.get("before_snapshot")),
+                "can_rollback": can_rollback,
+                "status": "rolled_back" if operation_id in rolled_back_ids else operation.get("status", "confirmed"),
             })
-        return operations[:limit]
+        return summaries[:limit]
+
+    def get_latest_rollbackable_operation(self) -> Dict[str, Any]:
+        operations = self._load_all_operations()
+        rolled_back_ids = self._rolled_back_operation_ids(operations)
+        for operation in operations:
+            operation_id = str(operation.get("operation_id") or "")
+            if (
+                operation.get("type") != "rollback"
+                and operation.get("before_snapshot")
+                and operation_id not in rolled_back_ids
+            ):
+                return operation
+        raise FileNotFoundError("没有可撤回的写入操作")
 
     def load_operation(self, operation_id: str) -> Dict[str, Any]:
         path = OPERATIONS_DIR / f"{operation_id}.json"
@@ -414,6 +451,10 @@ class PortfolioWriteService:
 
     def rollback_operation(self, operation_id: str) -> Dict[str, Any]:
         operation = self.load_operation(operation_id)
+        if operation.get("type") == "rollback":
+            raise ValueError("回滚操作本身不能再次回滚")
+        if operation_id in self._rolled_back_operation_ids():
+            raise ValueError("该操作已经撤回")
         before_snapshot = operation.get("before_snapshot")
         if not before_snapshot:
             raise ValueError("operation does not have before_snapshot")
@@ -429,12 +470,51 @@ class PortfolioWriteService:
             backup_path=backup_path,
             imported_positions=0,
         )
+
+        pending_id = str(operation.get("pending_action", {}).get("pending_id") or "").strip()
+        if pending_id:
+            pending_path = PENDING_DIR / f"{pending_id}.json"
+            if pending_path.exists():
+                try:
+                    with open(pending_path, "r", encoding="utf-8") as f:
+                        pending = json.load(f)
+                    pending["status"] = "rolled_back"
+                    pending["requires_confirmation"] = False
+                    pending["rolled_back_at"] = utc_now_iso()
+                    pending["rollback_operation_id"] = rollback["operation_id"]
+                    tmp_path = pending_path.with_suffix(".json.tmp")
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(pending, f, ensure_ascii=False, indent=2)
+                        f.write("\n")
+                    os.replace(tmp_path, pending_path)
+                except Exception as exc:
+                    print(f"[Rollback] 更新pending状态失败: {exc}")
+
         return {
             "ok": True,
             "rolled_back_operation_id": operation_id,
             "rollback_operation_id": rollback["operation_id"],
             "backup_path": backup_path,
         }
+
+
+    def rollback_latest_operation(self) -> Dict[str, Any]:
+        operation = self.get_latest_rollbackable_operation()
+        result = self.rollback_operation(str(operation["operation_id"]))
+        result["summary"] = operation.get("summary") or operation.get("type") or "最近一次写入"
+        result["operation_type"] = operation.get("type")
+        pending_action = operation.get("pending_action") or {}
+        changes = pending_action.get("changes") or []
+        if changes:
+            change = changes[0]
+            account = str(change.get("account") or "").strip()
+            target = str(change.get("name") or change.get("code") or "持仓").strip()
+            quantity = change.get("quantity")
+            description = "/".join(part for part in [account, target] if part)
+            if quantity is not None:
+                description = f"{description}，数量{quantity:g}" if isinstance(quantity, (int, float)) else f"{description}，数量{quantity}"
+            result["description"] = description
+        return result
 
     def safe_add_positions(
         self,

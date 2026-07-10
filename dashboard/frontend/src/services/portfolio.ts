@@ -106,4 +106,15 @@ export const portfolioService = {
     const response = await api.post(`/portfolio/rollback/${operationId}`)
     return response.data
   },
+
+  async rollbackLatest(): Promise<{
+    ok: boolean
+    rolled_back_operation_id: string
+    rollback_operation_id: string
+    summary?: string
+    description?: string
+  }> {
+    const response = await api.post('/portfolio/rollback-latest')
+    return response.data
+  },
 }

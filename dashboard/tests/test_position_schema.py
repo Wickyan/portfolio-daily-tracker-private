@@ -115,6 +115,49 @@ class PositionSchemaTest(unittest.TestCase):
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0]["quantity"], 3)
 
+    def test_rollback_latest_marks_pending_and_prevents_repeat(self) -> None:
+        pending_id = "pending-rollback-test"
+        pending_dir = Path("data/pending_actions")
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_path = pending_dir / f"{pending_id}.json"
+        pending_path.write_text(
+            json.dumps({
+                "pending_id": pending_id,
+                "status": "pending",
+                "requires_confirmation": True,
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.service.safe_add_positions(
+            [self.position("IBKR", 2, 200)],
+            summary="latest write",
+            pending_action={
+                "pending_id": pending_id,
+                "changes": [self.position("IBKR", 2, 200)],
+            },
+        )
+        operation_id = result["operation_id"]
+        rollback = self.service.rollback_latest_operation()
+        self.assertEqual(rollback["rolled_back_operation_id"], operation_id)
+        self.assertEqual(self.service.load_portfolio()["positions"], [])
+
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        self.assertEqual(pending["status"], "rolled_back")
+        self.assertFalse(pending["requires_confirmation"])
+
+        summaries = self.service.list_operations()
+        original = next(item for item in summaries if item["operation_id"] == operation_id)
+        rollback_summary = next(item for item in summaries if item["type"] == "rollback")
+        self.assertFalse(original["can_rollback"])
+        self.assertEqual(original["status"], "rolled_back")
+        self.assertFalse(rollback_summary["can_rollback"])
+
+        with self.assertRaisesRegex(ValueError, "已经撤回"):
+            self.service.rollback_operation(operation_id)
+        with self.assertRaisesRegex(ValueError, "回滚操作本身"):
+            self.service.rollback_operation(rollback["rollback_operation_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
