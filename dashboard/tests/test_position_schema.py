@@ -158,6 +158,46 @@ class PositionSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "回滚操作本身"):
             self.service.rollback_operation(rollback["rollback_operation_id"])
 
+    def test_selective_rollback_preserves_later_unrelated_position(self) -> None:
+        first = self.service.safe_add_positions(
+            [self.position("IBKR", 2, 100)],
+            summary="first apple",
+        )
+        second_position = {
+            "account": "长桥",
+            "name": "NVIDIA",
+            "code": "NVDA",
+            "currency": "USD",
+            "asset_type": "stock",
+            "quantity": 4,
+            "cost_price": 200,
+            "source": "manual",
+        }
+        self.service.safe_add_positions([second_position], summary="later nvidia")
+
+        self.service.rollback_operation(first["operation_id"])
+        positions = self.service.load_portfolio()["positions"]
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["account"], "长桥")
+        self.assertEqual(positions[0]["code"], "NVDA")
+        self.assertEqual(positions[0]["quantity"], 4)
+
+    def test_selective_rollback_removes_only_earlier_same_identity_delta(self) -> None:
+        first = self.service.safe_add_positions(
+            [self.position("IBKR", 2, 100)],
+            summary="first apple",
+        )
+        self.service.safe_add_positions(
+            [self.position("IBKR", 3, 200)],
+            summary="later apple",
+        )
+
+        self.service.rollback_operation(first["operation_id"])
+        positions = self.service.load_portfolio()["positions"]
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["quantity"], 3)
+        self.assertAlmostEqual(positions[0]["cost_price"], 200)
+
 
 if __name__ == "__main__":
     unittest.main()

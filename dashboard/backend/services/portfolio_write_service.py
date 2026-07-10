@@ -449,6 +449,104 @@ class PortfolioWriteService:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _apply_selective_inverse(
+        self,
+        current: Dict[str, Any],
+        operation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Undo one historical operation without discarding later unrelated writes.
+
+        The operation's before/after snapshots define a quantity and cost-basis
+        delta per canonical position identity. The inverse delta is applied to
+        the current portfolio. This preserves positions created or changed by
+        later operations on other identities.
+        """
+        before = operation.get("before_snapshot") or {}
+        after = operation.get("after_snapshot") or {}
+
+        def mapped(snapshot: Dict[str, Any]) -> Dict[PositionIdentity, Dict[str, Any]]:
+            return {
+                position_identity(position): self.normalize_position(position, for_storage=True)
+                for position in snapshot.get("positions", [])
+            }
+
+        before_map = mapped(before)
+        after_map = mapped(after)
+        current_map = mapped(current)
+        affected = set(before_map) | set(after_map)
+        epsilon = 1e-8
+
+        for identity in affected:
+            before_position = before_map.get(identity)
+            after_position = after_map.get(identity)
+            if before_position == after_position:
+                continue
+
+            current_position = current_map.get(identity)
+            before_qty = to_float((before_position or {}).get("quantity"), 0.0) or 0.0
+            after_qty = to_float((after_position or {}).get("quantity"), 0.0) or 0.0
+            current_qty = to_float((current_position or {}).get("quantity"), 0.0) or 0.0
+
+            before_total = to_float((before_position or {}).get("total_cost"), None)
+            if before_total is None:
+                before_total = before_qty * (to_float((before_position or {}).get("cost_price"), 0.0) or 0.0)
+            after_total = to_float((after_position or {}).get("total_cost"), None)
+            if after_total is None:
+                after_total = after_qty * (to_float((after_position or {}).get("cost_price"), 0.0) or 0.0)
+            current_total = to_float((current_position or {}).get("total_cost"), None)
+            if current_total is None:
+                current_total = current_qty * (to_float((current_position or {}).get("cost_price"), 0.0) or 0.0)
+
+            quantity_delta = after_qty - before_qty
+            total_cost_delta = after_total - before_total
+            target_qty = current_qty - quantity_delta
+            target_total = current_total - total_cost_delta
+
+            if target_qty < -epsilon:
+                raise ValueError(
+                    f"无法单独撤回{identity}：后续操作已消耗该持仓，请先撤回相关的后续操作"
+                )
+            if target_total < -epsilon:
+                raise ValueError(
+                    f"无法单独撤回{identity}：当前成本基础与历史操作冲突"
+                )
+
+            if abs(target_qty) <= epsilon:
+                current_map.pop(identity, None)
+                continue
+
+            template = dict(current_position or before_position or after_position or {})
+            template["account"], template["code"], template["currency"] = identity
+            template["quantity"] = target_qty
+            template["available_qty"] = min(
+                to_float(template.get("available_qty"), target_qty) or target_qty,
+                target_qty,
+            )
+            template["total_cost"] = max(target_total, 0.0)
+            template["cost_price"] = template["total_cost"] / target_qty
+            template["updated_at"] = utc_now_iso()
+
+            # When no later version exists, restore descriptive metadata from
+            # the state before the operation.
+            if current_position is None and before_position:
+                for key in ("name", "asset_type", "note", "source", "side", "current_price", "created_at"):
+                    if key in before_position:
+                        template[key] = before_position[key]
+            current_map[identity] = self.normalize_position(template, for_storage=True)
+
+        current_cash = to_float(current.get("cash"), 0.0) or 0.0
+        before_cash = to_float(before.get("cash"), 0.0) or 0.0
+        after_cash = to_float(after.get("cash"), 0.0) or 0.0
+        target_cash = current_cash - (after_cash - before_cash)
+        if target_cash < -epsilon:
+            raise ValueError("无法单独撤回：后续操作已使用相关现金")
+
+        result = deepcopy(current)
+        result["positions"] = list(current_map.values())
+        result["cash"] = 0.0 if abs(target_cash) <= epsilon else target_cash
+        result["updated_at"] = utc_now_iso()
+        return result
+
     def rollback_operation(self, operation_id: str) -> Dict[str, Any]:
         operation = self.load_operation(operation_id)
         if operation.get("type") == "rollback":
@@ -459,13 +557,14 @@ class PortfolioWriteService:
         if not before_snapshot:
             raise ValueError("operation does not have before_snapshot")
         current = self.load_portfolio()
+        restored = self._apply_selective_inverse(current, operation)
         backup_path = self.backup_portfolio()
-        self.save_portfolio_atomic(before_snapshot)
+        self.save_portfolio_atomic(restored)
         rollback = self.create_operation(
             operation_type="rollback",
             summary=f"Rollback operation {operation_id}",
             before_snapshot=current,
-            after_snapshot=before_snapshot,
+            after_snapshot=restored,
             pending_action={"rolled_back_operation_id": operation_id},
             backup_path=backup_path,
             imported_positions=0,

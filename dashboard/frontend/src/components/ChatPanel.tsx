@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Image, Loader2, X, Upload, MessageSquare, PlusCircle, History } from 'lucide-react'
+import { Send, Image, Loader2, X, Upload, MessageSquare, PlusCircle, History, RotateCcw } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useQueryClient } from '@tanstack/react-query'
@@ -14,11 +14,13 @@ function PendingActionCard({
   onRevise,
   onConfirm,
   onCancel,
+  onRollback,
 }: {
   pending: PendingAction
   onRevise: (message: string) => Promise<void>
   onConfirm: () => Promise<void>
   onCancel: () => Promise<void>
+  onRollback?: () => Promise<void>
 }) {
   const [reviseText, setReviseText] = useState('')
   const [isWorking, setIsWorking] = useState(false)
@@ -66,7 +68,23 @@ function PendingActionCard({
         </div>
       )}
       {pending.status === 'confirmed' ? (
-        <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>
+          {pending.operation_id && onRollback && (
+            <button
+              onClick={() => run(async () => {
+                const target = change.name || change.code || '这条记录'
+                if (!window.confirm(`确定撤回${target}的这次写入吗？后续其他记录会保留。`)) return
+                await onRollback()
+              })}
+              disabled={isWorking}
+              className="flex items-center gap-1.5 rounded bg-amber-600/90 px-3 py-1.5 text-sm text-white hover:bg-amber-500 disabled:opacity-50"
+            >
+              <RotateCcw className="h-4 w-4" />
+              撤回此条
+            </button>
+          )}
+        </div>
       ) : pending.status === 'rolled_back' ? (
         <div className="text-sm text-amber-300">该次写入已撤回，Portfolio 已恢复。</div>
       ) : pending.status === 'cancelled' ? (
@@ -592,6 +610,18 @@ export default function ChatPanel() {
                 await portfolioService.aiCancel(message.pendingAction.pending_id)
                 updatePendingMessage(index, { ...message.pendingAction, status: 'cancelled', requires_confirmation: false })
               }}
+              onRollback={message.pendingAction?.operation_id ? async () => {
+                const operationId = message.pendingAction!.operation_id!
+                await portfolioService.rollback(operationId)
+                queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+                queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+                await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+                updatePendingMessage(index, {
+                  ...message.pendingAction!,
+                  status: 'rolled_back',
+                  requires_confirmation: false,
+                })
+              } : undefined}
             />
           ) : isUser ? (
             <p className="whitespace-pre-wrap">{message.content}</p>
@@ -608,7 +638,7 @@ export default function ChatPanel() {
   return (
     <div
       ref={dropZoneRef}
-      className={`flex h-full flex-col card relative ${
+      className={`relative flex h-full min-h-0 flex-col overflow-hidden card ${
         isDragging ? 'ring-2 ring-primary-500 ring-offset-2 ring-offset-slate-900' : ''
       }`}
       onDragEnter={handleDragEnter}
@@ -628,7 +658,7 @@ export default function ChatPanel() {
       )}
 
       {/* 顶部工具栏 */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-700">
+      <div className="flex shrink-0 items-center justify-between border-b border-slate-700 px-4 py-3">
         <div className="flex items-center space-x-2">
           <MessageSquare className="h-5 w-5 text-slate-400" />
           <span className="text-sm font-medium text-slate-300">
@@ -657,7 +687,7 @@ export default function ChatPanel() {
       </div>
 
       {/* 消息列表 */}
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 custom-scrollbar">
         {messages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-slate-400">
             <div className="text-center">
@@ -727,7 +757,7 @@ export default function ChatPanel() {
       )}
 
       {/* 输入区域 */}
-      <form onSubmit={handleSubmit} className="border-t border-slate-700 p-4">
+      <form onSubmit={handleSubmit} className="shrink-0 border-t border-slate-700 p-4">
         <div className="flex items-center gap-3">
           <input
             type="file"
