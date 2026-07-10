@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { TrendingUp, TrendingDown, RefreshCw, Edit2, Trash2, X, Save, PlusCircle, RotateCcw } from 'lucide-react'
 import { portfolioService } from '@/services'
 import type { Position } from '@/types'
@@ -215,14 +215,28 @@ export default function Portfolio() {
   const {
     data: portfolio,
     isLoading,
-    refetch,
     isRefetching,
   } = useQuery({
-    queryKey: ['portfolio', 'live'],
-    queryFn: portfolioService.getLivePortfolio,
-    refetchInterval: autoRefresh ? 60000 : false, // 每60秒自动刷新
+    queryKey: ['portfolio'],
+    queryFn: portfolioService.getPortfolio,
     refetchOnWindowFocus: false,
   })
+
+
+  const refreshQuotesMutation = useMutation({
+    mutationFn: portfolioService.refresh,
+    onSuccess: async () => {
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+    },
+  })
+
+  useEffect(() => {
+    if (!autoRefresh) return
+    const timer = window.setInterval(() => {
+      if (!refreshQuotesMutation.isPending) refreshQuotesMutation.mutate()
+    }, 60000)
+    return () => window.clearInterval(timer)
+  }, [autoRefresh])
 
   const { data: operations = [], refetch: refetchOperations } = useQuery({
     queryKey: ['portfolio', 'operations'],
@@ -231,9 +245,9 @@ export default function Portfolio() {
 
   const addPositionMutation = useMutation({
     mutationFn: portfolioService.addPosition,
-    onSuccess: () => {
+    onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-      queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
       refetchOperations()
     }
   })
@@ -241,9 +255,9 @@ export default function Portfolio() {
   const updatePositionMutation = useMutation({
     mutationFn: ({ identity, data }: { identity: { account: string; code: string; currency: string }; data: { quantity: number; cost_price: number } }) =>
       portfolioService.updatePosition(identity, data),
-    onSuccess: () => {
+    onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-      queryClient.refetchQueries({ queryKey: ['portfolio'] })
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
       refetchOperations()
       setEditingPosition(null)
     }
@@ -251,18 +265,18 @@ export default function Portfolio() {
 
   const deletePositionMutation = useMutation({
     mutationFn: portfolioService.removePosition,
-    onSuccess: () => {
+    onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-      queryClient.refetchQueries({ queryKey: ['portfolio'] })
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
       refetchOperations()
     }
   })
 
   const rollbackMutation = useMutation({
     mutationFn: portfolioService.rollback,
-    onSuccess: () => {
+    onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-      queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
       refetchOperations()
     }
   })
@@ -356,11 +370,11 @@ export default function Portfolio() {
               新增持仓
             </button>
             <button
-              onClick={() => refetch()}
-              disabled={isRefetching}
+              onClick={() => refreshQuotesMutation.mutate()}
+              disabled={refreshQuotesMutation.isPending || isRefetching}
               className="flex items-center px-4 py-2 bg-primary-600 hover:bg-primary-500 rounded-lg transition-colors disabled:opacity-50"
             >
-              <RefreshCw className={`h-4 w-4 mr-2 ${isRefetching ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`h-4 w-4 mr-2 ${refreshQuotesMutation.isPending || isRefetching ? 'animate-spin' : ''}`} />
               刷新行情
             </button>
           </div>

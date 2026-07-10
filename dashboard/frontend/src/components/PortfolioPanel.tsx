@@ -1,19 +1,22 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { TrendingUp, TrendingDown, RefreshCw } from 'lucide-react'
 import { portfolioService } from '@/services'
 import type { Position } from '@/types'
 
 export default function PortfolioPanel() {
-  const {
-    data: portfolio,
-    isLoading,
-    refetch,
-    isRefetching,
-  } = useQuery({
-    queryKey: ['portfolio', 'live'],
-    queryFn: portfolioService.getLivePortfolio,
+  const queryClient = useQueryClient()
+  const { data: portfolio, isLoading } = useQuery({
+    queryKey: ['portfolio'],
+    queryFn: portfolioService.getPortfolio,
     refetchInterval: 60000,
     refetchOnWindowFocus: false,
+  })
+
+  const refreshMutation = useMutation({
+    mutationFn: portfolioService.refresh,
+    onSuccess: async () => {
+      await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+    },
   })
 
   const formatMoney = (value: number) => {
@@ -74,9 +77,7 @@ export default function PortfolioPanel() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">持仓</h2>
         </div>
-        <div className="flex items-center justify-center py-8 text-slate-400">
-          加载中...
-        </div>
+        <div className="flex items-center justify-center py-8 text-slate-400">加载中...</div>
       </div>
     )
   }
@@ -87,15 +88,13 @@ export default function PortfolioPanel() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">持仓</h2>
           <button
-            onClick={() => refetch()}
+            onClick={() => refreshMutation.mutate()}
             className="p-2 text-slate-400 hover:text-white rounded-lg transition-colors"
           >
-            <RefreshCw className={`h-4 w-4 ${isRefetching ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`h-4 w-4 ${refreshMutation.isPending ? 'animate-spin' : ''}`} />
           </button>
         </div>
-        <div className="text-center py-8 text-slate-400">
-          暂无持仓
-        </div>
+        <div className="text-center py-8 text-slate-400">暂无持仓</div>
       </div>
     )
   }
@@ -105,20 +104,18 @@ export default function PortfolioPanel() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold">持仓</h2>
         <button
-          onClick={() => refetch()}
-          className="p-2 text-slate-400 hover:text-white rounded-lg transition-colors"
+          onClick={() => refreshMutation.mutate()}
+          disabled={refreshMutation.isPending}
+          className="p-2 text-slate-400 hover:text-white rounded-lg transition-colors disabled:opacity-50"
         >
-          <RefreshCw className={`h-4 w-4 ${isRefetching ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`h-4 w-4 ${refreshMutation.isPending ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
-      {/* 持仓汇总 */}
       <div className="grid grid-cols-2 gap-4 mb-4 p-3 bg-slate-700/50 rounded-lg">
         <div>
           <div className="text-sm text-slate-400">持仓市值</div>
-          <div className="font-semibold">
-            {formatMoney(portfolio.total_market_value)}
-          </div>
+          <div className="font-semibold">{formatMoney(portfolio.total_market_value)}</div>
         </div>
         <div>
           <div className="text-sm text-slate-400">总盈亏</div>
@@ -132,10 +129,7 @@ export default function PortfolioPanel() {
         </div>
       </div>
 
-      {/* 持仓列表 */}
-      <div className="divide-y divide-slate-700">
-        {portfolio.positions.map(renderPosition)}
-      </div>
+      <div className="divide-y divide-slate-700">{portfolio.positions.map(renderPosition)}</div>
     </div>
   )
 }

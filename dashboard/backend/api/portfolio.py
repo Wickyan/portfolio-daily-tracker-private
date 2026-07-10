@@ -49,8 +49,11 @@ async def get_portfolio():
 @router.get("/live")
 async def get_live_portfolio():
     service = get_service()
-    await service.refresh_portfolio()
-    return await service.get_portfolio()
+    refresh_result = await service.refresh_portfolio()
+    portfolio = await service.get_portfolio()
+    if not refresh_result.get("ok", False):
+        portfolio["refresh_warning"] = refresh_result.get("error") or "行情刷新失败，已返回缓存数据"
+    return portfolio
 
 
 @router.post("/add")
@@ -139,8 +142,14 @@ async def remove_position(
 @router.post("/refresh")
 async def refresh_portfolio():
     service = get_service()
-    await service.refresh_portfolio()
-    return {"message": "持仓价格已刷新"}
+    result = await service.refresh_portfolio()
+    if result.get("ok"):
+        return {"ok": True, "message": "持仓价格已刷新"}
+    return {
+        "ok": False,
+        "message": "行情刷新失败，已保留原有价格",
+        "error": result.get("error", ""),
+    }
 
 
 @router.get("/summary")

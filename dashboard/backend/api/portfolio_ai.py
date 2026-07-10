@@ -31,6 +31,11 @@ router = APIRouter()
 InputType = Literal["text", "image_text"]
 
 COMMON_ACCOUNTS = {"长桥", "哈富", "IBKR", "尊嘉", "华盛通", "银河"}
+ACCOUNT_ALIASES = {
+    "IB": "IBKR",
+    "盈透": "IBKR",
+    "盈透证券": "IBKR",
+}
 COMMON_ASSET_WORDS = {"苹果", "微软", "英伟达", "特斯拉", "比亚迪", "腾讯", "腾讯控股", "小米", "海外科技", "纳指ETF"}
 NEW_ACCOUNT_HINTS = {"富途", "老虎", "雪盈", "中信证券", "银河2号"}
 
@@ -172,28 +177,37 @@ def infer_currency(message: str) -> Optional[str]:
     return None
 
 
+def normalize_account(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    account = str(value).strip()
+    if not account:
+        return None
+    return ACCOUNT_ALIASES.get(account.upper(), ACCOUNT_ALIASES.get(account, account))
+
+
 def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[str], Optional[str]]:
     text = message.strip()
     if allow_single and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff]{2,12}", text):
-        return text, "single"
+        return normalize_account(text), "single"
 
     account_match = re.search(r"(?:账户|券商|分组)(?:还是|为|是|:|：)?\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})", text)
     if account_match:
-        return account_match.group(1), "explicit"
+        return normalize_account(account_match.group(1)), "explicit"
 
     same_match = re.search(r"(?:还是|同上账户|这个账户)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})", text)
     if same_match:
-        return same_match.group(1), "explicit"
+        return normalize_account(same_match.group(1)), "explicit"
 
     for account in sorted(COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS, key=len, reverse=True):
         if re.search(rf"{re.escape(account)}(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入)", text, re.IGNORECASE):
-            return account, "explicit"
+            return normalize_account(account), "explicit"
 
     prefix_match = re.match(r"^([A-Za-z0-9\u4e00-\u9fff]{2,12})(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入)", text, re.IGNORECASE)
     if prefix_match:
         prefix = prefix_match.group(1)
         if prefix not in COMMON_ASSET_WORDS:
-            return prefix, "candidate"
+            return normalize_account(prefix), "candidate"
     return None, None
 
 
@@ -394,7 +408,10 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
             updated = previous["changes"][0].copy()
             updated["account"] = account
             updated["updated_at"] = utc_now_iso()
-            warnings = list(previous.get("warnings", []))
+            warnings = [
+                warning for warning in previous.get("warnings", [])
+                if "新账户分组" not in warning
+            ]
             if account not in COMMON_ACCOUNTS:
                 warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
             updated = service.normalize_position(updated)

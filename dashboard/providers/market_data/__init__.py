@@ -5,10 +5,12 @@ from .akshare_provider import AKShareProvider
 from .eastmoney_provider import EastmoneyDirectProvider
 from .google_finance_provider import GoogleFinanceProvider
 from .multi_source_provider import MultiSourceProvider
+from .tencent_provider import TencentDirectProvider
 
 __all__ = [
     'AKShareProvider',
     'EastmoneyDirectProvider',
     'GoogleFinanceProvider',
     'MultiSourceProvider',
+    'TencentDirectProvider',
 ]

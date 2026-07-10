@@ -90,8 +90,14 @@ function PendingActionCard({
               修改
             </button>
             <button
-              onClick={() => run(onConfirm)}
-              disabled={isWorking || !pending.requires_confirmation}
+              onClick={() => run(async () => {
+                if (reviseText.trim()) {
+                  await onRevise(reviseText.trim())
+                  setReviseText('')
+                }
+                await onConfirm()
+              })}
+              disabled={isWorking || (!pending.requires_confirmation && !reviseText.trim())}
               className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
             >
               确认写入
@@ -294,8 +300,8 @@ export default function ChatPanel() {
         } else {
           await portfolioService.aiConfirm(latestPending.pending_id!)
           queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-          queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
           queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+          await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
         }
         setMessages([...nextMessages, userEntry])
       } catch (error) {
@@ -479,7 +485,7 @@ export default function ChatPanel() {
                 if (!message.pendingAction?.pending_id) return
                 await portfolioService.aiConfirm(message.pendingAction.pending_id)
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-                queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+                await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
                 updatePendingMessage(index, { ...message.pendingAction, status: 'confirmed', requires_confirmation: false })
               }}
               onCancel={async () => {

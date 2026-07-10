@@ -15,7 +15,7 @@ from core.llm import LLMConfig
 from core.models import AgentContext, Market
 from core.memory import MemoryManager, MemoryExtractor, LLMMemoryExtractor
 from providers.llm import create_llm_provider, LLMProviderType
-from providers.market_data import EastmoneyDirectProvider, GoogleFinanceProvider, AKShareProvider, MultiSourceProvider
+from providers.market_data import TencentDirectProvider, EastmoneyDirectProvider, GoogleFinanceProvider, AKShareProvider, MultiSourceProvider
 from providers.news import RSSNewsProvider
 from providers.portfolio.manual import ManualPortfolioProvider
 from agents.trader import TraderAgent
@@ -140,15 +140,17 @@ class AgentService:
         """初始化市场数据 Provider"""
         # 优先走东方财富直连单票接口（A股更稳），
         # 再回退到 Yahoo/AKShare。
+        tencent_provider = TencentDirectProvider()
         eastmoney_provider = EastmoneyDirectProvider()
         google_provider = GoogleFinanceProvider()
         akshare_provider = AKShareProvider()
 
         self.market_provider = MultiSourceProvider([
+            tencent_provider,
             eastmoney_provider,
             google_provider,
-            akshare_provider
-        ])
+            akshare_provider,
+        ], provider_timeout=5.0)
 
     def _init_portfolio_provider(self):
         """初始化持仓 Provider"""
@@ -728,9 +730,14 @@ class AgentService:
         """更新持仓"""
         self.portfolio_provider.update_position(symbol, quantity=quantity, cost_price=cost_price)
 
-    async def refresh_portfolio(self):
-        """刷新持仓价格"""
-        await self.portfolio_provider.refresh()
+    async def refresh_portfolio(self) -> Dict[str, Any]:
+        """刷新持仓价格；行情源失败时保留已有账本数据。"""
+        try:
+            await self.portfolio_provider.refresh()
+            return {"ok": True}
+        except Exception as exc:
+            print(f"[持仓刷新] 行情刷新失败，保留原数据: {exc}")
+            return {"ok": False, "error": str(exc)}
 
     # ==================== 行情接口 ====================
 
