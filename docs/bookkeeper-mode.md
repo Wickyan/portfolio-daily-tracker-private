@@ -62,4 +62,4 @@ Bookkeeper 只展示用户友好字段：
 
 ## 账户现金
 
-bookkeeper支持`deposit`、`withdraw`和`set_cash`三类现金操作。现金按`account+currency`保存，不作为position。所有现金写入仍必须经过preview和confirm，并可通过operation回滚。
+bookkeeper支持`deposit`、`withdraw`、`set_cash`和`fx_exchange`。`fx_exchange`会生成同一账户的换出withdraw与换入deposit，并在一个operation中原子确认、原子回滚。现金按`account+currency`保存，不作为position。所有现金写入仍必须经过preview和confirm，并可通过operation回滚。

@@ -51,7 +51,7 @@ Portfolio 页面“新增持仓”也走统一安全写入服务，会生成 bac
 
 账户现金按`account+currency`记录，支持：
 
-- AI自然语言设置余额、入金和出金
+- AI自然语言设置余额、入金、出金和换汇
 - Settings页面手动设置指定账户/币种余额
 - backup、operation和rollback
 - USD/HKD按实时汇率折算为CNY
@@ -63,6 +63,17 @@ Portfolio 页面“新增持仓”也走统一安全写入服务，会生成 bac
 ```
 
 持仓明细保留原币种价格和市值，顶部汇总统一显示CNY折算值。
+
+### 自然语言现金示例
+
+```text
+IB港币减少4000        → IBKR/HKD withdraw 4000
+IB港币变为20.32       → IBKR/HKD set_cash 20.32
+长桥500港币换成20美元 → 同一操作内HKD withdraw 500 + USD deposit 20
+银河提现了5k元        → 银河/CNY withdraw 5000
+```
+
+换汇记录保存实际成交的两端金额；资产汇总仍使用当前USD/CNY、HKD/CNY等实时汇率。减少现金、提现和换汇会在preview阶段检查当前对应币种余额；余额不足时禁用确认，后端confirm阶段还会再次校验。
 
 ## 测试工具
 

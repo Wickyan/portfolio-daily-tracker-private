@@ -24,7 +24,8 @@ function PendingActionCard({
 }) {
   const [reviseText, setReviseText] = useState('')
   const [isWorking, setIsWorking] = useState(false)
-  const change: PendingChange = pending.changes?.[0] || {}
+  const changes: PendingChange[] = pending.changes?.length ? pending.changes : [{}]
+  const change: PendingChange = changes[0]
 
   const field = (label: string, value?: string | number | null) => (
     <div className="flex justify-between gap-4 border-b border-slate-700/60 py-1.5 text-sm">
@@ -45,30 +46,61 @@ function PendingActionCard({
   return (
     <div className="space-y-3 rounded-lg border border-primary-500/40 bg-slate-800 p-4">
       <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
-      <div className="rounded bg-slate-900/60 px-3 py-2">
-        {field('账户分组', change.account)}
-        {['deposit', 'withdraw', 'set_cash'].includes(pending.action_type || '') ? (
-          <>
-            {field('币种', change.currency)}
-            {field('金额', change.amount)}
-            {field('操作', pending.action_type)}
-          </>
-        ) : (
-          <>
-            {field('标的', change.name)}
-            {field('代码', change.code)}
-            {field('币种', change.currency)}
-            {field('类型', change.asset_type)}
-            {field('操作', pending.action_type)}
-            {field('数量', change.quantity)}
-            {field('成本价', change.cost_price)}
-            {field('总成本', change.total_cost)}
-            {field('手续费', change.fee ?? '未提供')}
-          </>
-        )}
+      <div className="space-y-2">
+        {changes.map((item, index) => {
+          const childAction = item.action_type || pending.action_type || ''
+          const isCashAction = ['deposit', 'withdraw', 'set_cash'].includes(childAction)
+          const actionLabel: Record<string, string> = {
+            deposit: '增加现金',
+            withdraw: '减少现金',
+            set_cash: '设置现金余额',
+            fx_exchange: '换汇',
+            sell: '卖出',
+            add_or_update: '买入/新增',
+          }
+          const sectionTitle = pending.action_type === 'fx_exchange'
+            ? (childAction === 'withdraw' ? '换出' : '换入')
+            : (changes.length > 1 ? `第${index + 1}条` : '')
+          return (
+            <div key={`${childAction}-${item.account || ''}-${item.currency || ''}-${index}`} className="rounded bg-slate-900/60 px-3 py-2">
+              {sectionTitle && <div className="mb-1 text-sm font-semibold text-primary-300">{sectionTitle}</div>}
+              {field('账户分组', item.account)}
+              {isCashAction ? (
+                <>
+                  {field('币种', item.currency)}
+                  {field('金额', item.amount)}
+                  {field('操作', actionLabel[childAction] || childAction)}
+                </>
+              ) : (
+                <>
+                  {field('标的', item.name)}
+                  {field('代码', item.code)}
+                  {field('币种', item.currency)}
+                  {field('类型', item.asset_type)}
+                  {field('操作', actionLabel[childAction] || childAction)}
+                  {field('数量', item.quantity)}
+                  {field('成本价', item.cost_price)}
+                  {field('总成本', item.total_cost)}
+                  {field('手续费', item.fee ?? '未提供')}
+                </>
+              )}
+            </div>
+          )
+        })}
       </div>
       {pending.missing_fields?.length > 0 && (
-        <div className="text-sm text-amber-300">缺少：{pending.missing_fields.join('、')}</div>
+        <div className="text-sm text-amber-300">
+          缺少/阻止写入：{pending.missing_fields.map((item) => ({
+            account: '账户',
+            amount: '金额',
+            positive_amount: '金额必须大于0',
+            amount_non_negative: '余额不能为负',
+            available_cash: '可用现金不足',
+            distinct_currencies: '换出和换入币种必须不同',
+            'source_amount/currency': '换出金额和币种',
+            'target_amount/currency': '换入金额和币种',
+          }[item] || item)).join('、')}
+        </div>
       )}
       {pending.warnings?.length > 0 && (
         <div className="space-y-1 text-sm text-slate-300">
@@ -102,7 +134,9 @@ function PendingActionCard({
           {pending.operation_id && onRollback && (
             <button
               onClick={() => run(async () => {
-                const target = change.name || change.code || '这条记录'
+                const target = pending.action_type === 'fx_exchange'
+                  ? '这笔换汇'
+                  : (change.name || change.code || '这条记录')
                 if (!window.confirm(`确定撤回${target}的这次写入吗？后续其他记录会保留。`)) return
                 await onRollback()
               })}

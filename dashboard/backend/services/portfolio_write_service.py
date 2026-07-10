@@ -294,7 +294,9 @@ class PortfolioWriteService:
             amount = to_float(change.get("amount"), None)
             if amount is None:
                 missing.append("amount")
-            elif amount < 0:
+            elif action_type in {"deposit", "withdraw"} and amount <= 0:
+                missing.append("positive_amount")
+            elif action_type == "set_cash" and amount < 0:
                 missing.append("amount_non_negative")
             return missing
         normalized = self.normalize_position(change)
@@ -324,7 +326,12 @@ class PortfolioWriteService:
                 account = str(raw_change.get("account") or "").strip()
                 currency = str(raw_change.get("currency") or "").upper().strip()
                 amount = to_float(raw_change.get("amount"), None)
-                if not account or not currency or amount is None or amount < 0:
+                invalid_amount = (
+                    amount is None
+                    or (action_type in {"deposit", "withdraw"} and amount <= 0)
+                    or (action_type == "set_cash" and amount < 0)
+                )
+                if not account or not currency or invalid_amount:
                     raise ValueError("现金操作缺少有效的account/currency/amount")
                 matches = [item for item in cash_accounts if item["account"] == account and item["currency"] == currency]
                 if len(matches) > 1:

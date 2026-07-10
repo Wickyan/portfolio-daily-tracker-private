@@ -231,6 +231,72 @@ class PositionSchemaTest(unittest.TestCase):
         self.service.rollback_operation(usd["operation_id"])
         self.assertEqual(self.service.load_portfolio()["cash_accounts"], [])
 
+
+    def test_fx_exchange_is_atomic_and_rollback_restores_both_currencies(self) -> None:
+        self.service.safe_set_cash_account("长桥", "HKD", 1000)
+        exchange = self.service.safe_add_positions([
+            {
+                "action_type": "withdraw",
+                "account": "长桥",
+                "currency": "HKD",
+                "amount": 500,
+                "note": "fx_exchange_out",
+            },
+            {
+                "action_type": "deposit",
+                "account": "长桥",
+                "currency": "USD",
+                "amount": 20,
+                "note": "fx_exchange_in",
+            },
+        ], summary="长桥500HKD换20USD")
+
+        cash = {
+            (item["account"], item["currency"]): item["amount"]
+            for item in self.service.load_portfolio()["cash_accounts"]
+        }
+        self.assertEqual(cash[("长桥", "HKD")], 500)
+        self.assertEqual(cash[("长桥", "USD")], 20)
+
+        self.service.rollback_operation(exchange["operation_id"])
+        cash = {
+            (item["account"], item["currency"]): item["amount"]
+            for item in self.service.load_portfolio()["cash_accounts"]
+        }
+        self.assertEqual(cash, {("长桥", "HKD"): 1000})
+
+    def test_fx_exchange_fails_atomically_when_source_cash_is_insufficient(self) -> None:
+        self.service.safe_set_cash_account("长桥", "HKD", 100)
+        before = self.service.load_portfolio()
+        with self.assertRaisesRegex(ValueError, "现金不足"):
+            self.service.safe_add_positions([
+                {"action_type": "withdraw", "account": "长桥", "currency": "HKD", "amount": 500},
+                {"action_type": "deposit", "account": "长桥", "currency": "USD", "amount": 20},
+            ], summary="insufficient exchange")
+        self.assertEqual(self.service.load_portfolio(), before)
+
+    def test_set_one_currency_does_not_overwrite_other_currency(self) -> None:
+        self.service.safe_set_cash_account("IBKR", "USD", 1000)
+        self.service.safe_set_cash_account("IBKR", "HKD", 5000)
+        self.service.safe_set_cash_account("IBKR", "HKD", 20.32)
+        cash = {
+            (item["account"], item["currency"]): item["amount"]
+            for item in self.service.load_portfolio()["cash_accounts"]
+        }
+        self.assertEqual(cash[("IBKR", "USD")], 1000)
+        self.assertAlmostEqual(cash[("IBKR", "HKD")], 20.32)
+
+    def test_zero_deposit_and_withdraw_are_rejected(self) -> None:
+        for action in ("deposit", "withdraw"):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(ValueError, "有效的account/currency/amount"):
+                    self.service.safe_add_positions([{
+                        "action_type": action,
+                        "account": "IBKR",
+                        "currency": "USD",
+                        "amount": 0,
+                    }], summary="zero cash delta")
+
     def test_cash_withdraw_cannot_go_negative(self) -> None:
         self.service.safe_set_cash_account("银河", "CNY", 100)
         with self.assertRaisesRegex(ValueError, "现金不足"):

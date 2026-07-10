@@ -106,3 +106,17 @@ symbol→code
 - 每条持仓返回`asset_weight_pct=该持仓CNY市值/总资产CNY`，页面显示为“持仓比例”；另返回`holding_weight_pct=该持仓CNY市值/全部持仓CNY市值`。
 - 每条账户现金返回`asset_weight_pct=该现金CNY折算值/总资产CNY`。同一券商的不同币种分别计算后再参与总资产汇总。
 - 新增或确认持仓后，后端先刷新实时行情再返回，前端随后重新获取总资产。
+
+
+## 换汇操作
+
+换汇不新增独立余额类型，而是在同一个operation中保存两条现金变化：
+
+```json
+[
+  {"action_type": "withdraw", "account": "长桥", "currency": "HKD", "amount": 500},
+  {"action_type": "deposit", "account": "长桥", "currency": "USD", "amount": 20}
+]
+```
+
+两条变化必须同时成功；preview和confirm都会检查换出币种余额，余额不足时整笔操作失败，不得只写入换入币种。回滚时两条变化也同时撤回。成交金额使用用户提供的实际换出/换入金额，总资产则按当前实时汇率重新估值。

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from backend.api.portfolio_ai import parse_bookkeeping_message
+from backend.api.portfolio_ai import enrich_cash_availability, parse_bookkeeping_message
 
 
 class BookkeepingParserTest(unittest.TestCase):
@@ -175,6 +175,134 @@ class BookkeepingParserTest(unittest.TestCase):
         self.assertEqual(parsed["action_type"], "set_cash")
         self.assertEqual(parsed["changes"][0]["account"], "IBKR")
         self.assertEqual(parsed["changes"][0]["amount"], 2000)
+
+
+    def test_ib_hkd_decrease_is_withdraw(self) -> None:
+        parsed = parse_bookkeeping_message("ib港币减少4000")
+        self.assertEqual(parsed["action_type"], "withdraw")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "IBKR")
+        self.assertEqual(change["currency"], "HKD")
+        self.assertEqual(change["amount"], 4000)
+
+    def test_ib_hkd_change_to_exact_balance_is_set_cash(self) -> None:
+        parsed = parse_bookkeeping_message("ib港币变为20.32")
+        self.assertEqual(parsed["action_type"], "set_cash")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "IBKR")
+        self.assertEqual(change["currency"], "HKD")
+        self.assertAlmostEqual(change["amount"], 20.32)
+
+    def test_cash_exchange_creates_atomic_out_and_in_changes(self) -> None:
+        parsed = parse_bookkeeping_message("长桥500港币换成了20美元")
+        self.assertEqual(parsed["action_type"], "fx_exchange")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertEqual(len(parsed["changes"]), 2)
+        source, target = parsed["changes"]
+        self.assertEqual(source["action_type"], "withdraw")
+        self.assertEqual(source["account"], "长桥")
+        self.assertEqual(source["currency"], "HKD")
+        self.assertEqual(source["amount"], 500)
+        self.assertEqual(target["action_type"], "deposit")
+        self.assertEqual(target["account"], "长桥")
+        self.assertEqual(target["currency"], "USD")
+        self.assertEqual(target["amount"], 20)
+        self.assertTrue(any("总资产仍按当前实时汇率折算" in item for item in parsed["warnings"]))
+
+    def test_cash_exchange_without_account_can_revise_both_legs(self) -> None:
+        first = parse_bookkeeping_message("500港币换成20美元")
+        self.assertEqual(first["action_type"], "fx_exchange")
+        self.assertEqual(first["missing_fields"], ["account"])
+        pending = {
+            "changes": first["changes"],
+            "missing_fields": first["missing_fields"],
+            "warnings": first["warnings"],
+            "action_type": first["action_type"],
+        }
+        revised = parse_bookkeeping_message("长桥", previous=pending)
+        self.assertEqual(revised["missing_fields"], [])
+        self.assertTrue(all(change["account"] == "长桥" for change in revised["changes"]))
+
+    def test_withdraw_supports_k_suffix(self) -> None:
+        parsed = parse_bookkeeping_message("银河提现了5k元")
+        self.assertEqual(parsed["action_type"], "withdraw")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "银河")
+        self.assertEqual(change["currency"], "CNY")
+        self.assertEqual(change["amount"], 5000)
+
+    def test_cash_shorthand_variants(self) -> None:
+        cases = [
+            ("IB美元增加1.5k", "deposit", "IBKR", "USD", 1500),
+            ("长桥港币减了2千", "withdraw", "长桥", "HKD", 2000),
+            ("银河人民币改成3万", "set_cash", "银河", "CNY", 30000),
+            ("富途现金余额是8000港币", "set_cash", "富途", "HKD", 8000),
+        ]
+        for text, action, account, currency, amount in cases:
+            with self.subTest(text=text):
+                parsed = parse_bookkeeping_message(text)
+                self.assertEqual(parsed["action_type"], action)
+                self.assertEqual(parsed["missing_fields"], [])
+                change = parsed["changes"][0]
+                self.assertEqual(change["account"], account)
+                self.assertEqual(change["currency"], currency)
+                self.assertEqual(change["amount"], amount)
+
+    def test_exchange_rejects_same_currency(self) -> None:
+        parsed = parse_bookkeeping_message("长桥500港币换成400港币")
+        self.assertEqual(parsed["action_type"], "fx_exchange")
+        self.assertIn("distinct_currencies", parsed["missing_fields"])
+
+
+    def test_exchange_language_variants(self) -> None:
+        cases = [
+            ("长桥把500港币换成20美元", "长桥", "HKD", 500, "USD", 20),
+            ("长桥用500HKD换20USD", "长桥", "HKD", 500, "USD", 20),
+            ("IBKR港币500兑换为美元20", "IBKR", "HKD", 500, "USD", 20),
+            ("银河人民币1万换成港币10800", "银河", "CNY", 10000, "HKD", 10800),
+        ]
+        for text, account, source_currency, source_amount, target_currency, target_amount in cases:
+            with self.subTest(text=text):
+                parsed = parse_bookkeeping_message(text)
+                self.assertEqual(parsed["action_type"], "fx_exchange")
+                self.assertEqual(parsed["missing_fields"], [])
+                source, target = parsed["changes"]
+                self.assertEqual(source["account"], account)
+                self.assertEqual(source["currency"], source_currency)
+                self.assertEqual(source["amount"], source_amount)
+                self.assertEqual(target["currency"], target_currency)
+                self.assertEqual(target["amount"], target_amount)
+
+    def test_unrelated_change_word_is_chat_only(self) -> None:
+        parsed = parse_bookkeeping_message("我换了手机")
+        self.assertEqual(parsed["intent"], "chat_only")
+
+
+    def test_cash_availability_blocks_negative_balance(self) -> None:
+        parsed = parse_bookkeeping_message("ib港币减少4000")
+        with patch(
+            "backend.api.portfolio_ai.PortfolioWriteService.load_portfolio",
+            return_value={"positions": [], "cash": 0, "cash_accounts": [
+                {"account": "IBKR", "currency": "HKD", "amount": 100},
+            ]},
+        ):
+            checked = enrich_cash_availability(parsed)
+        self.assertIn("available_cash", checked["missing_fields"])
+        self.assertTrue(any("当前100" in warning for warning in checked["warnings"]))
+
+    def test_cash_availability_accepts_sufficient_exchange_source(self) -> None:
+        parsed = parse_bookkeeping_message("长桥500港币换成20美元")
+        with patch(
+            "backend.api.portfolio_ai.PortfolioWriteService.load_portfolio",
+            return_value={"positions": [], "cash": 0, "cash_accounts": [
+                {"account": "长桥", "currency": "HKD", "amount": 1000},
+            ]},
+        ):
+            checked = enrich_cash_availability(parsed)
+        self.assertEqual(checked["missing_fields"], [])
 
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")

@@ -78,8 +78,12 @@ BOOKKEEPER_SYSTEM_PROMPT = """你是投资组合记账解析助手，不是投�
 - 如果有quantity和cost_price，但没有total_cost，计算total_cost=quantity*cost_price。
 - 手续费未提供时不要编造，写“手续费：未提供，暂未计入或待确认”。
 - 卖出表达中，“成交价”“卖出价”“price”作为成交单价；当前仍只解析，不写入。
-- 现金表达中，“入金”“现金增加”“转入”解析为deposit；“出金”“现金减少”“转出”“提现”解析为withdraw；“账户现金/现金余额”解析为set_cash。
-- 现金按account/group+currency记录amount，不作为position；现金写入同样只能生成待确认信息，必须经confirm后生效。
+- 现金表达中，“入金”“现金增加”“转入”“港币增加1000”解析为deposit；“出金”“现金减少”“转出”“提现”“港币减少1000”解析为withdraw。
+- “账户现金/现金余额/港币变为20.32/美元改成1000”解析为set_cash，表示把该账户该币种的余额设置成目标值，而不是增加目标值。
+- “长桥500港币换成20美元”解析为fx_exchange，内部生成同一账户的一条withdraw(HKD,500)和一条deposit(USD,20)，必须作为同一个待确认操作原子写入和回滚。
+- 换汇时按用户给出的实际换出和换入金额记账，不用实时汇率改写成交金额；Portfolio总资产再按当前实时汇率分别折算各币种。
+- 支持现金金额简写：5k/5K/5千=5000，3w/3W/3万=30000。
+- 现金按account/group+currency记录amount，不作为position；同一账户可同时存在USD、HKD、CNY等多种现金。现金写入同样只能生成待确认信息，必须经confirm后生效。
 
 币种规则：
 - currency是记账币种的最终字段。
