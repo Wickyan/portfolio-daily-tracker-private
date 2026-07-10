@@ -235,10 +235,80 @@ export default function ChatPanel() {
 
     const currentImages = [...selectedImages]
     const userMessage = input.trim()
+    const normalizedCommand = userMessage.replace(/\s+/g, '')
+    const confirmCommands = new Set(['确认', '确认写入', '写入', '保存', '录入', '提交'])
+    const cancelCommands = new Set(['取消', '取消写入', '不写了'])
+
+    let latestPendingIndex = -1
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const pending = messages[i].pendingAction
+      if (pending?.pending_id && pending.status !== 'confirmed' && pending.status !== 'cancelled') {
+        latestPendingIndex = i
+        break
+      }
+    }
 
     // 立即清空输入和图片
     setInput('')
     clearAllImages()
+
+    // “确认/写入/取消”只操作最近一条pending，不再作为普通聊天发送。
+    if (currentImages.length === 0 && (confirmCommands.has(normalizedCommand) || cancelCommands.has(normalizedCommand))) {
+      const userEntry: ChatMessage = { role: 'user', content: userMessage }
+      if (latestPendingIndex < 0) {
+        setMessages([
+          ...messages,
+          userEntry,
+          { role: 'assistant', content: '当前没有待确认记录，请先提交一条交易或持仓信息。' },
+        ])
+        return
+      }
+
+      const latestPending = messages[latestPendingIndex].pendingAction!
+      if (confirmCommands.has(normalizedCommand) && !latestPending.requires_confirmation) {
+        const missing = latestPending.missing_fields?.join('、') || '必要字段'
+        setMessages([
+          ...messages,
+          userEntry,
+          { role: 'assistant', content: `当前记录还不能写入，仍缺少：${missing}。请先补充或修改。` },
+        ])
+        return
+      }
+
+      setLoading(true)
+      try {
+        const nextMessages = messages.map((message, index) => {
+          if (index !== latestPendingIndex || !message.pendingAction) return message
+          return {
+            ...message,
+            pendingAction: {
+              ...message.pendingAction,
+              status: cancelCommands.has(normalizedCommand) ? 'cancelled' : 'confirmed',
+              requires_confirmation: false,
+            },
+          }
+        })
+
+        if (cancelCommands.has(normalizedCommand)) {
+          await portfolioService.aiCancel(latestPending.pending_id!)
+        } else {
+          await portfolioService.aiConfirm(latestPending.pending_id!)
+          queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+          queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+          queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+        }
+        setMessages([...nextMessages, userEntry])
+      } catch (error) {
+        setMessages([
+          ...messages,
+          userEntry,
+          { role: 'assistant', content: `操作失败：${getApiErrorMessage(error)}` },
+        ])
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
 
     // 添加用户消息
     addMessage({

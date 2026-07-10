@@ -109,10 +109,41 @@ def compact_positions() -> List[Dict[str, Any]]:
 
 
 def parse_key_value(message: str, key: str) -> Optional[str]:
-    match = re.search(rf"{key}\s*[:：]\s*([^\s]+)", message, re.IGNORECASE)
+    match = re.search(rf"{re.escape(key)}\s*[:：]\s*([^\s]+)", message, re.IGNORECASE)
     if not match:
         return None
     return match.group(1).strip()
+
+
+def parse_first_key_value(message: str, keys: tuple[str, ...]) -> Optional[str]:
+    for key in keys:
+        value = parse_key_value(message, key)
+        if value is not None:
+            return value
+    return None
+
+
+def looks_like_structured_bookkeeping(message: str) -> bool:
+    """Recognize complete key:value bookkeeping input even without an action verb."""
+    label_groups = (
+        ("account", "账户", "券商", "分组"),
+        ("name", "名称", "标的"),
+        ("code", "symbol", "代码"),
+        ("currency", "币种"),
+        ("asset_type", "type", "类型"),
+        ("quantity", "数量"),
+        ("cost_price", "成本价", "均价"),
+        ("total_cost", "总成本", "总金额"),
+    )
+    present = {
+        index
+        for index, aliases in enumerate(label_groups)
+        if any(re.search(rf"{re.escape(alias)}\s*[:：]", message, re.IGNORECASE) for alias in aliases)
+    }
+    has_identity = bool(present & {0, 1, 2})
+    has_quantity = 5 in present
+    has_cost = bool(present & {6, 7})
+    return has_identity and has_quantity and has_cost and len(present) >= 4
 
 
 def parse_number_after(message: str, labels: tuple[str, ...]) -> Optional[float]:
@@ -168,10 +199,10 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
 
 def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple[Dict[str, Any], List[str]]:
     warnings: List[str] = []
-    name = parse_key_value(message, "name")
-    raw_symbol = parse_key_value(message, "symbol") or parse_key_value(message, "code")
-    currency = (parse_key_value(message, "currency") or infer_currency(message) or "").upper() or None
-    asset_type = parse_key_value(message, "asset_type") or parse_key_value(message, "type")
+    name = parse_first_key_value(message, ("name", "名称", "标的"))
+    raw_symbol = parse_first_key_value(message, ("symbol", "code", "代码"))
+    currency = (parse_first_key_value(message, ("currency", "币种")) or infer_currency(message) or "").upper() or None
+    asset_type = parse_first_key_value(message, ("asset_type", "type", "类型"))
     code = None
 
     if raw_symbol:
@@ -287,6 +318,8 @@ def infer_action(message: str) -> str:
     if any(token in message for token in ["入金", "现金增加", "转入"]):
         return "deposit"
     if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "录入"]):
+        return "add_or_update"
+    if looks_like_structured_bookkeeping(message):
         return "add_or_update"
     return "chat_only"
 
