@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from backend.api.portfolio_ai import parse_bookkeeping_message
+from backend.api.portfolio_ai import (
+    ReviseRequest,
+    ai_revise,
+    load_pending,
+    make_pending,
+    parse_bookkeeping_message,
+    save_pending,
+)
 from backend.services.portfolio_valuation import calculate_portfolio_valuation
 from backend.services.portfolio_write_service import PortfolioWriteService
 
@@ -61,6 +69,42 @@ class CashLanguageFlowTest(unittest.TestCase):
         withdrawal = parse_bookkeeping_message("银河提现了5k元")
         self.service.safe_add_positions(withdrawal["changes"], summary=withdrawal["summary"])
         self.assertEqual(self.cash_map()[("银河", "CNY")], 5000)
+
+
+    def test_currency_revision_creates_successor_pending_card(self) -> None:
+        parsed = parse_bookkeeping_message("银河增加2w")
+        original = make_pending(parsed, "text", "银河增加2w")
+        save_pending(original)
+
+        revised = asyncio.run(ai_revise(ReviseRequest(
+            pending_id=original["pending_id"],
+            message="港币",
+        )))
+
+        self.assertNotEqual(revised["pending_id"], original["pending_id"])
+        self.assertEqual(revised["revises_pending_id"], original["pending_id"])
+        self.assertEqual(revised["changes"][0]["account"], "银河")
+        self.assertEqual(revised["changes"][0]["currency"], "HKD")
+        self.assertEqual(revised["changes"][0]["amount"], 20000)
+        self.assertTrue(revised["requires_confirmation"])
+
+        old = load_pending(original["pending_id"])
+        self.assertEqual(old["status"], "superseded")
+        self.assertFalse(old["requires_confirmation"])
+        self.assertEqual(old["revised_to_pending_id"], revised["pending_id"])
+
+    def test_two_cash_currencies_can_be_applied_second_then_first(self) -> None:
+        first_hkd = parse_bookkeeping_message("银河增加2.2w港币")
+        second_usd = parse_bookkeeping_message("银河增加2.2w美元")
+
+        self.service.safe_add_positions(second_usd["changes"], summary="confirm second USD")
+        self.service.safe_add_positions(first_hkd["changes"], summary="confirm first HKD")
+
+        balances = self.cash_map()
+        self.assertEqual(balances[("银河", "USD")], 22000)
+        self.assertEqual(balances[("银河", "HKD")], 22000)
+        self.assertEqual(len(balances), 2)
+
 
 
 if __name__ == "__main__":

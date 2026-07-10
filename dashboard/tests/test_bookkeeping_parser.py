@@ -334,6 +334,7 @@ class BookkeepingParserTest(unittest.TestCase):
         parsed = parse_bookkeeping_message("小米 尊嘉买入100股 20")
         self.assertEqual(parsed["changes"][0]["account"], "尊嘉")
 
+
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")
         self.assertEqual(parsed["intent"], "chat_only")

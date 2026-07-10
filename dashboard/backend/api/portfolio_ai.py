@@ -149,6 +149,8 @@ def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
         "status": pending.get("status", "pending"),
         "operation_id": pending.get("operation_id"),
         "instrument_candidates": pending.get("instrument_candidates", []),
+        "revises_pending_id": pending.get("revises_pending_id"),
+        "revised_to_pending_id": pending.get("revised_to_pending_id"),
     }
 
 
@@ -1025,6 +1027,143 @@ def apply_direct_code_revision(
     }
 
 
+def parse_currency_revision(message: str) -> Optional[str]:
+    text = re.sub(r"[\s，,。；;:：]", "", str(message or "")).upper()
+    aliases = {
+        "人民币": "CNY",
+        "人民币元": "CNY",
+        "元": "CNY",
+        "RMB": "CNY",
+        "CNY": "CNY",
+        "港币": "HKD",
+        "港元": "HKD",
+        "HKD": "HKD",
+        "美元": "USD",
+        "美金": "USD",
+        "刀": "USD",
+        "USD": "USD",
+    }
+    for prefix in ("币种", "改成", "改为", "修改为", "变成", "变为", "设置为", "设为"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return aliases.get(text)
+
+
+def apply_direct_field_revision(
+    pending: Dict[str, Any],
+    message: str,
+) -> Optional[Dict[str, Any]]:
+    """Apply a concise field-only revision without rebuilding the whole record.
+
+    Examples: 港币、币种HKD、金额3000、数量100、成本价20、长桥。
+    The result is still a new pending action and must be confirmed separately.
+    """
+    if not pending.get("changes"):
+        return None
+
+    action_type = str(pending.get("action_type") or "add_or_update")
+    original_changes = [dict(change) for change in pending.get("changes", [])]
+    warnings = list(pending.get("warnings", []))
+    text = str(message or "").strip()
+
+    currency = parse_currency_revision(text)
+    if currency:
+        if action_type == "fx_exchange" and len(original_changes) > 1:
+            return None
+        for change in original_changes:
+            change["currency"] = currency
+            change["updated_at"] = utc_now_iso()
+        warnings.append(f"已将币种修改为{currency}")
+        return {
+            "intent": "bookkeeping",
+            "summary": "已修改币种，请重新确认",
+            "action_type": action_type,
+            "changes": original_changes,
+            "missing_fields": collect_missing_fields(original_changes, action_type),
+            "warnings": list(dict.fromkeys(warnings)),
+            "instrument_candidates": pending.get("instrument_candidates", []),
+        }
+
+    account, account_source = infer_account(text, allow_single=True)
+    if account and (
+        account in COMMON_ACCOUNTS
+        or account in NEW_ACCOUNT_HINTS
+        or account_source == "explicit"
+        or re.search(r"账户|券商|分组", text)
+    ):
+        for change in original_changes:
+            change["account"] = account
+            change["updated_at"] = utc_now_iso()
+        warnings = [warning for warning in warnings if "新账户分组" not in warning]
+        if account not in COMMON_ACCOUNTS:
+            warnings.append(f"{account}是新账户分组，请在确认写入前核对")
+        parsed = {
+            "intent": "bookkeeping",
+            "summary": "已修改账户，请重新确认",
+            "action_type": action_type,
+            "changes": original_changes,
+            "missing_fields": collect_missing_fields(original_changes, action_type),
+            "warnings": list(dict.fromkeys(warnings)),
+            "instrument_candidates": pending.get("instrument_candidates", []),
+        }
+        return enrich_cash_availability(parsed)
+
+    amount = parse_number_after(text, ("amount", "金额", "余额"))
+    if amount is None and re.fullmatch(NUMBER_TOKEN_PATTERN, text, re.IGNORECASE):
+        amount = parse_human_number(text, None)
+    if amount is not None and action_type in {"deposit", "withdraw", "set_cash"}:
+        original_changes[0]["amount"] = amount
+        original_changes[0]["updated_at"] = utc_now_iso()
+        parsed = {
+            "intent": "bookkeeping",
+            "summary": "已修改金额，请重新确认",
+            "action_type": action_type,
+            "changes": original_changes,
+            "missing_fields": collect_missing_fields(original_changes, action_type),
+            "warnings": list(dict.fromkeys(warnings + [f"已将金额修改为{amount:g}"])),
+            "instrument_candidates": pending.get("instrument_candidates", []),
+        }
+        return enrich_cash_availability(parsed)
+
+    quantity = parse_number_after(text, ("quantity", "数量"))
+    if quantity is not None and action_type not in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
+        change = original_changes[0]
+        change["quantity"] = quantity
+        cost_price = to_float(change.get("cost_price"), None)
+        if cost_price is not None:
+            change["total_cost"] = quantity * cost_price
+        change["updated_at"] = utc_now_iso()
+        return {
+            "intent": "bookkeeping",
+            "summary": "已修改数量，请重新确认",
+            "action_type": action_type,
+            "changes": original_changes,
+            "missing_fields": collect_missing_fields(original_changes, action_type),
+            "warnings": list(dict.fromkeys(warnings + [f"已将数量修改为{quantity:g}"])),
+            "instrument_candidates": pending.get("instrument_candidates", []),
+        }
+
+    cost_price = parse_number_after(text, ("cost_price", "成本价", "均价", "成交价"))
+    if cost_price is not None and action_type not in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
+        change = original_changes[0]
+        change["cost_price"] = cost_price
+        quantity = to_float(change.get("quantity"), None)
+        if quantity is not None:
+            change["total_cost"] = quantity * cost_price
+        change["updated_at"] = utc_now_iso()
+        return {
+            "intent": "bookkeeping",
+            "summary": "已修改成本价，请重新确认",
+            "action_type": action_type,
+            "changes": original_changes,
+            "missing_fields": collect_missing_fields(original_changes, action_type),
+            "warnings": list(dict.fromkeys(warnings + [f"已将成本价修改为{cost_price:g}"])),
+            "instrument_candidates": pending.get("instrument_candidates", []),
+        }
+
+    return None
+
+
 def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[str, Any]:
     pending_id = str(uuid4())
     now = datetime.now()
@@ -1073,25 +1212,34 @@ async def ai_preview(request: PreviewRequest):
 async def ai_revise(request: ReviseRequest):
     pending = load_pending(request.pending_id)
     if pending.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="pending_action 已结束")
+        raise HTTPException(status_code=400, detail="pending_action已结束")
+
     parsed = apply_direct_code_revision(pending, request.message)
+    if parsed is None:
+        parsed = apply_direct_field_revision(pending, request.message)
     if parsed is None:
         parsed = parse_bookkeeping_message(request.message, previous=pending)
         parsed = await enrich_with_online_instrument_search(parsed, request.message)
         parsed = enrich_cash_availability(parsed)
     if parsed.get("intent") == "chat_only":
         raise HTTPException(status_code=400, detail="未识别到可用于补充的记账信息")
-    pending["message"] = f"{pending.get('message', '')}\n[revise] {request.message}"
-    pending["changes"] = parsed.get("changes", pending.get("changes", []))
-    pending["missing_fields"] = [field for field in parsed.get("missing_fields", []) if field != "market"]
-    pending["warnings"] = parsed.get("warnings", [])
-    pending["instrument_candidates"] = parsed.get("instrument_candidates", pending.get("instrument_candidates", []))
-    pending["summary"] = parsed.get("summary", pending.get("summary"))
-    pending["action_type"] = parsed.get("action_type", pending.get("action_type"))
-    pending["requires_confirmation"] = len(pending["missing_fields"]) == 0
+
+    combined_message = f"{pending.get('message', '')}\n[revise] {request.message}".strip()
+    successor = make_pending(
+        parsed,
+        str(pending.get("input_type") or "text"),
+        combined_message,
+    )
+    successor["revises_pending_id"] = pending["pending_id"]
+    successor["updated_at"] = utc_now_iso()
+    save_pending(successor)
+
+    pending["status"] = "superseded"
+    pending["requires_confirmation"] = False
+    pending["revised_to_pending_id"] = successor["pending_id"]
     pending["updated_at"] = utc_now_iso()
     save_pending(pending)
-    return public_pending(pending)
+    return public_pending(successor)
 
 
 @router.post("/ai-confirm")

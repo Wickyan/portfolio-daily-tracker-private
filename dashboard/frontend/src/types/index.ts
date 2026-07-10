@@ -141,6 +141,8 @@ export interface PendingAction {
   status?: string
   operation_id?: string
   instrument_candidates?: InstrumentCandidate[]
+  revises_pending_id?: string
+  revised_to_pending_id?: string
 }
 
 export interface OperationSummary {

@@ -9,6 +9,27 @@ import { getApiErrorMessage } from '@/services/chat'
 import ConversationHistory from './ConversationHistory'
 import type { ChatMessage, PendingAction, PendingChange } from '@/types'
 
+const TERMINAL_PENDING_STATUSES = new Set(['confirmed', 'cancelled', 'rolled_back', 'expired', 'superseded'])
+
+function parseChineseOrdinal(value: string): number | null {
+  if (/^\d+$/.test(value)) return Number(value)
+  const map: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 }
+  if (value in map) return map[value]
+  if (/^十[一二三四五六七八九]$/.test(value)) return 10 + (map[value[1]] || 0)
+  if (/^[二三四五六七八九]十$/.test(value)) return (map[value[0]] || 0) * 10
+  if (/^[二三四五六七八九]十[一二三四五六七八九]$/.test(value)) {
+    return (map[value[0]] || 0) * 10 + (map[value[2]] || 0)
+  }
+  return null
+}
+
+function parseTargetedConfirmOrdinal(command: string): number | null {
+  const match = command.match(/^(?:再)?确认(?:第)?([一二两三四五六七八九十\d]+)条$/)
+  if (!match) return null
+  const ordinal = parseChineseOrdinal(match[1])
+  return ordinal && ordinal > 0 ? ordinal : null
+}
+
 function PendingActionCard({
   pending,
   onRevise,
@@ -150,6 +171,8 @@ function PendingActionCard({
         </div>
       ) : pending.status === 'rolled_back' ? (
         <div className="text-sm text-amber-300">该次写入已撤回，Portfolio 已恢复。</div>
+      ) : pending.status === 'superseded' ? (
+        <div className="text-sm text-sky-300">原卡片已被修改后的新确认卡替代，不能再确认这一版。</div>
       ) : pending.status === 'cancelled' ? (
         <div className="text-sm text-slate-400">已取消。</div>
       ) : (
@@ -177,13 +200,14 @@ function PendingActionCard({
                 if (reviseText.trim()) {
                   await onRevise(reviseText.trim())
                   setReviseText('')
+                  return
                 }
                 await onConfirm()
               })}
               disabled={isWorking || (!pending.requires_confirmation && !reviseText.trim())}
               className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
             >
-              确认写入
+              {reviseText.trim() ? '生成新确认卡' : '确认写入'}
             </button>
             <button
               onClick={() => run(onCancel)}
@@ -361,19 +385,18 @@ export default function ChatPanel() {
     const normalizedCommand = userMessage.replace(/\s+/g, '')
     const confirmCommands = new Set(['确认', '确定', '确认写入', '写入', '保存', '录入', '提交'])
     const cancelCommands = new Set(['取消', '取消写入', '不写了'])
+    const targetedConfirmOrdinal = parseTargetedConfirmOrdinal(normalizedCommand)
     const isRollbackCommand = /撤回|撤销|回滚|undo/i.test(normalizedCommand)
 
-    let latestPendingIndex = -1
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const pending = messages[i].pendingAction
-      if (
-        pending?.pending_id
-        && !['confirmed', 'cancelled', 'rolled_back', 'expired'].includes(pending.status || 'pending')
-      ) {
-        latestPendingIndex = i
-        break
-      }
-    }
+    const activePendingEntries = messages
+      .map((message, index) => ({ message, index, pending: message.pendingAction }))
+      .filter(({ pending }) => (
+        Boolean(pending?.pending_id)
+        && !TERMINAL_PENDING_STATUSES.has(pending?.status || 'pending')
+      ))
+    const latestPendingEntry = activePendingEntries.length > 0
+      ? activePendingEntries[activePendingEntries.length - 1]
+      : null
 
     // 立即清空输入和图片
     setInput('')
@@ -430,60 +453,78 @@ export default function ChatPanel() {
       return
     }
 
-    // “确认/写入/取消”只操作最近一条pending，不再作为普通聊天发送。
-    if (currentImages.length === 0 && (confirmCommands.has(normalizedCommand) || cancelCommands.has(normalizedCommand))) {
+    // “确认第二条/再确认第一条”可精确选择未确认卡片；普通“确认”仍操作最新一条。
+    const isConfirmCommand = confirmCommands.has(normalizedCommand) || targetedConfirmOrdinal !== null
+    if (currentImages.length === 0 && (isConfirmCommand || cancelCommands.has(normalizedCommand))) {
       const userEntry: ChatMessage = { role: 'user', content: userMessage }
-      if (latestPendingIndex < 0) {
-        setMessages([
-          ...messages,
-          userEntry,
-          { role: 'assistant', content: '当前没有待确认记录，请先提交一条交易或持仓信息。' },
-        ])
+      let targetEntry = latestPendingEntry
+      if (targetedConfirmOrdinal !== null) {
+        targetEntry = activePendingEntries[targetedConfirmOrdinal - 1] || null
+      }
+
+      if (!targetEntry?.pending?.pending_id) {
+        const message = targetedConfirmOrdinal !== null
+          ? `当前只有${activePendingEntries.length}条待确认记录，找不到第${targetedConfirmOrdinal}条。`
+          : '当前没有待确认记录，请先提交一条交易或持仓信息。'
+        useAppStore.setState((state) => ({
+          messages: [...state.messages, userEntry, { role: 'assistant', content: message }],
+        }))
         return
       }
 
-      const latestPending = messages[latestPendingIndex].pendingAction!
-      if (confirmCommands.has(normalizedCommand) && !latestPending.requires_confirmation) {
-        const missing = latestPending.missing_fields?.join('、') || '必要字段'
-        setMessages([
-          ...messages,
-          userEntry,
-          { role: 'assistant', content: `当前记录还不能写入，仍缺少：${missing}。请先补充或修改。` },
-        ])
+      const targetPending = targetEntry.pending
+      const targetPendingId = targetPending.pending_id!
+      if (isConfirmCommand && !targetPending.requires_confirmation) {
+        const missing = targetPending.missing_fields?.join('、') || '必要字段'
+        useAppStore.setState((state) => ({
+          messages: [
+            ...state.messages,
+            userEntry,
+            { role: 'assistant', content: `当前记录还不能写入，仍缺少：${missing}。请先补充或修改。` },
+          ],
+        }))
         return
       }
 
       setLoading(true)
       try {
-        let operationId = latestPending.operation_id
+        let operationId = targetPending.operation_id
         if (cancelCommands.has(normalizedCommand)) {
-          await portfolioService.aiCancel(latestPending.pending_id!)
+          await portfolioService.aiCancel(targetPendingId)
         } else {
-          const result = await portfolioService.aiConfirm(latestPending.pending_id!)
+          const result = await portfolioService.aiConfirm(targetPendingId)
           operationId = result.operation_id
           queryClient.invalidateQueries({ queryKey: ['portfolio'] })
           queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
           await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
         }
-        const nextMessages = messages.map((message, index) => {
-          if (index !== latestPendingIndex || !message.pendingAction) return message
-          return {
-            ...message,
-            pendingAction: {
-              ...message.pendingAction,
-              status: cancelCommands.has(normalizedCommand) ? 'cancelled' : 'confirmed',
-              requires_confirmation: false,
-              operation_id: operationId,
-            },
-          }
-        })
-        setMessages([...nextMessages, userEntry])
+
+        useAppStore.setState((state) => ({
+          messages: [
+            ...state.messages.map((message): ChatMessage => {
+              const currentPending = message.pendingAction
+              if (!currentPending || currentPending.pending_id !== targetPendingId) return message
+              return {
+                ...message,
+                pendingAction: {
+                  ...currentPending,
+                  status: cancelCommands.has(normalizedCommand) ? 'cancelled' : 'confirmed',
+                  requires_confirmation: false,
+                  operation_id: operationId,
+                },
+              }
+            }),
+            userEntry,
+          ],
+        }))
       } catch (error) {
-        setMessages([
-          ...messages,
-          userEntry,
-          { role: 'assistant', content: `操作失败：${getApiErrorMessage(error)}` },
-        ])
+        useAppStore.setState((state) => ({
+          messages: [
+            ...state.messages,
+            userEntry,
+            { role: 'assistant', content: `操作失败：${getApiErrorMessage(error)}` },
+          ],
+        }))
       } finally {
         setLoading(false)
       }
@@ -605,8 +646,38 @@ export default function ChatPanel() {
     if (e.target) e.target.value = ''
   }
 
-  const updatePendingMessage = (index: number, pending: PendingAction) => {
-    setMessages(messages.map((msg, i) => i === index ? { ...msg, pendingAction: pending } : msg))
+  const updatePendingMessage = (pendingId: string, pending: PendingAction) => {
+    useAppStore.setState((state) => ({
+      messages: state.messages.map((message) =>
+        message.pendingAction?.pending_id === pendingId
+          ? { ...message, pendingAction: pending }
+          : message,
+      ),
+    }))
+  }
+
+  const appendRevisedPendingMessage = (originalPendingId: string, pending: PendingAction) => {
+    useAppStore.setState((state) => ({
+      messages: [
+        ...state.messages.map((message) => {
+          if (message.pendingAction?.pending_id !== originalPendingId) return message
+          return {
+            ...message,
+            pendingAction: {
+              ...message.pendingAction,
+              status: 'superseded',
+              requires_confirmation: false,
+              revised_to_pending_id: pending.pending_id,
+            },
+          }
+        }),
+        {
+          role: 'assistant',
+          content: '已根据修改内容生成新的待确认卡片。',
+          pendingAction: pending,
+        },
+      ],
+    }))
   }
 
   const renderMessage = (message: ChatMessage, index: number) => {
@@ -652,8 +723,9 @@ export default function ChatPanel() {
               pending={message.pendingAction}
               onRevise={async (text) => {
                 if (!message.pendingAction?.pending_id) return
-                const updated = await portfolioService.aiRevise(message.pendingAction.pending_id, text)
-                updatePendingMessage(index, updated)
+                const originalPendingId = message.pendingAction.pending_id
+                const updated = await portfolioService.aiRevise(originalPendingId, text)
+                appendRevisedPendingMessage(originalPendingId, updated)
               }}
               onConfirm={async () => {
                 if (!message.pendingAction?.pending_id) return
@@ -661,7 +733,7 @@ export default function ChatPanel() {
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
                 queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
                 await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-                updatePendingMessage(index, {
+                updatePendingMessage(message.pendingAction.pending_id, {
                   ...message.pendingAction,
                   status: 'confirmed',
                   requires_confirmation: false,
@@ -671,7 +743,7 @@ export default function ChatPanel() {
               onCancel={async () => {
                 if (!message.pendingAction?.pending_id) return
                 await portfolioService.aiCancel(message.pendingAction.pending_id)
-                updatePendingMessage(index, { ...message.pendingAction, status: 'cancelled', requires_confirmation: false })
+                updatePendingMessage(message.pendingAction.pending_id, { ...message.pendingAction, status: 'cancelled', requires_confirmation: false })
               }}
               onRollback={message.pendingAction?.operation_id ? async () => {
                 const operationId = message.pendingAction!.operation_id!
@@ -679,7 +751,7 @@ export default function ChatPanel() {
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
                 queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
                 await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-                updatePendingMessage(index, {
+                updatePendingMessage(message.pendingAction!.pending_id!, {
                   ...message.pendingAction!,
                   status: 'rolled_back',
                   requires_confirmation: false,
