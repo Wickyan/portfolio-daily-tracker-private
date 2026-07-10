@@ -209,6 +209,28 @@ class PositionSchemaTest(unittest.TestCase):
         self.service.rollback_operation(set_result["operation_id"])
         self.assertEqual(self.service.load_portfolio()["cash_accounts"], [])
 
+
+    def test_same_account_can_hold_multiple_cash_currencies(self) -> None:
+        usd = self.service.safe_set_cash_account("IBKR", "USD", 1000)
+        hkd = self.service.safe_set_cash_account("IBKR", "HKD", 2000)
+
+        cash_accounts = self.service.load_portfolio()["cash_accounts"]
+        by_identity = {
+            (item["account"], item["currency"]): item["amount"]
+            for item in cash_accounts
+        }
+        self.assertEqual(by_identity[("IBKR", "USD")], 1000)
+        self.assertEqual(by_identity[("IBKR", "HKD")], 2000)
+        self.assertEqual(len(by_identity), 2)
+
+        self.service.rollback_operation(hkd["operation_id"])
+        cash_accounts = self.service.load_portfolio()["cash_accounts"]
+        self.assertEqual(len(cash_accounts), 1)
+        self.assertEqual(cash_accounts[0]["currency"], "USD")
+
+        self.service.rollback_operation(usd["operation_id"])
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"], [])
+
     def test_cash_withdraw_cannot_go_negative(self) -> None:
         self.service.safe_set_cash_account("银河", "CNY", 100)
         with self.assertRaisesRegex(ValueError, "现金不足"):

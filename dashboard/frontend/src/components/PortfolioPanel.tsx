@@ -60,6 +60,7 @@ export default function PortfolioPanel() {
           <div className="text-sm text-slate-400 mt-1">
             {position.account && `${position.account} | `}
             {position.quantity} | 成本 {position.cost_price.toFixed(2)} {position.currency}
+            {' | '}占比 {(position.asset_weight_pct || 0).toFixed(2)}%
           </div>
         </div>
 

@@ -19,6 +19,8 @@ export interface Position {
   market_value: number
   market_value_cny?: number | null
   fx_rate?: number | null
+  asset_weight_pct?: number
+  holding_weight_pct?: number
 }
 
 export interface CashAccount {
@@ -27,6 +29,7 @@ export interface CashAccount {
   amount: number
   fx_rate?: number | null
   amount_cny?: number | null
+  asset_weight_pct?: number
   updated_at?: string
 }
 

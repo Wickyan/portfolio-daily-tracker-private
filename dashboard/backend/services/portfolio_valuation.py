@@ -101,6 +101,25 @@ def calculate_portfolio_valuation(
             "updated_at": raw.get("updated_at"),
         })
 
+    total_assets_cny = total_market_value_cny + total_cash_cny
+    for position in positions:
+        market_value_cny = to_float(position.get("market_value_cny"), 0.0) or 0.0
+        position["asset_weight_pct"] = (
+            market_value_cny / total_assets_cny * 100
+            if total_assets_cny > 0 else 0.0
+        )
+        position["holding_weight_pct"] = (
+            market_value_cny / total_market_value_cny * 100
+            if total_market_value_cny > 0 else 0.0
+        )
+
+    for cash_account in cash_accounts:
+        amount_cny = to_float(cash_account.get("amount_cny"), 0.0) or 0.0
+        cash_account["asset_weight_pct"] = (
+            amount_cny / total_assets_cny * 100
+            if total_assets_cny > 0 else 0.0
+        )
+
     return {
         "positions": positions,
         "cash_accounts": cash_accounts,
@@ -110,6 +129,6 @@ def calculate_portfolio_valuation(
         "fx_rates": rates,
         "currency_totals": currency_totals,
         "total_market_value": total_market_value_cny,
-        "total_assets": total_market_value_cny + total_cash_cny,
+        "total_assets": total_assets_cny,
         "total_profit": total_profit_cny,
     }

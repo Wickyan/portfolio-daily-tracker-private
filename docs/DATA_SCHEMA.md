@@ -84,12 +84,18 @@ symbol→code
       "currency": "USD",
       "amount": 1000,
       "updated_at": "2026-07-11T01:00:00"
+    },
+    {
+      "account": "IBKR",
+      "currency": "HKD",
+      "amount": 2000,
+      "updated_at": "2026-07-11T01:05:00"
     }
   ]
 }
 ```
 
-现金唯一身份为`account+currency`。支持设置余额、入金、出金、操作日志和定向回滚；出金后余额不得小于0。
+现金唯一身份为`account+currency`。因此同一券商可以同时存在多种币种，例如`IBKR+USD`和`IBKR+HKD`；它们分别设置、入金、出金和回滚，互不覆盖。出金后余额不得小于0。
 
 ## 总资产与汇率
 
@@ -97,4 +103,6 @@ symbol→code
 - USD和HKD使用实时汇率折算为CNY；CNY汇率恒为1。
 - 顶部`total_market_value`、`cash`、`total_assets`、`total_profit`统一为CNY折算值。
 - API同时返回原币种数值、`market_value_cny`、`profit_cny`、`fx_rate`、`fx_rates`和`fx_updated_at`。
+- 每条持仓返回`asset_weight_pct=该持仓CNY市值/总资产CNY`，页面显示为“持仓比例”；另返回`holding_weight_pct=该持仓CNY市值/全部持仓CNY市值`。
+- 每条账户现金返回`asset_weight_pct=该现金CNY折算值/总资产CNY`。同一券商的不同币种分别计算后再参与总资产汇总。
 - 新增或确认持仓后，后端先刷新实时行情再返回，前端随后重新获取总资产。

@@ -59,6 +59,49 @@ class PortfolioValuationTest(unittest.TestCase):
         self.assertAlmostEqual(result["total_profit"], expected_profit)
         self.assertEqual(len(result["cash_accounts"]), 3)
         self.assertAlmostEqual(result["cash_accounts"][0]["amount_cny"], 3500)
+        total_weight = sum(item["asset_weight_pct"] for item in result["positions"])
+        total_weight += sum(item["asset_weight_pct"] for item in result["cash_accounts"])
+        self.assertAlmostEqual(total_weight, 100.0)
+        for item in result["positions"]:
+            expected_weight = item["market_value_cny"] / result["total_assets"] * 100
+            self.assertAlmostEqual(item["asset_weight_pct"], expected_weight)
+
+
+    def test_same_account_multiple_cash_currencies_use_separate_live_rates(self) -> None:
+        portfolio = {
+            "positions": [],
+            "cash": 0,
+            "cash_accounts": [
+                {"account": "IBKR", "currency": "USD", "amount": 1000},
+                {"account": "IBKR", "currency": "HKD", "amount": 2000},
+            ],
+        }
+        rates = {"CNY": 1, "USD": 7.1, "HKD": 0.91}
+        result = calculate_portfolio_valuation(portfolio, rates)
+
+        self.assertEqual(len(result["cash_accounts"]), 2)
+        self.assertAlmostEqual(result["cash"], 1000 * 7.1 + 2000 * 0.91)
+        self.assertAlmostEqual(result["total_assets"], 1000 * 7.1 + 2000 * 0.91)
+        usd = next(item for item in result["cash_accounts"] if item["currency"] == "USD")
+        hkd = next(item for item in result["cash_accounts"] if item["currency"] == "HKD")
+        self.assertAlmostEqual(usd["amount_cny"], 7100)
+        self.assertAlmostEqual(hkd["amount_cny"], 1820)
+        self.assertAlmostEqual(usd["asset_weight_pct"] + hkd["asset_weight_pct"], 100.0)
+
+
+    def test_position_weights_sum_to_100_without_cash(self) -> None:
+        portfolio = {
+            "positions": [
+                {"account": "A", "code": "1", "currency": "CNY", "quantity": 1, "cost_price": 10, "current_price": 30},
+                {"account": "B", "code": "2", "currency": "CNY", "quantity": 1, "cost_price": 10, "current_price": 70},
+            ],
+            "cash": 0,
+            "cash_accounts": [],
+        }
+        result = calculate_portfolio_valuation(portfolio, {"CNY": 1})
+        self.assertAlmostEqual(result["positions"][0]["asset_weight_pct"], 30.0)
+        self.assertAlmostEqual(result["positions"][1]["asset_weight_pct"], 70.0)
+        self.assertAlmostEqual(sum(item["holding_weight_pct"] for item in result["positions"]), 100.0)
 
     def test_each_new_write_changes_total_by_exact_converted_value(self) -> None:
         rates = {"CNY": 1, "USD": 6.8, "HKD": 0.87}
