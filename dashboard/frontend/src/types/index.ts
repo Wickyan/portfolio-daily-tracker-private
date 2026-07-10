@@ -1,11 +1,19 @@
 // 持仓相关类型
 export interface Position {
+  account?: string
+  group?: string
+  code: string
   symbol: string
   name: string
-  market: 'a_share' | 'hk' | 'us'
+  currency: 'CNY' | 'USD' | 'HKD' | string
+  asset_type: 'stock' | 'fund' | 'etf' | 'cash' | 'custom' | 'fund_or_custom' | string
   quantity: number
   available_qty: number
   cost_price: number
+  total_cost?: number
+  fee?: number | null
+  note?: string
+  source?: string
   current_price: number
   profit: number
   profit_pct: number
@@ -58,6 +66,7 @@ export interface ChatMessage {
   timestamp?: string
   image?: string  // 为了向后兼容旧的单张图片数据
   images?: string[]  // 支持多张图片
+  pendingAction?: PendingAction
 }
 
 export interface ChatResponse {
@@ -67,6 +76,44 @@ export interface ChatResponse {
   sentiment: 'bullish' | 'bearish' | 'neutral'
   memory_updates: MemoryUpdate[]
   imported_positions?: number  // 导入的持仓数量
+}
+
+export interface PendingChange {
+  action_type?: string
+  account?: string
+  group?: string
+  name?: string
+  code?: string | null
+  currency?: string | null
+  asset_type?: string | null
+  quantity?: number | null
+  cost_price?: number | null
+  total_cost?: number | null
+  fee?: number | null
+  note?: string
+  source?: string
+}
+
+export interface PendingAction {
+  ok: boolean
+  pending_id?: string
+  summary: string
+  action_type?: string
+  changes: PendingChange[]
+  missing_fields: string[]
+  warnings: string[]
+  requires_confirmation: boolean
+  intent?: 'bookkeeping' | 'chat_only' | string
+  status?: string
+}
+
+export interface OperationSummary {
+  operation_id: string
+  created_at: string
+  type: string
+  summary: string
+  imported_positions: number
+  can_rollback: boolean
 }
 
 // 建议相关类型

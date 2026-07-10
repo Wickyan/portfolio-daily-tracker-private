@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from backend.api import chat, portfolio, market, memory, suggestions, settings
+from backend.api import chat, portfolio, market, memory, suggestions, settings, dev_tools, portfolio_ai
 from backend.api import backtest, portfolio_tracker
 from backend.services.agent_service import AgentService
 
@@ -56,10 +56,12 @@ app.add_middleware(
 # 注册路由
 app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["持仓"])
+app.include_router(portfolio_ai.router, prefix="/api/portfolio", tags=["AI记账"])
 app.include_router(market.router, prefix="/api/market", tags=["行情"])
 app.include_router(memory.router, prefix="/api/memory", tags=["记忆"])
 app.include_router(suggestions.router, prefix="/api/suggestions", tags=["建议"])
 app.include_router(settings.router, prefix="/api/settings", tags=["设置"])
+app.include_router(dev_tools.router, prefix="/api/dev", tags=["开发工具"])
 app.include_router(backtest.router, tags=["回测"])
 app.include_router(portfolio_tracker.router, prefix="/api/tracker", tags=["投资组合跟踪"])
 

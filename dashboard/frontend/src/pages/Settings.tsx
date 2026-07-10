@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Settings as SettingsIcon, Server, Cpu, Save, DollarSign, Loader2, KeyRound } from 'lucide-react'
+import { Settings as SettingsIcon, Server, Cpu, Save, DollarSign, Loader2, KeyRound, AlertTriangle } from 'lucide-react'
 
 interface ModelInfo {
   id: string
@@ -30,6 +30,8 @@ interface LLMConfigResponse {
   api_key_masked: string
 }
 
+type ResetTarget = 'portfolio' | 'chat' | 'pending' | 'operations' | 'all'
+
 export default function Settings() {
   const queryClient = useQueryClient()
   const [apiUrl] = useState('http://localhost:8000')
@@ -42,6 +44,9 @@ export default function Settings() {
   const [llmBaseUrl, setLlmBaseUrl] = useState('https://api.deepseek.com/v1')
   const [llmApiKey, setLlmApiKey] = useState('')
   const [llmModel, setLlmModel] = useState('deepseek-chat')
+  const [resetTarget, setResetTarget] = useState<ResetTarget>('portfolio')
+  const [resetConfirm, setResetConfirm] = useState('')
+  const [resetMessage, setResetMessage] = useState('')
 
   // 获取配置
   const { data: config, isLoading } = useQuery<ConfigResponse>({
@@ -217,6 +222,43 @@ export default function Settings() {
     }
   })
 
+  const resetDevDataMutation = useMutation({
+    mutationFn: async () => {
+      const confirmed = window.confirm('此操作会先备份再重置所选测试数据。确认继续？')
+      if (!confirmed) {
+        return null
+      }
+
+      const res = await fetch('/api/dev/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: resetTarget,
+          confirm_text: resetConfirm
+        })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        throw new Error(data.detail || data.message || '重置失败')
+      }
+      return data
+    },
+    onSuccess: (data) => {
+      if (!data) return
+      if (resetTarget === 'portfolio' || resetTarget === 'all') {
+        queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+        queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+      }
+      setResetMessage(`${data.message}，备份目录：${data.backup_dir}`)
+      setResetConfirm('')
+      setTimeout(() => setResetMessage(''), 8000)
+    },
+    onError: (error) => {
+      setResetMessage(error instanceof Error ? error.message : '重置失败')
+      setTimeout(() => setResetMessage(''), 8000)
+    }
+  })
+
   const handleSave = () => {
     if (selectedApiGroup !== config?.current_api_group) {
       switchApiGroupMutation.mutate(selectedApiGroup)
@@ -384,6 +426,63 @@ export default function Settings() {
               保存并重载
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* 测试工具/危险操作 */}
+      <div className="bg-slate-800 rounded-lg p-6 border border-amber-500/30">
+        <h2 className="text-xl font-semibold flex items-center mb-4">
+          <AlertTriangle className="h-5 w-5 mr-2 text-amber-400" />
+          测试工具/危险操作
+        </h2>
+        {resetMessage && (
+          <div className={`mb-4 border rounded-lg p-3 ${
+            resetMessage.includes('失败') || resetMessage.includes('RESET')
+              ? 'bg-red-500/10 border-red-500 text-red-400'
+              : 'bg-green-500/10 border-green-500 text-green-400'
+          }`}>
+            {resetMessage}
+          </div>
+        )}
+        <div className="space-y-4">
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">重置目标</label>
+            <select
+              value={resetTarget}
+              onChange={(e) => setResetTarget(e.target.value as ResetTarget)}
+              className="w-full bg-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-amber-500"
+            >
+              <option value="portfolio">持仓</option>
+              <option value="chat">对话</option>
+              <option value="pending">待确认操作</option>
+              <option value="operations">操作日志</option>
+              <option value="all">全部测试数据</option>
+            </select>
+            <div className="text-xs text-slate-500 mt-2">
+              操作日志清空后将无法用于回滚；全部测试数据只清持仓、对话、待确认操作，不删除备份。
+            </div>
+          </div>
+          <div>
+            <label className="text-sm text-slate-400 mb-2 block">确认文本</label>
+            <input
+              type="text"
+              value={resetConfirm}
+              onChange={(e) => setResetConfirm(e.target.value)}
+              placeholder="请输入RESET确认"
+              className="w-full bg-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-amber-500"
+            />
+            <div className="text-xs text-slate-500 mt-2">
+              不会删除 DeepSeek 配置、Nginx 密码、代码、文档和备份目录。
+            </div>
+          </div>
+          <button
+            onClick={() => resetDevDataMutation.mutate()}
+            disabled={resetDevDataMutation.isPending}
+            className="flex items-center px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg transition-colors disabled:opacity-50"
+          >
+            {resetDevDataMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            执行重置
+          </button>
         </div>
       </div>
 

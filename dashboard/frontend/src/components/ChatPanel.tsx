@@ -4,10 +4,111 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppStore } from '@/store'
-import { chatService } from '@/services'
+import { chatService, portfolioService } from '@/services'
 import { getApiErrorMessage } from '@/services/chat'
 import ConversationHistory from './ConversationHistory'
-import type { ChatMessage } from '@/types'
+import type { ChatMessage, PendingAction, PendingChange } from '@/types'
+
+function PendingActionCard({
+  pending,
+  onRevise,
+  onConfirm,
+  onCancel,
+}: {
+  pending: PendingAction
+  onRevise: (message: string) => Promise<void>
+  onConfirm: () => Promise<void>
+  onCancel: () => Promise<void>
+}) {
+  const [reviseText, setReviseText] = useState('')
+  const [isWorking, setIsWorking] = useState(false)
+  const change: PendingChange = pending.changes?.[0] || {}
+
+  const field = (label: string, value?: string | number | null) => (
+    <div className="flex justify-between gap-4 border-b border-slate-700/60 py-1.5 text-sm">
+      <span className="text-slate-400">{label}</span>
+      <span className="text-right font-medium">{value === undefined || value === null || value === '' ? '缺失' : value}</span>
+    </div>
+  )
+
+  const run = async (fn: () => Promise<void>) => {
+    setIsWorking(true)
+    try {
+      await fn()
+    } finally {
+      setIsWorking(false)
+    }
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border border-primary-500/40 bg-slate-800 p-4">
+      <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
+      <div className="rounded bg-slate-900/60 px-3 py-2">
+        {field('账户分组', change.account || change.group)}
+        {field('标的', change.name)}
+        {field('代码', change.code)}
+        {field('币种', change.currency)}
+        {field('类型', change.asset_type)}
+        {field('操作', pending.action_type)}
+        {field('数量', change.quantity)}
+        {field('成本价', change.cost_price)}
+        {field('总成本', change.total_cost)}
+        {field('手续费', change.fee ?? '未提供')}
+      </div>
+      {pending.missing_fields?.length > 0 && (
+        <div className="text-sm text-amber-300">缺少：{pending.missing_fields.join('、')}</div>
+      )}
+      {pending.warnings?.length > 0 && (
+        <div className="space-y-1 text-sm text-slate-300">
+          {pending.warnings.map((warning, index) => (
+            <div key={index}>- {warning}</div>
+          ))}
+        </div>
+      )}
+      {pending.status === 'confirmed' ? (
+        <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>
+      ) : pending.status === 'cancelled' ? (
+        <div className="text-sm text-slate-400">已取消。</div>
+      ) : (
+        <div className="space-y-2">
+          <input
+            value={reviseText}
+            onChange={(e) => setReviseText(e.target.value)}
+            placeholder="补充/修改信息"
+            className="w-full rounded bg-slate-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+          />
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => run(async () => {
+                if (!reviseText.trim()) return
+                await onRevise(reviseText.trim())
+                setReviseText('')
+              })}
+              disabled={isWorking || !reviseText.trim()}
+              className="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600 disabled:opacity-50"
+            >
+              修改
+            </button>
+            <button
+              onClick={() => run(onConfirm)}
+              disabled={isWorking || !pending.requires_confirmation}
+              className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
+            >
+              确认写入
+            </button>
+            <button
+              onClick={() => run(onCancel)}
+              disabled={isWorking}
+              className="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600 disabled:opacity-50"
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function ChatPanel() {
   const [input, setInput] = useState('')
@@ -24,6 +125,7 @@ export default function ChatPanel() {
     isLoading,
     currentResponse,
     addMessage,
+    setMessages,
     setLoading,
     setCurrentResponse,
     appendToCurrentResponse,
@@ -150,18 +252,26 @@ export default function ChatPanel() {
 
     try {
       if (currentImages.length > 0) {
-        // 带图片的消息
+        // 带图片的消息：先让视觉模型生成文字，再只生成 preview，不直接写 portfolio。
         const response = await chatService.sendMessageWithImage(
           userMessage,
           currentImages.map(c => c.file),
           true
         )
 
-        // 添加助手回复
-        addMessage({
-          role: 'assistant',
-          content: response.response,
-        })
+        const preview = await portfolioService.aiPreview(`${userMessage}\n${response.response}`, 'image_text')
+        if (preview.intent !== 'chat_only' && preview.pending_id) {
+          addMessage({
+            role: 'assistant',
+            content: '已生成待确认记账预览，当前不会写入portfolio。',
+            pendingAction: preview,
+          })
+        } else {
+          addMessage({
+            role: 'assistant',
+            content: response.response,
+          })
+        }
 
         // 更新建议和风险
         if (response.suggestions) {
@@ -176,6 +286,16 @@ export default function ChatPanel() {
           queryClient.invalidateQueries({ queryKey: ['portfolio'] })
         }
       } else {
+        const preview = await portfolioService.aiPreview(userMessage, 'text')
+        if (preview.intent !== 'chat_only' && preview.pending_id) {
+          addMessage({
+            role: 'assistant',
+            content: '已生成待确认记账预览，当前不会写入portfolio。',
+            pendingAction: preview,
+          })
+          return
+        }
+
         // 普通文本消息默认流式返回
         let streamedResponse = ''
         await chatService.streamMessage(
@@ -235,6 +355,10 @@ export default function ChatPanel() {
     if (e.target) e.target.value = ''
   }
 
+  const updatePendingMessage = (index: number, pending: PendingAction) => {
+    setMessages(messages.map((msg, i) => i === index ? { ...msg, pendingAction: pending } : msg))
+  }
+
   const renderMessage = (message: ChatMessage, index: number) => {
     const isUser = message.role === 'user'
 
@@ -273,7 +397,28 @@ export default function ChatPanel() {
               ))}
             </div>
           )}
-          {isUser ? (
+          {message.pendingAction ? (
+            <PendingActionCard
+              pending={message.pendingAction}
+              onRevise={async (text) => {
+                if (!message.pendingAction?.pending_id) return
+                const updated = await portfolioService.aiRevise(message.pendingAction.pending_id, text)
+                updatePendingMessage(index, updated)
+              }}
+              onConfirm={async () => {
+                if (!message.pendingAction?.pending_id) return
+                await portfolioService.aiConfirm(message.pendingAction.pending_id)
+                queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+                queryClient.invalidateQueries({ queryKey: ['portfolio', 'live'] })
+                updatePendingMessage(index, { ...message.pendingAction, status: 'confirmed', requires_confirmation: false })
+              }}
+              onCancel={async () => {
+                if (!message.pendingAction?.pending_id) return
+                await portfolioService.aiCancel(message.pendingAction.pending_id)
+                updatePendingMessage(index, { ...message.pendingAction, status: 'cancelled', requires_confirmation: false })
+              }}
+            />
+          ) : isUser ? (
             <p className="whitespace-pre-wrap">{message.content}</p>
           ) : (
             <div className="prose prose-invert max-w-none prose-td:border prose-td:border-slate-600 prose-th:border prose-th:border-slate-600 prose-th:bg-slate-800 prose-table:w-auto overflow-x-auto">

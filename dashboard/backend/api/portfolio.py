@@ -10,11 +10,19 @@ router = APIRouter()
 
 class AddPositionRequest(BaseModel):
     """添加持仓请求"""
-    symbol: str
+    account: Optional[str] = None
+    group: Optional[str] = None
+    code: Optional[str] = None
+    symbol: Optional[str] = None
     name: str
-    quantity: int
+    currency: Optional[str] = None
+    asset_type: Optional[str] = None
+    quantity: float
     cost_price: float
-    market: str = "a_share"  # a_share, hk, us
+    total_cost: Optional[float] = None
+    fee: Optional[float] = None
+    note: str = ""
+    source: str = "manual"
 
 
 class UpdatePositionRequest(BaseModel):
@@ -50,37 +58,80 @@ async def get_live_portfolio():
 @router.post("/add")
 async def add_position(request: AddPositionRequest):
     """添加持仓"""
-    service = get_service()
+    from backend.services.portfolio_write_service import PortfolioWriteService
+    from backend.api.portfolio_ai import reload_agent_portfolio_provider
 
-    await service.add_position(
-        symbol=request.symbol,
-        name=request.name,
-        quantity=request.quantity,
-        cost_price=request.cost_price,
-        market=request.market
-    )
-
-    return {"message": f"已添加持仓: {request.name}({request.symbol})"}
+    write_service = PortfolioWriteService()
+    change = {
+        "account": request.account or request.group,
+        "group": request.group or request.account,
+        "code": request.code or request.symbol,
+        "symbol": request.symbol or request.code,
+        "name": request.name,
+        "currency": request.currency,
+        "asset_type": request.asset_type,
+        "quantity": request.quantity,
+        "cost_price": request.cost_price,
+        "total_cost": request.total_cost,
+        "fee": request.fee,
+        "note": request.note,
+        "source": request.source or "manual",
+    }
+    missing = write_service.validate_confirmable_change(write_service.normalize_position(change))
+    if missing:
+        raise HTTPException(status_code=400, detail=f"缺少字段: {', '.join(missing)}")
+    result = write_service.safe_add_positions([change], summary=f"手动新增持仓: {request.name}")
+    reload_agent_portfolio_provider()
+    return {**result, "message": f"已添加持仓: {request.name}({request.code or request.symbol})"}
 
 
 @router.put("/{symbol}")
 async def update_position(symbol: str, request: UpdatePositionRequest):
     """更新持仓"""
-    service = get_service()
-    await service.update_position(
-        symbol=symbol,
-        quantity=request.quantity,
-        cost_price=request.cost_price
+    from backend.services.portfolio_write_service import PortfolioWriteService, to_float
+    from backend.api.portfolio_ai import reload_agent_portfolio_provider
+
+    write_service = PortfolioWriteService()
+    before = write_service.load_portfolio()
+    existing = next((p for p in before.get("positions", []) if p.get("code") == symbol or p.get("symbol") == symbol), None)
+    if not existing:
+        raise HTTPException(status_code=404, detail="持仓不存在")
+    updated = existing.copy()
+    if request.quantity is not None:
+        updated["quantity"] = request.quantity
+    if request.cost_price is not None:
+        updated["cost_price"] = request.cost_price
+    updated["total_cost"] = (to_float(updated.get("quantity"), 0.0) or 0.0) * (to_float(updated.get("cost_price"), 0.0) or 0.0)
+
+    backup_path = write_service.backup_portfolio()
+    after = before.copy()
+    after["positions"] = [
+        write_service.normalize_position(updated, for_storage=True)
+        if (p.get("code") == symbol or p.get("symbol") == symbol) else p
+        for p in before.get("positions", [])
+    ]
+    write_service.save_portfolio_atomic(after)
+    operation = write_service.create_operation(
+        operation_type="manual_update",
+        summary=f"手动更新持仓 {symbol}",
+        before_snapshot=before,
+        after_snapshot=after,
+        backup_path=backup_path,
+        imported_positions=1,
     )
-    return {"message": f"已更新持仓: {symbol}"}
+    reload_agent_portfolio_provider()
+    return {"ok": True, "operation_id": operation["operation_id"], "message": f"已更新持仓: {symbol}", "backup_path": backup_path}
 
 
 @router.delete("/{symbol}")
 async def remove_position(symbol: str):
     """删除持仓"""
-    service = get_service()
-    await service.remove_position(symbol)
-    return {"message": f"已删除持仓: {symbol}"}
+    from backend.services.portfolio_write_service import PortfolioWriteService
+    from backend.api.portfolio_ai import reload_agent_portfolio_provider
+
+    result = PortfolioWriteService().safe_remove_position(symbol)
+    reload_agent_portfolio_provider()
+    return {**result, "message": f"已删除持仓: {symbol}"}
 
 
 @router.post("/refresh")

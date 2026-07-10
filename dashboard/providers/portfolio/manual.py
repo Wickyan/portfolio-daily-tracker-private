@@ -2,7 +2,7 @@
 手动持仓管理 Provider
 支持从文件导入或手动维护持仓
 """
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 import asyncio
 import json
@@ -32,6 +32,7 @@ class ManualPortfolioProvider(PortfolioProvider):
         self.market_provider = market_provider
         self._portfolio = Portfolio()
         self._last_update: Optional[datetime] = None
+        self._position_meta: Dict[str, Dict] = {}
         self._load()
 
     @property
@@ -50,11 +51,17 @@ class ManualPortfolioProvider(PortfolioProvider):
                     data = json.load(f)
 
                 positions = []
+                self._position_meta = {}
                 for p in data.get("positions", []):
+                    symbol = p.get("code") or p.get("symbol")
+                    if not symbol:
+                        continue
+                    currency = str(p.get("currency") or "").upper()
+                    internal_market = p.get("market") or self._infer_internal_market(symbol, currency)
                     stock = Stock(
-                        symbol=p["symbol"],
+                        symbol=str(symbol),
                         name=p["name"],
-                        market=Market(p.get("market", "a_share"))
+                        market=Market(internal_market)
                     )
                     positions.append(Position(
                         stock=stock,
@@ -64,6 +71,17 @@ class ManualPortfolioProvider(PortfolioProvider):
                         current_price=p.get("current_price", p["cost_price"]),
                         side=PositionSide(p.get("side", "long"))
                     ))
+                    self._position_meta[str(symbol)] = {
+                        "account": p.get("account") or p.get("group", ""),
+                        "group": p.get("group") or p.get("account", ""),
+                        "currency": currency or self._infer_currency(symbol),
+                        "asset_type": p.get("asset_type") or self._infer_asset_type(symbol),
+                        "total_cost": p.get("total_cost"),
+                        "fee": p.get("fee"),
+                        "note": p.get("note", ""),
+                        "source": p.get("source", "manual"),
+                        "created_at": p.get("created_at"),
+                    }
 
                 self._portfolio = Portfolio(
                     positions=positions,
@@ -78,12 +96,22 @@ class ManualPortfolioProvider(PortfolioProvider):
         data = {
             "positions": [
                 {
+                    "account": self._position_meta.get(p.stock.symbol, {}).get("account", ""),
+                    "group": self._position_meta.get(p.stock.symbol, {}).get("group", self._position_meta.get(p.stock.symbol, {}).get("account", "")),
+                    "code": p.stock.symbol,
                     "symbol": p.stock.symbol,
                     "name": p.stock.name,
-                    "market": p.stock.market.value,
+                    "currency": self._position_meta.get(p.stock.symbol, {}).get("currency") or self._infer_currency(p.stock.symbol),
+                    "asset_type": self._position_meta.get(p.stock.symbol, {}).get("asset_type") or self._infer_asset_type(p.stock.symbol),
                     "quantity": p.quantity,
                     "available_qty": p.available_qty,
                     "cost_price": p.cost_price,
+                    "total_cost": self._position_meta.get(p.stock.symbol, {}).get("total_cost", p.quantity * p.cost_price),
+                    "fee": self._position_meta.get(p.stock.symbol, {}).get("fee"),
+                    "note": self._position_meta.get(p.stock.symbol, {}).get("note", ""),
+                    "source": self._position_meta.get(p.stock.symbol, {}).get("source", "manual"),
+                    "created_at": self._position_meta.get(p.stock.symbol, {}).get("created_at", datetime.now().isoformat()),
+                    "updated_at": datetime.now().isoformat(),
                     "current_price": p.current_price,
                     "side": p.side.value
                 }
@@ -98,6 +126,29 @@ class ManualPortfolioProvider(PortfolioProvider):
 
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _infer_internal_market(self, symbol: str, currency: str = "") -> str:
+        symbol = str(symbol or "").upper()
+        currency = str(currency or "").upper()
+        if currency == "HKD" or (symbol.isdigit() and len(symbol) == 4):
+            return "hk_stock"
+        if currency == "USD" or (symbol.isascii() and not symbol.isdigit()):
+            return "us_stock"
+        return "a_share"
+
+    def _infer_currency(self, symbol: str) -> str:
+        symbol = str(symbol or "").upper()
+        if symbol.isdigit() and len(symbol) == 4:
+            return "HKD"
+        if symbol.isascii() and not symbol.isdigit():
+            return "USD"
+        return "CNY"
+
+    def _infer_asset_type(self, symbol: str) -> str:
+        symbol = str(symbol or "")
+        if symbol.isdigit() and len(symbol) == 6 and symbol.startswith(("15", "16", "50", "51", "52", "56", "58")):
+            return "fund"
+        return "stock" if symbol else "custom"
 
     async def get_portfolio(self) -> Portfolio:
         """获取当前持仓"""
@@ -157,8 +208,9 @@ class ManualPortfolioProvider(PortfolioProvider):
         market: Market = Market.A_SHARE,
         available_qty: Optional[int] = None,
         current_price: Optional[float] = None
-    ):
+        ):
         """添加持仓（如果已存在则更新）"""
+        symbol = str(symbol).strip()
         # 检查是否已存在
         existing_idx = None
         for idx, p in enumerate(self._portfolio.positions):
@@ -181,6 +233,18 @@ class ManualPortfolioProvider(PortfolioProvider):
         else:
             # 添加新持仓
             self._portfolio.positions.append(position)
+
+        meta = self._position_meta.get(symbol, {})
+        meta.setdefault("account", "")
+        meta.setdefault("group", meta.get("account", ""))
+        meta.setdefault("currency", self._infer_currency(symbol))
+        meta.setdefault("asset_type", self._infer_asset_type(symbol))
+        meta["total_cost"] = quantity * cost_price
+        meta.setdefault("fee", None)
+        meta.setdefault("note", "")
+        meta.setdefault("source", "manual")
+        meta.setdefault("created_at", datetime.now().isoformat())
+        self._position_meta[symbol] = meta
 
         self._save()
 

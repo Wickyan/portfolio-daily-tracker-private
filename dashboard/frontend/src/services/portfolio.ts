@@ -1,5 +1,5 @@
 import api from './api'
-import type { Portfolio, PortfolioSummary } from '@/types'
+import type { OperationSummary, PendingAction, Portfolio, PortfolioSummary } from '@/types'
 
 export const portfolioService = {
   // 获取持仓
@@ -22,16 +22,19 @@ export const portfolioService = {
 
   // 添加持仓
   async addPosition(data: {
-    symbol: string
+    account?: string
+    group?: string
+    code?: string
+    symbol?: string
     name: string
+    currency?: string
+    asset_type?: string
     quantity: number
     cost_price: number
-    market?: string
+    fee?: number | null
+    note?: string
   }) {
-    const response = await api.post('/portfolio/add', {
-      ...data,
-      market: data.market || 'a_share',
-    })
+    const response = await api.post('/portfolio/add', data)
     return response.data
   },
 
@@ -50,6 +53,42 @@ export const portfolioService = {
   // 刷新持仓价格
   async refresh() {
     const response = await api.post('/portfolio/refresh')
+    return response.data
+  },
+
+  async aiPreview(message: string, inputType: 'text' | 'image_text' = 'text'): Promise<PendingAction> {
+    const response = await api.post<PendingAction>('/portfolio/ai-preview', {
+      input_type: inputType,
+      message,
+    })
+    return response.data
+  },
+
+  async aiRevise(pendingId: string, message: string): Promise<PendingAction> {
+    const response = await api.post<PendingAction>('/portfolio/ai-revise', {
+      pending_id: pendingId,
+      message,
+    })
+    return response.data
+  },
+
+  async aiConfirm(pendingId: string) {
+    const response = await api.post('/portfolio/ai-confirm', { pending_id: pendingId })
+    return response.data
+  },
+
+  async aiCancel(pendingId: string) {
+    const response = await api.post('/portfolio/ai-cancel', { pending_id: pendingId })
+    return response.data
+  },
+
+  async getOperations(): Promise<OperationSummary[]> {
+    const response = await api.get<{ operations: OperationSummary[] }>('/portfolio/operations')
+    return response.data.operations
+  },
+
+  async rollback(operationId: string) {
+    const response = await api.post(`/portfolio/rollback/${operationId}`)
     return response.data
   },
 }

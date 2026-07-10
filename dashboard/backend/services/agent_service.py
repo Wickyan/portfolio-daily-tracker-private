@@ -19,6 +19,7 @@ from providers.market_data import EastmoneyDirectProvider, GoogleFinanceProvider
 from providers.news import RSSNewsProvider
 from providers.portfolio.manual import ManualPortfolioProvider
 from agents.trader import TraderAgent
+from agents.bookkeeper.prompts import build_system_prompt as build_bookkeeper_system_prompt
 
 
 class AgentService:
@@ -174,11 +175,10 @@ class AgentService:
             get_market_news_tool,
             compare_stocks_tool,
             get_tracker_snapshot_tool,
-            update_holdings_tool,
-            run_portfolio_pipeline_tool,
             ToolExecutor
         )
 
+        # Bookkeeper 默认模式只挂只读工具；写入/日报管道工具留给未来 trader/confirm 流程。
         tools = [
             get_stock_quote_tool(self.market_provider),
             get_portfolio_tool(self.portfolio_provider),
@@ -186,14 +186,17 @@ class AgentService:
             get_market_news_tool(self.news_provider),
             compare_stocks_tool(self.market_provider),
             get_tracker_snapshot_tool(),
-            update_holdings_tool(),
-            run_portfolio_pipeline_tool(),
         ]
 
         tool_executor = ToolExecutor(tools)
 
-        # 创建 Agent（带工具支持）
-        self.agent = TraderAgent(self.llm_provider, tool_executor=tool_executor)
+        # 默认首页 AI 使用记账解析模式，不做交易员式建议。
+        self.agent = TraderAgent(
+            self.llm_provider,
+            tool_executor=tool_executor,
+            prompt_builder=build_bookkeeper_system_prompt
+        )
+        setattr(self.agent, "mode", "bookkeeper")
         self.agent.start_conversation()
 
     def _init_extractors(self):
@@ -339,9 +342,8 @@ class AgentService:
         }
 
         # 构建系统提示
-        from agents.trader.prompts import build_system_prompt
         context_str = context.to_context_string() if context else ""
-        system_prompt = build_system_prompt(context_str)
+        system_prompt = build_bookkeeper_system_prompt(context_str)
 
         # 直接调用 LLM（绕过 Agent 以支持图片）
         messages = [
@@ -368,9 +370,6 @@ class AgentService:
                 # 使用 LLM 提取结构化数据
                 extraction = await self.llm_extractor.extract(message, full_response)
 
-                # 调试：打印提取结果
-                print(f"[提取调试] 提取到的数据: {extraction}")
-
                 # 应用记忆更新
                 for update in extraction.get("memory_updates", []):
                     self._apply_memory_update(update)
@@ -379,32 +378,6 @@ class AgentService:
                 user_profile = extraction.get("user_profile", {})
                 if user_profile:
                     self._apply_profile_update(user_profile)
-
-                # 导入提取的持仓信息
-                positions = extraction.get("positions", [])
-                print(f"[持仓导入] 提取到 {len(positions)} 个持仓")
-                imported_count = 0
-                for pos in positions:
-                    try:
-                        print(f"[持仓导入] 正在导入: {pos}")
-                        await self._import_position(pos)
-                        imported_count += 1
-                    except Exception as e:
-                        print(f"[持仓导入] 导入失败: {pos}, 错误: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                if imported_count > 0:
-                    print(f"[持仓导入] 成功导入 {imported_count} 个持仓")
-
-                # 导入现金余额
-                cash = extraction.get("cash")
-                if cash is not None and cash > 0:
-                    try:
-                        self.portfolio_provider.set_cash(cash)
-                        print(f"[现金导入] 成功设置现金余额: ¥{cash:,.2f}")
-                    except Exception as e:
-                        print(f"[现金导入] 设置失败: {e}")
 
                 # 更新最近的建议和风险
                 self._recent_suggestions = extraction.get("suggestions", [])
@@ -416,8 +389,8 @@ class AgentService:
                     "risks": self._recent_risks,
                     "sentiment": extraction.get("sentiment", "neutral"),
                     "memory_updates": extraction.get("memory_updates", []),
-                    "imported_positions": imported_count,
-                    "cash_updated": cash is not None
+                    "imported_positions": 0,
+                    "cash_updated": False
                 }
             else:
                 return {"response": full_response}
@@ -436,9 +409,25 @@ class AgentService:
 
     async def _build_context(self) -> AgentContext:
         """构建 Agent 上下文"""
-        # 获取持仓信息
-        portfolio = await self.portfolio_provider.get_portfolio()
-        portfolio_summary = portfolio.to_summary()
+        # 获取持仓信息（bookkeeper 只看用户友好字段，不暴露 market）
+        portfolio = await self.get_portfolio()
+        portfolio_lines = [
+            "【当前持仓摘要】",
+            f"总资产: ¥{portfolio.get('total_assets', 0):,.2f}",
+            f"持仓市值: ¥{portfolio.get('total_market_value', 0):,.2f}",
+            f"可用现金: ¥{portfolio.get('cash', 0):,.2f}",
+            "positions:"
+        ]
+        for p in portfolio.get("positions", []):
+            portfolio_lines.append(
+                f"- account/group={p.get('account') or p.get('group', '')}, "
+                f"name={p.get('name', '')}, code={p.get('code') or p.get('symbol', '')}, "
+                f"currency={p.get('currency', '')}, asset_type={p.get('asset_type', '')}, "
+                f"quantity={p.get('quantity', 0)}, cost_price={p.get('cost_price', 0)}"
+            )
+        if not portfolio.get("positions"):
+            portfolio_lines.append("- (空)")
+        portfolio_summary = "\n".join(portfolio_lines)
 
         # 获取用户记忆
         memory_context = self.memory_manager.get_context_string()
@@ -669,27 +658,51 @@ class AgentService:
 
     async def get_portfolio(self) -> Dict[str, Any]:
         """获取持仓"""
-        portfolio = await self.portfolio_provider.get_portfolio()
+        from backend.services.portfolio_write_service import PortfolioWriteService, to_float
+
+        raw_portfolio = PortfolioWriteService().load_portfolio()
+        positions = []
+        total_market_value = 0.0
+        total_profit = 0.0
+
+        for raw in raw_portfolio.get("positions", []):
+            quantity = to_float(raw.get("quantity"), 0.0) or 0.0
+            cost_price = to_float(raw.get("cost_price"), 0.0) or 0.0
+            current_price = to_float(raw.get("current_price"), cost_price) or cost_price
+            market_value = quantity * current_price
+            profit = market_value - (quantity * cost_price)
+            profit_pct = (profit / (quantity * cost_price) * 100) if quantity * cost_price > 0 else 0.0
+            code = raw.get("code") or raw.get("symbol", "")
+            total_market_value += market_value
+            total_profit += profit
+            positions.append({
+                "account": raw.get("account") or raw.get("group", ""),
+                "group": raw.get("group") or raw.get("account", ""),
+                "code": code,
+                "symbol": code,
+                "name": raw.get("name", ""),
+                "currency": raw.get("currency", ""),
+                "asset_type": raw.get("asset_type", "custom"),
+                "quantity": quantity,
+                "available_qty": to_float(raw.get("available_qty"), quantity) or quantity,
+                "cost_price": cost_price,
+                "current_price": current_price,
+                "total_cost": to_float(raw.get("total_cost"), quantity * cost_price) or quantity * cost_price,
+                "fee": to_float(raw.get("fee"), None),
+                "note": raw.get("note", ""),
+                "source": raw.get("source", "manual"),
+                "profit": profit,
+                "profit_pct": profit_pct,
+                "market_value": market_value
+            })
+
+        cash = to_float(raw_portfolio.get("cash"), 0.0) or 0.0
         return {
-            "positions": [
-                {
-                    "symbol": p.stock.symbol,
-                    "name": p.stock.name,
-                    "market": p.stock.market.value,
-                    "quantity": p.quantity,
-                    "available_qty": p.available_qty,
-                    "cost_price": p.cost_price,
-                    "current_price": p.current_price,
-                    "profit": p.profit,
-                    "profit_pct": p.profit_pct,
-                    "market_value": p.market_value
-                }
-                for p in portfolio.positions
-            ],
-            "cash": portfolio.cash,
-            "total_market_value": portfolio.total_market_value,
-            "total_assets": portfolio.total_assets,
-            "total_profit": portfolio.total_profit
+            "positions": positions,
+            "cash": cash,
+            "total_market_value": total_market_value,
+            "total_assets": total_market_value + cash,
+            "total_profit": total_profit
         }
 
     async def add_position(

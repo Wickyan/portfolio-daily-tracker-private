@@ -1,7 +1,7 @@
 """
 交易员 Agent 核心逻辑
 """
-from typing import Optional, AsyncIterator, List
+from typing import Callable, Optional, AsyncIterator, List
 from datetime import datetime
 import json
 
@@ -19,10 +19,16 @@ from .prompts import build_system_prompt
 class TraderAgent:
     """交易员 Agent"""
 
-    def __init__(self, llm_provider: LLMProvider, tool_executor: Optional[ToolExecutor] = None):
+    def __init__(
+        self,
+        llm_provider: LLMProvider,
+        tool_executor: Optional[ToolExecutor] = None,
+        prompt_builder: Callable[[str], str] = build_system_prompt
+    ):
         self.llm = llm_provider
         self.conversation: Optional[Conversation] = None
         self.tool_executor = tool_executor
+        self.prompt_builder = prompt_builder
         self.max_tool_iterations = 5  # 防止无限循环
 
     def start_conversation(self, conversation_id: str = "default") -> Conversation:
@@ -225,7 +231,7 @@ class TraderAgent:
         if context:
             context_str = context.to_context_string()
 
-        system_prompt = build_system_prompt(context_str)
+        system_prompt = self.prompt_builder(context_str)
 
         # 构建消息列表
         messages = [
