@@ -120,10 +120,11 @@ async def get_market_indices():
 
 @router.get("/search/{keyword}")
 async def search_stocks(keyword: str):
-    """搜索股票"""
-    # TODO: 实现股票搜索功能
-    # 目前返回空结果
-    return {
-        "results": [],
-        "message": "搜索功能开发中"
-    }
+    """按名称或代码在线搜索股票、ETF和基金。"""
+    from backend.services.instrument_search_service import InstrumentSearchService
+
+    try:
+        results = await InstrumentSearchService().search(keyword, limit=10)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"标的搜索失败: {exc}") from exc
+    return {"results": results}

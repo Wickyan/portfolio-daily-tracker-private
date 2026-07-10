@@ -67,6 +67,25 @@ function PendingActionCard({
           ))}
         </div>
       )}
+      {pending.instrument_candidates && pending.instrument_candidates.length > 1 && !change.code && (
+        <div className="space-y-2">
+          <div className="text-sm text-slate-300">搜索候选：</div>
+          <div className="flex flex-wrap gap-2">
+            {pending.instrument_candidates.slice(0, 5).map((candidate) => (
+              <button
+                key={`${candidate.code}-${candidate.currency}`}
+                onClick={() => run(async () => {
+                  await onRevise(`代码${candidate.code}`)
+                })}
+                disabled={isWorking}
+                className="rounded border border-slate-600 bg-slate-700 px-2.5 py-1.5 text-left text-xs hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
+              >
+                <span className="font-semibold">{candidate.code}</span> {candidate.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {pending.status === 'confirmed' ? (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>

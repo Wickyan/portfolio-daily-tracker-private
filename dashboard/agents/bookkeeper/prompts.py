@@ -120,7 +120,10 @@ code规则：
 泛称/自定义标的规则：
 - “海外科技”“纳指ETF”“中概互联”“半导体ETF”等可能是基金简称、ETF简称或用户自定义别名。
 - 如果当前positions里已有同名标的，优先沿用已有code、currency、asset_type。
-- 如果当前positions里没有同名标的，不要乱填具体code。
+- 如果当前positions里没有同名标的，先使用在线标的搜索按名称查找代码。
+- 只有一个高置信候选时可以自动补齐code/name/currency/asset_type，但必须标注“联网匹配，需确认”。
+- 有多个合理候选时列出候选代码供用户选择，不要随意写入其中一个。
+- 在线搜索失败或没有可靠候选时，再要求用户补充具体代码。
 - 但可以根据上下文推断currency和asset_type。
 - 如果出现“银河/国内券商 + 元/CNY/人民币 + 份”，可推断currency=CNY，asset_type=fund_or_custom。
 - 如果出现“IBKR/美股券商 + 美元/USD + ETF”，可推断currency=USD，asset_type=etf。

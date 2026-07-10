@@ -16,6 +16,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.services.instrument_search_service import InstrumentSearchService
 from backend.services.portfolio_write_service import (
     PENDING_DIR,
     PortfolioWriteService,
@@ -94,6 +95,7 @@ def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
         "intent": pending.get("intent", "bookkeeping"),
         "status": pending.get("status", "pending"),
         "operation_id": pending.get("operation_id"),
+        "instrument_candidates": pending.get("instrument_candidates", []),
     }
 
 
@@ -403,6 +405,12 @@ def infer_action(message: str) -> str:
         return "deposit"
     if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "录入"]):
         return "add_or_update"
+    # Accept concise bookkeeping such as "海外科技100股，一共花了9000元"
+    # even when the user omits an explicit buy/add verb.
+    has_quantity = bool(re.search(r"[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)", message))
+    has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
+    if has_quantity and has_total_amount:
+        return "add_or_update"
     if looks_like_structured_bookkeeping(message):
         return "add_or_update"
     return "chat_only"
@@ -592,6 +600,103 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
     }
 
 
+async def enrich_with_online_instrument_search(
+    parsed: Dict[str, Any],
+    message: str,
+) -> Dict[str, Any]:
+    """Resolve a missing code from an instrument name before asking the user."""
+    if parsed.get("intent") != "bookkeeping" or not parsed.get("changes"):
+        return parsed
+
+    change = dict(parsed["changes"][0])
+    if change.get("code"):
+        return parsed
+    keyword = str(change.get("name") or "").strip()
+    if not keyword:
+        return parsed
+
+    try:
+        candidates = await InstrumentSearchService().search(keyword, limit=8)
+    except Exception as exc:
+        warnings = list(parsed.get("warnings", []))
+        warnings.append(f"标的在线搜索暂时失败：{exc}")
+        parsed["warnings"] = list(dict.fromkeys(warnings))
+        return parsed
+
+    if not candidates:
+        return parsed
+
+    chosen = InstrumentSearchService.choose_confident(candidates)
+    warnings = [
+        warning for warning in parsed.get("warnings", [])
+        if "需要确认具体代码" not in warning
+        and "需要确认具体代码或基金名称" not in warning
+        and "像是基金简称或自定义标的" not in warning
+    ]
+
+    if chosen:
+        change["code"] = chosen["code"]
+        change["name"] = chosen["name"]
+        change["currency"] = change.get("currency") or chosen["currency"]
+        change["asset_type"] = chosen["asset_type"]
+        change = PortfolioWriteService().normalize_position(change)
+        parsed["changes"] = [change]
+        parsed["missing_fields"] = build_missing(change, str(parsed.get("action_type") or "add_or_update"))
+        warnings.append(
+            f"已联网匹配：{chosen['code']} {chosen['name']}；请在确认写入前核对"
+        )
+        parsed["warnings"] = list(dict.fromkeys(warnings))
+        parsed["instrument_candidates"] = candidates[:5]
+        return parsed
+
+    parsed["instrument_candidates"] = candidates[:5]
+    preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
+    warnings.append(f"联网找到多个候选：{preview}。请补充具体代码")
+    parsed["warnings"] = list(dict.fromkeys(warnings))
+    return parsed
+
+
+def apply_direct_code_revision(
+    pending: Dict[str, Any],
+    message: str,
+) -> Dict[str, Any] | None:
+    """Allow a bare code or '代码xxxx' to select an online-search candidate."""
+    if not pending.get("changes"):
+        return None
+    match = re.search(
+        r"^(?:代码|code)?\s*[:：]?\s*([A-Za-z]{1,8}|[0-9]{4,6})\s*$",
+        message.strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    code = match.group(1).upper()
+    candidates = pending.get("instrument_candidates", []) or []
+    selected = next((candidate for candidate in candidates if str(candidate.get("code") or "").upper() == code), None)
+
+    updated = dict(pending["changes"][0])
+    updated["code"] = code
+    if selected:
+        updated["name"] = selected.get("name") or updated.get("name")
+        updated["currency"] = updated.get("currency") or selected.get("currency")
+        updated["asset_type"] = selected.get("asset_type") or updated.get("asset_type")
+    updated = PortfolioWriteService().normalize_position(updated)
+    action_type = str(pending.get("action_type") or "add_or_update")
+    missing = build_missing(updated, action_type)
+    warnings = [warning for warning in pending.get("warnings", []) if "联网找到多个候选" not in warning]
+    if selected:
+        warnings.append(f"已选择联网候选：{selected['code']} {selected['name']}")
+    return {
+        "intent": "bookkeeping",
+        "summary": "已补充标的代码",
+        "action_type": action_type,
+        "changes": [updated],
+        "missing_fields": missing,
+        "warnings": list(dict.fromkeys(warnings)),
+        "instrument_candidates": candidates,
+    }
+
+
 def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[str, Any]:
     pending_id = str(uuid4())
     now = datetime.now()
@@ -610,6 +715,7 @@ def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[
         "changes": parsed.get("changes", []),
         "missing_fields": missing,
         "warnings": parsed.get("warnings", []),
+        "instrument_candidates": parsed.get("instrument_candidates", []),
         "requires_confirmation": parsed.get("intent") == "bookkeeping" and len(missing) == 0,
     }
     return pending
@@ -618,6 +724,7 @@ def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[
 @router.post("/ai-preview")
 async def ai_preview(request: PreviewRequest):
     parsed = parse_bookkeeping_message(request.message)
+    parsed = await enrich_with_online_instrument_search(parsed, request.message)
     if parsed.get("intent") == "chat_only":
         return {
             "ok": True,
@@ -638,13 +745,17 @@ async def ai_revise(request: ReviseRequest):
     pending = load_pending(request.pending_id)
     if pending.get("status") != "pending":
         raise HTTPException(status_code=400, detail="pending_action 已结束")
-    parsed = parse_bookkeeping_message(request.message, previous=pending)
+    parsed = apply_direct_code_revision(pending, request.message)
+    if parsed is None:
+        parsed = parse_bookkeeping_message(request.message, previous=pending)
+        parsed = await enrich_with_online_instrument_search(parsed, request.message)
     if parsed.get("intent") == "chat_only":
         raise HTTPException(status_code=400, detail="未识别到可用于补充的记账信息")
     pending["message"] = f"{pending.get('message', '')}\n[revise] {request.message}"
     pending["changes"] = parsed.get("changes", pending.get("changes", []))
     pending["missing_fields"] = [field for field in parsed.get("missing_fields", []) if field != "market"]
     pending["warnings"] = parsed.get("warnings", [])
+    pending["instrument_candidates"] = parsed.get("instrument_candidates", pending.get("instrument_candidates", []))
     pending["summary"] = parsed.get("summary", pending.get("summary"))
     pending["action_type"] = parsed.get("action_type", pending.get("action_type"))
     pending["requires_confirmation"] = len(pending["missing_fields"]) == 0

@@ -91,6 +91,14 @@ export interface PendingChange {
   source?: string
 }
 
+export interface InstrumentCandidate {
+  code: string
+  name: string
+  currency: string
+  asset_type: string
+  score?: number
+}
+
 export interface PendingAction {
   ok: boolean
   pending_id?: string
@@ -103,6 +111,7 @@ export interface PendingAction {
   intent?: 'bookkeeping' | 'chat_only' | string
   status?: string
   operation_id?: string
+  instrument_candidates?: InstrumentCandidate[]
 }
 
 export interface OperationSummary {

@@ -98,6 +98,14 @@ class BookkeepingParserTest(unittest.TestCase):
         self.assertIn("existing_position", parsed["missing_fields"])
         self.assertTrue(any("暂不支持卖空" in warning for warning in parsed["warnings"]))
 
+    def test_concise_name_quantity_total_is_bookkeeping(self) -> None:
+        parsed = parse_bookkeeping_message("海外科技 100股票 一共花了9000元")
+        self.assertEqual(parsed["intent"], "bookkeeping")
+        self.assertEqual(parsed["changes"][0]["name"], "海外科技")
+        self.assertEqual(parsed["changes"][0]["quantity"], 100)
+        self.assertEqual(parsed["changes"][0]["total_cost"], 9000)
+        self.assertEqual(parsed["changes"][0]["cost_price"], 90)
+
     def test_existing_nvidia_and_total_amount_are_inferred(self) -> None:
         positions = [{
             "account": "IBKR",
