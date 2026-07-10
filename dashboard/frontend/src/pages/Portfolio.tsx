@@ -8,7 +8,7 @@ import type { Position } from '@/types'
 interface EditPositionDialogProps {
   position: Position
   onClose: () => void
-  onSave: (symbol: string, data: { quantity: number; cost_price: number }) => void
+  onSave: (identity: { account: string; code: string; currency: string }, data: { quantity: number; cost_price: number }) => void
 }
 
 function EditPositionDialog({ position, onClose, onSave }: EditPositionDialogProps) {
@@ -16,7 +16,7 @@ function EditPositionDialog({ position, onClose, onSave }: EditPositionDialogPro
   const [costPrice, setCostPrice] = useState(position.cost_price)
 
   const handleSave = () => {
-    onSave(position.symbol, { quantity, cost_price: costPrice })
+    onSave({ account: position.account, code: position.code, currency: position.currency }, { quantity, cost_price: costPrice })
     onClose()
   }
 
@@ -35,7 +35,7 @@ function EditPositionDialog({ position, onClose, onSave }: EditPositionDialogPro
             <label className="block text-sm text-slate-400 mb-2">代码</label>
             <input
               type="text"
-              value={position.symbol}
+              value={position.code}
               disabled
               className="w-full bg-slate-700/50 rounded-lg px-4 py-2 text-slate-500"
             />
@@ -52,7 +52,7 @@ function EditPositionDialog({ position, onClose, onSave }: EditPositionDialogPro
           </div>
 
           <div>
-            <label className="block text-sm text-slate-400 mb-2">成本价（元）</label>
+            <label className="block text-sm text-slate-400 mb-2">成本价</label>
             <input
               type="number"
               step="0.01"
@@ -87,7 +87,6 @@ function AddPositionDialog({ onClose, onSave }: {
   onClose: () => void
   onSave: (data: {
     account: string
-    group: string
     name: string
     code: string
     currency: string
@@ -115,7 +114,6 @@ function AddPositionDialog({ onClose, onSave }: {
   const handleSave = () => {
     onSave({
       account: form.account,
-      group: form.account,
       name: form.name,
       code: form.code,
       currency: form.currency,
@@ -241,8 +239,8 @@ export default function Portfolio() {
   })
 
   const updatePositionMutation = useMutation({
-    mutationFn: ({ symbol, data }: { symbol: string; data: { quantity: number; cost_price: number } }) =>
-      portfolioService.updatePosition(symbol, data),
+    mutationFn: ({ identity, data }: { identity: { account: string; code: string; currency: string }; data: { quantity: number; cost_price: number } }) =>
+      portfolioService.updatePosition(identity, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
       queryClient.refetchQueries({ queryKey: ['portfolio'] })
@@ -269,9 +267,13 @@ export default function Portfolio() {
     }
   })
 
-  const handleDeletePosition = (symbol: string, name: string) => {
-    if (confirm(`确定要删除持仓 ${name}(${symbol}) 吗？`)) {
-      deletePositionMutation.mutate(symbol)
+  const handleDeletePosition = (position: Position) => {
+    if (confirm(`确定要删除${position.account}账户的持仓${position.name}(${position.code}, ${position.currency})吗？`)) {
+      deletePositionMutation.mutate({
+        account: position.account,
+        code: position.code,
+        currency: position.currency,
+      })
     }
   }
 
@@ -391,9 +393,9 @@ export default function Portfolio() {
                   const profitClass = isProfit ? 'text-green-400' : 'text-red-400'
 
                   return (
-                    <tr key={`${position.account || position.group}-${position.code || position.symbol}`} className="border-b border-slate-700/50 hover:bg-slate-700/30">
-                      <td className="px-6 py-4">{position.account || position.group || '-'}</td>
-                      <td className="px-6 py-4 font-mono text-primary-400">{position.code || position.symbol}</td>
+                    <tr key={`${position.account}-${position.code}-${position.currency}`} className="border-b border-slate-700/50 hover:bg-slate-700/30">
+                      <td className="px-6 py-4">{position.account || '-'}</td>
+                      <td className="px-6 py-4 font-mono text-primary-400">{position.code}</td>
                       <td className="px-6 py-4">{position.name}</td>
                       <td className="px-6 py-4">
                         <div className="text-sm">{position.currency}</div>
@@ -429,7 +431,7 @@ export default function Portfolio() {
                             <Edit2 className="h-4 w-4" />
                           </button>
                           <button
-                            onClick={() => handleDeletePosition(position.code || position.symbol, position.name)}
+                            onClick={() => handleDeletePosition(position)}
                             className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-slate-700 rounded transition-colors"
                             title="删除持仓"
                           >
@@ -477,7 +479,7 @@ export default function Portfolio() {
         <EditPositionDialog
           position={editingPosition}
           onClose={() => setEditingPosition(null)}
-          onSave={(symbol, data) => updatePositionMutation.mutate({ symbol, data })}
+          onSave={(identity, data) => updatePositionMutation.mutate({ identity, data })}
         />
       )}
       {showAddDialog && (

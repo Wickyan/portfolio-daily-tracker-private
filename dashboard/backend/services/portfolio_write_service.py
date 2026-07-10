@@ -1,9 +1,11 @@
 """
-Safe portfolio write service.
+Canonical portfolio schema and safe write helpers.
 
-All user-visible portfolio writes should go through this service so every
-change gets a backup and an operation log. Stored positions never include
-market/exchange/canonical_symbol.
+Stored positions use one user-facing identity only:
+    account + code + currency
+
+Legacy input aliases (group/symbol) are accepted at boundaries, but are never
+written back to portfolio.json. market/exchange/canonical_symbol are discarded.
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -22,7 +24,34 @@ BACKUPS_DIR = DATA_DIR / "backups"
 OPERATIONS_DIR = DATA_DIR / "operations"
 PENDING_DIR = DATA_DIR / "pending_actions"
 
-PROHIBITED_FIELDS = {"market", "exchange", "canonical_symbol"}
+PROHIBITED_FIELDS = {
+    "market",
+    "exchange",
+    "canonical_symbol",
+}
+
+# New writes persist only canonical bookkeeping fields plus the temporary quote
+# compatibility fields still used by the existing dashboard.
+POSITION_STORAGE_FIELDS = {
+    "account",
+    "name",
+    "code",
+    "currency",
+    "asset_type",
+    "quantity",
+    "cost_price",
+    "total_cost",
+    "fee",
+    "note",
+    "source",
+    "created_at",
+    "updated_at",
+    "available_qty",
+    "current_price",
+    "side",
+}
+
+PositionIdentity = Tuple[str, str, str]
 
 
 def utc_now_iso() -> str:
@@ -55,7 +84,8 @@ def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]
     if ":" in upper:
         prefix, rest = upper.split(":", 1)
         if prefix in {"SHE", "SHA"}:
-            return rest, "CNY", "stock"
+            inferred_type = "fund" if rest.startswith(("15", "16", "50", "51", "52", "56", "58")) else "stock"
+            return rest, "CNY", inferred_type
         if prefix == "HKG":
             return rest.zfill(4), "HKD", "stock"
         if prefix in {"NASDAQ", "NYSE", "AMEX"}:
@@ -65,15 +95,15 @@ def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]
 
 def infer_position_defaults(position: Dict[str, Any]) -> Dict[str, Any]:
     code = str(position.get("code") or "").strip()
-    currency = position.get("currency")
-    asset_type = position.get("asset_type")
+    currency = str(position.get("currency") or "").upper()
+    asset_type = str(position.get("asset_type") or "").strip()
 
     if not currency:
         if code.isdigit() and len(code) == 6:
             currency = "CNY"
         elif code.isdigit() and len(code) == 4:
             currency = "HKD"
-        elif code.isascii() and code.replace(".", "").isalnum():
+        elif code.isascii() and code and not code.isdigit():
             currency = "USD"
 
     if not asset_type:
@@ -86,9 +116,17 @@ def infer_position_defaults(position: Dict[str, Any]) -> Dict[str, Any]:
         else:
             asset_type = "custom"
 
-    position["currency"] = str(currency or "").upper()
+    position["currency"] = currency
     position["asset_type"] = asset_type or "custom"
     return position
+
+
+def position_identity(position: Dict[str, Any]) -> PositionIdentity:
+    """Return the canonical identity: account + code + currency."""
+    account = str(position.get("account") or position.get("group") or "").strip()
+    code, inferred_currency, _ = strip_code_prefix(position.get("code") or position.get("symbol"))
+    currency = str(position.get("currency") or inferred_currency or "").upper().strip()
+    return account, code, currency
 
 
 class PortfolioWriteService:
@@ -137,79 +175,99 @@ class PortfolioWriteService:
         return f"dashboard/data/backups/{backup_path.name}"
 
     def normalize_position(self, raw: Dict[str, Any], for_storage: bool = False) -> Dict[str, Any]:
-        position = {k: v for k, v in dict(raw or {}).items() if k not in PROHIBITED_FIELDS}
+        """
+        Normalize legacy aliases into the canonical schema.
 
-        raw_code = position.get("code") or position.get("symbol")
+        Accepted input aliases:
+        - group -> account
+        - symbol -> code
+
+        Returned/stored data never contains group, symbol, market, exchange or
+        canonical_symbol.
+        """
+        raw_position = {
+            k: v for k, v in dict(raw or {}).items()
+            if k not in PROHIBITED_FIELDS
+        }
+        position: Dict[str, Any] = {}
+
+        account = str(raw_position.get("account") or raw_position.get("group") or "").strip()
+        if account:
+            position["account"] = account
+
+        raw_code = raw_position.get("code") or raw_position.get("symbol")
         code, inferred_currency, inferred_asset_type = strip_code_prefix(raw_code)
         if code:
             position["code"] = code
-            position["symbol"] = code
-        else:
-            position.pop("code", None)
-            position.pop("symbol", None)
 
-        if not position.get("currency") and inferred_currency:
-            position["currency"] = inferred_currency
-        if not position.get("asset_type") and inferred_asset_type:
-            position["asset_type"] = inferred_asset_type
-
-        account = str(position.get("account") or position.get("group") or "").strip()
-        if account:
-            position["account"] = account
-            position["group"] = account
-
-        name = str(position.get("name") or "").strip()
+        name = str(raw_position.get("name") or "").strip()
         if name:
             position["name"] = name
 
-        quantity = to_float(position.get("quantity"), None)
-        cost_price = to_float(position.get("cost_price"), None)
-        total_cost = to_float(position.get("total_cost"), None)
-        fee = to_float(position.get("fee"), None)
+        explicit_currency = str(raw_position.get("currency") or "").upper().strip()
+        if explicit_currency or inferred_currency:
+            position["currency"] = explicit_currency or inferred_currency
 
-        if cost_price is None and quantity and total_cost is not None:
+        asset_type = str(raw_position.get("asset_type") or "").strip()
+        if asset_type or inferred_asset_type:
+            position["asset_type"] = asset_type or inferred_asset_type
+
+        quantity = to_float(raw_position.get("quantity"), None)
+        cost_price = to_float(raw_position.get("cost_price"), None)
+        total_cost = to_float(raw_position.get("total_cost"), None)
+        fee = to_float(raw_position.get("fee"), None)
+
+        if cost_price is None and quantity not in (None, 0) and total_cost is not None:
             cost_price = total_cost / quantity
         if total_cost is None and quantity is not None and cost_price is not None:
             total_cost = quantity * cost_price
 
         if quantity is not None:
             position["quantity"] = quantity
-            position["available_qty"] = to_float(position.get("available_qty"), quantity) or quantity
+            position["available_qty"] = to_float(raw_position.get("available_qty"), quantity)
         if cost_price is not None:
             position["cost_price"] = cost_price
-            position["current_price"] = to_float(position.get("current_price"), cost_price) or cost_price
+            position["current_price"] = to_float(raw_position.get("current_price"), cost_price)
         if total_cost is not None:
             position["total_cost"] = total_cost
         if fee is not None:
             position["fee"] = fee
 
-        position["note"] = str(position.get("note") or "")
-        position["source"] = str(position.get("source") or "manual")
+        position["note"] = str(raw_position.get("note") or "")
+        position["source"] = str(raw_position.get("source") or "manual")
+        position["side"] = str(raw_position.get("side") or "long")
         position = infer_position_defaults(position)
 
         now = utc_now_iso()
-        if not position.get("created_at"):
-            position["created_at"] = now
-        position["updated_at"] = now
+        position["created_at"] = str(raw_position.get("created_at") or now)
+        position["updated_at"] = str(raw_position.get("updated_at") or now)
+
+        # Operational metadata may exist in pending changes, but is never stored.
+        if not for_storage:
+            if raw_position.get("action_type"):
+                position["action_type"] = str(raw_position["action_type"])
+            if raw_position.get("action"):
+                position["action"] = str(raw_position["action"])
+            if raw_position.get("amount") is not None:
+                position["amount"] = to_float(raw_position.get("amount"), None)
 
         if for_storage:
-            position.pop("market", None)
-            position.pop("exchange", None)
-            position.pop("canonical_symbol", None)
+            position = {k: v for k, v in position.items() if k in POSITION_STORAGE_FIELDS}
 
         return position
 
     def validate_confirmable_change(self, change: Dict[str, Any]) -> List[str]:
+        normalized = self.normalize_position(change)
         missing = []
-        if not (change.get("account") or change.get("group")):
-            missing.append("account/group")
-        if not change.get("code"):
+        if not normalized.get("account"):
+            missing.append("account")
+        if not normalized.get("code"):
             missing.append("code")
-        if not change.get("currency"):
+        if not normalized.get("currency"):
             missing.append("currency")
-        if to_float(change.get("quantity"), None) is None:
+        if to_float(normalized.get("quantity"), None) is None:
             missing.append("quantity")
-        if to_float(change.get("cost_price"), None) is None:
+        if to_float(normalized.get("cost_price"), None) is None:
             missing.append("cost_price")
         return missing
 
@@ -219,26 +277,19 @@ class PortfolioWriteService:
         imported = 0
 
         for raw_change in changes:
-            change = self.normalize_position(raw_change, for_storage=True)
             action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
+            change = self.normalize_position(raw_change, for_storage=True)
 
             if action_type in {"sell", "delete"}:
                 positions = self._apply_sell_or_delete(positions, change)
                 imported += 1
                 continue
 
-            account = change.get("account") or change.get("group")
-            code = change.get("code")
-            currency = change.get("currency")
-            existing = next(
-                (
-                    p for p in positions
-                    if (p.get("account") or p.get("group")) == account
-                    and p.get("code") == code
-                    and p.get("currency") == currency
-                ),
-                None,
-            )
+            identity = position_identity(change)
+            existing_matches = [p for p in positions if position_identity(p) == identity]
+            if len(existing_matches) > 1:
+                raise ValueError(f"检测到重复持仓身份: {identity}")
+            existing = existing_matches[0] if existing_matches else None
 
             if existing:
                 old_qty = to_float(existing.get("quantity"), 0.0) or 0.0
@@ -268,29 +319,33 @@ class PortfolioWriteService:
         return result, imported
 
     def _apply_sell_or_delete(self, positions: List[Dict[str, Any]], change: Dict[str, Any]) -> List[Dict[str, Any]]:
-        account = change.get("account") or change.get("group")
-        code = change.get("code")
-        currency = change.get("currency")
+        identity = position_identity(change)
         qty = to_float(change.get("quantity"), None)
-        kept = []
+        kept: List[Dict[str, Any]] = []
+        matched = False
+
         for position in positions:
-            same = (
-                (not account or (position.get("account") or position.get("group")) == account)
-                and position.get("code") == code
-                and (not currency or position.get("currency") == currency)
-            )
-            if not same:
+            if position_identity(position) != identity:
                 kept.append(position)
                 continue
+
+            matched = True
             if qty is None:
                 continue
+
             new_qty = (to_float(position.get("quantity"), 0.0) or 0.0) - qty
             if new_qty > 0:
                 position["quantity"] = new_qty
-                position["available_qty"] = min(to_float(position.get("available_qty"), new_qty) or new_qty, new_qty)
+                position["available_qty"] = min(
+                    to_float(position.get("available_qty"), new_qty) or new_qty,
+                    new_qty,
+                )
                 position["total_cost"] = new_qty * (to_float(position.get("cost_price"), 0.0) or 0.0)
                 position["updated_at"] = utc_now_iso()
                 kept.append(position)
+
+        if not matched:
+            raise FileNotFoundError(identity)
         return kept
 
     def create_operation(
@@ -373,7 +428,12 @@ class PortfolioWriteService:
             "backup_path": backup_path,
         }
 
-    def safe_add_positions(self, changes: List[Dict[str, Any]], summary: str, pending_action: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def safe_add_positions(
+        self,
+        changes: List[Dict[str, Any]],
+        summary: str,
+        pending_action: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         before = self.load_portfolio()
         backup_path = self.backup_portfolio()
         after, imported = self.apply_changes(before, changes)
@@ -395,27 +455,86 @@ class PortfolioWriteService:
             "portfolio_updated": True,
         }
 
-    def safe_remove_position(self, code: str) -> Dict[str, Any]:
+    def safe_update_position(
+        self,
+        account: str,
+        code: str,
+        currency: str,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        identity = position_identity({"account": account, "code": code, "currency": currency})
         before = self.load_portfolio()
-        backup_path = self.backup_portfolio()
+        matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
+        if not matches:
+            raise FileNotFoundError(identity)
+        if len(matches) > 1:
+            raise ValueError(f"检测到重复持仓身份: {identity}")
+
+        existing = matches[0]
+        updated = dict(existing)
+        if updates.get("quantity") is not None:
+            updated["quantity"] = to_float(updates.get("quantity"), existing.get("quantity"))
+            updated["available_qty"] = updated["quantity"]
+        if updates.get("cost_price") is not None:
+            updated["cost_price"] = to_float(updates.get("cost_price"), existing.get("cost_price"))
+        updated["total_cost"] = (
+            (to_float(updated.get("quantity"), 0.0) or 0.0)
+            * (to_float(updated.get("cost_price"), 0.0) or 0.0)
+        )
+        updated["updated_at"] = utc_now_iso()
+        updated = self.normalize_position(updated, for_storage=True)
+
         after = deepcopy(before)
-        before_len = len(after.get("positions", []))
-        after["positions"] = [p for p in after.get("positions", []) if p.get("code") != code and p.get("symbol") != code]
-        removed = before_len - len(after["positions"])
-        after["updated_at"] = utc_now_iso()
+        after["positions"] = [
+            updated if position_identity(p) == identity else self.normalize_position(p, for_storage=True)
+            for p in before.get("positions", [])
+        ]
+        backup_path = self.backup_portfolio()
         self.save_portfolio_atomic(after)
         operation = self.create_operation(
-            operation_type="manual_delete",
-            summary=f"删除持仓 {code}",
+            operation_type="manual_update",
+            summary=f"手动更新持仓 {account}/{code}/{currency}",
             before_snapshot=before,
             after_snapshot=after,
             backup_path=backup_path,
-            imported_positions=removed,
+            imported_positions=1,
         )
         return {
             "ok": True,
             "operation_id": operation["operation_id"],
-            "removed_positions": removed,
+            "backup_path": backup_path,
+            "portfolio_updated": True,
+        }
+
+    def safe_remove_position(self, account: str, code: str, currency: str) -> Dict[str, Any]:
+        identity = position_identity({"account": account, "code": code, "currency": currency})
+        before = self.load_portfolio()
+        matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
+        if not matches:
+            raise FileNotFoundError(identity)
+        if len(matches) > 1:
+            raise ValueError(f"检测到重复持仓身份: {identity}")
+
+        backup_path = self.backup_portfolio()
+        after = deepcopy(before)
+        after["positions"] = [
+            p for p in after.get("positions", [])
+            if position_identity(p) != identity
+        ]
+        after["updated_at"] = utc_now_iso()
+        self.save_portfolio_atomic(after)
+        operation = self.create_operation(
+            operation_type="manual_delete",
+            summary=f"删除持仓 {account}/{code}/{currency}",
+            before_snapshot=before,
+            after_snapshot=after,
+            backup_path=backup_path,
+            imported_positions=1,
+        )
+        return {
+            "ok": True,
+            "operation_id": operation["operation_id"],
+            "removed_positions": 1,
             "backup_path": backup_path,
             "portfolio_updated": True,
         }

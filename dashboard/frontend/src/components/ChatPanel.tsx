@@ -44,7 +44,7 @@ function PendingActionCard({
     <div className="space-y-3 rounded-lg border border-primary-500/40 bg-slate-800 p-4">
       <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
       <div className="rounded bg-slate-900/60 px-3 py-2">
-        {field('账户分组', change.account || change.group)}
+        {field('账户分组', change.account)}
         {field('标的', change.name)}
         {field('代码', change.code)}
         {field('币种', change.currency)}

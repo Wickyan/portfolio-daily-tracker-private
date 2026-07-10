@@ -1,38 +1,30 @@
-"""
-手动持仓管理 Provider
-支持从文件导入或手动维护持仓
-"""
-from typing import Dict, List, Optional
-from datetime import datetime
-import asyncio
-import json
-import os
-from pathlib import Path
+"""手动持仓Provider。
 
-from core.data.base import PortfolioProvider, MarketDataProvider
-from core.models import Portfolio, Position, Stock, Market, PositionSide
+portfolio.json使用规范账本字段。group/symbol只作为旧数据读取兼容，保存时
+统一写为account/code；market仅在内存中用于行情Provider，不写入账本。
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from core.data.base import MarketDataProvider, PortfolioProvider
+from core.models import Market, Portfolio, Position, PositionSide, Stock
 
 
 class ManualPortfolioProvider(PortfolioProvider):
-    """
-    手动持仓管理
-
-    支持：
-    1. 从 JSON 文件加载持仓
-    2. 手动添加/删除/修改持仓
-    3. 自动保存持仓变更
-    """
-
     def __init__(
         self,
         data_file: str = "portfolio.json",
-        market_provider: Optional[MarketDataProvider] = None
+        market_provider: Optional[MarketDataProvider] = None,
     ):
         self.data_file = Path(data_file)
         self.market_provider = market_provider
         self._portfolio = Portfolio()
         self._last_update: Optional[datetime] = None
-        self._position_meta: Dict[str, Dict] = {}
         self._load()
 
     @property
@@ -43,139 +35,154 @@ class ManualPortfolioProvider(PortfolioProvider):
     def last_update(self) -> Optional[datetime]:
         return self._last_update
 
-    def _load(self):
-        """从文件加载持仓"""
-        if self.data_file.exists():
-            try:
-                with open(self.data_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                positions = []
-                self._position_meta = {}
-                for p in data.get("positions", []):
-                    symbol = p.get("code") or p.get("symbol")
-                    if not symbol:
-                        continue
-                    currency = str(p.get("currency") or "").upper()
-                    internal_market = p.get("market") or self._infer_internal_market(symbol, currency)
-                    stock = Stock(
-                        symbol=str(symbol),
-                        name=p["name"],
-                        market=Market(internal_market)
-                    )
-                    positions.append(Position(
-                        stock=stock,
-                        quantity=p["quantity"],
-                        available_qty=p.get("available_qty", p["quantity"]),
-                        cost_price=p["cost_price"],
-                        current_price=p.get("current_price", p["cost_price"]),
-                        side=PositionSide(p.get("side", "long"))
-                    ))
-                    self._position_meta[str(symbol)] = {
-                        "account": p.get("account") or p.get("group", ""),
-                        "group": p.get("group") or p.get("account", ""),
-                        "currency": currency or self._infer_currency(symbol),
-                        "asset_type": p.get("asset_type") or self._infer_asset_type(symbol),
-                        "total_cost": p.get("total_cost"),
-                        "fee": p.get("fee"),
-                        "note": p.get("note", ""),
-                        "source": p.get("source", "manual"),
-                        "created_at": p.get("created_at"),
-                    }
-
-                self._portfolio = Portfolio(
-                    positions=positions,
-                    cash=data.get("cash", 0.0)
-                )
-                self._last_update = datetime.now()
-            except Exception as e:
-                print(f"加载持仓文件失败: {e}")
-
-    def _save(self):
-        """保存持仓到文件"""
-        data = {
-            "positions": [
-                {
-                    "account": self._position_meta.get(p.stock.symbol, {}).get("account", ""),
-                    "group": self._position_meta.get(p.stock.symbol, {}).get("group", self._position_meta.get(p.stock.symbol, {}).get("account", "")),
-                    "code": p.stock.symbol,
-                    "symbol": p.stock.symbol,
-                    "name": p.stock.name,
-                    "currency": self._position_meta.get(p.stock.symbol, {}).get("currency") or self._infer_currency(p.stock.symbol),
-                    "asset_type": self._position_meta.get(p.stock.symbol, {}).get("asset_type") or self._infer_asset_type(p.stock.symbol),
-                    "quantity": p.quantity,
-                    "available_qty": p.available_qty,
-                    "cost_price": p.cost_price,
-                    "total_cost": self._position_meta.get(p.stock.symbol, {}).get("total_cost", p.quantity * p.cost_price),
-                    "fee": self._position_meta.get(p.stock.symbol, {}).get("fee"),
-                    "note": self._position_meta.get(p.stock.symbol, {}).get("note", ""),
-                    "source": self._position_meta.get(p.stock.symbol, {}).get("source", "manual"),
-                    "created_at": self._position_meta.get(p.stock.symbol, {}).get("created_at", datetime.now().isoformat()),
-                    "updated_at": datetime.now().isoformat(),
-                    "current_price": p.current_price,
-                    "side": p.side.value
-                }
-                for p in self._portfolio.positions
-            ],
-            "cash": self._portfolio.cash,
-            "updated_at": datetime.now().isoformat()
-        }
-
-        # 确保目录存在
-        self.data_file.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self.data_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    def _infer_internal_market(self, symbol: str, currency: str = "") -> str:
+    @staticmethod
+    def _infer_internal_market(symbol: str, currency: str = "") -> str:
         symbol = str(symbol or "").upper()
         currency = str(currency or "").upper()
         if currency == "HKD" or (symbol.isdigit() and len(symbol) == 4):
             return "hk_stock"
-        if currency == "USD" or (symbol.isascii() and not symbol.isdigit()):
+        if currency == "USD" or (symbol.isascii() and symbol and not symbol.isdigit()):
             return "us_stock"
         return "a_share"
 
-    def _infer_currency(self, symbol: str) -> str:
+    @staticmethod
+    def _infer_currency(symbol: str) -> str:
         symbol = str(symbol or "").upper()
         if symbol.isdigit() and len(symbol) == 4:
             return "HKD"
-        if symbol.isascii() and not symbol.isdigit():
+        if symbol.isascii() and symbol and not symbol.isdigit():
             return "USD"
         return "CNY"
 
-    def _infer_asset_type(self, symbol: str) -> str:
+    @staticmethod
+    def _infer_asset_type(symbol: str) -> str:
         symbol = str(symbol or "")
         if symbol.isdigit() and len(symbol) == 6 and symbol.startswith(("15", "16", "50", "51", "52", "56", "58")):
             return "fund"
         return "stock" if symbol else "custom"
 
+    @staticmethod
+    def _identity(account: str, code: str, currency: str) -> Tuple[str, str, str]:
+        return str(account or "").strip(), str(code or "").strip(), str(currency or "").upper().strip()
+
+    @staticmethod
+    def _position_identity(position: Position) -> Tuple[str, str, str]:
+        return ManualPortfolioProvider._identity(
+            getattr(position, "account", ""),
+            position.stock.symbol,
+            getattr(position, "currency", ""),
+        )
+
+    def _load(self) -> None:
+        if not self.data_file.exists():
+            return
+
+        try:
+            with open(self.data_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            positions: List[Position] = []
+            for raw in data.get("positions", []):
+                code = str(raw.get("code") or raw.get("symbol") or "").strip()
+                if not code:
+                    continue
+
+                account = str(raw.get("account") or raw.get("group") or "").strip()
+                currency = str(raw.get("currency") or self._infer_currency(code)).upper()
+                asset_type = str(raw.get("asset_type") or self._infer_asset_type(code))
+                internal_market = self._infer_internal_market(code, currency)
+                stock = Stock(
+                    symbol=code,
+                    name=str(raw.get("name") or code),
+                    market=Market(internal_market),
+                )
+                position = Position(
+                    stock=stock,
+                    quantity=raw.get("quantity", 0),
+                    available_qty=raw.get("available_qty", raw.get("quantity", 0)),
+                    cost_price=raw.get("cost_price", 0),
+                    current_price=raw.get("current_price", raw.get("cost_price", 0)),
+                    side=PositionSide(raw.get("side", "long")),
+                )
+                # Position dataclass has no slots, so attach bookkeeping metadata
+                # without changing the market-domain model yet.
+                position.account = account
+                position.currency = currency
+                position.asset_type = asset_type
+                position.total_cost = raw.get("total_cost")
+                position.fee = raw.get("fee")
+                position.note = raw.get("note", "")
+                position.source = raw.get("source", "manual")
+                position.created_at = raw.get("created_at")
+                position.updated_at = raw.get("updated_at")
+                positions.append(position)
+
+            self._portfolio = Portfolio(
+                positions=positions,
+                cash=data.get("cash", 0.0),
+            )
+            self._last_update = datetime.now()
+        except Exception as exc:
+            print(f"加载持仓文件失败: {exc}")
+
+    def _position_to_record(self, position: Position) -> Dict[str, Any]:
+        quantity = position.quantity
+        cost_price = position.cost_price
+        return {
+            "account": str(getattr(position, "account", "") or ""),
+            "code": position.stock.symbol,
+            "name": position.stock.name,
+            "currency": str(getattr(position, "currency", "") or self._infer_currency(position.stock.symbol)).upper(),
+            "asset_type": str(getattr(position, "asset_type", "") or self._infer_asset_type(position.stock.symbol)),
+            "quantity": quantity,
+            "available_qty": position.available_qty,
+            "cost_price": cost_price,
+            "total_cost": getattr(position, "total_cost", None) or quantity * cost_price,
+            "fee": getattr(position, "fee", None),
+            "note": str(getattr(position, "note", "") or ""),
+            "source": str(getattr(position, "source", "manual") or "manual"),
+            "created_at": getattr(position, "created_at", None) or datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "current_price": position.current_price,
+            "side": position.side.value,
+        }
+
+    def _save(self) -> None:
+        data = {
+            "positions": [self._position_to_record(p) for p in self._portfolio.positions],
+            "cash": self._portfolio.cash,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self.data_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.data_file.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp_path.replace(self.data_file)
+
     async def get_portfolio(self) -> Portfolio:
-        """获取当前持仓"""
         return self._portfolio
 
     async def get_positions(self) -> List[Position]:
-        """获取持仓列表"""
         return self._portfolio.positions
 
     async def refresh(self) -> None:
-        """刷新持仓数据（更新当前价格）"""
         if not self.market_provider or not self._portfolio.positions:
             return
 
-        positions_by_market: dict[Market, List[Position]] = {}
+        positions_by_market: Dict[Market, List[Position]] = {}
         for position in self._portfolio.positions:
             positions_by_market.setdefault(position.stock.market, []).append(position)
 
         async def refresh_market_positions(market: Market, positions: List[Position]) -> None:
-            symbols = [position.stock.symbol for position in positions]
+            symbols = list(dict.fromkeys(position.stock.symbol for position in positions))
             quote_map = {}
 
             try:
                 quotes = await self.market_provider.get_quotes(symbols, market)
                 quote_map = {quote.stock.symbol: quote for quote in quotes}
-            except Exception as e:
-                print(f"批量刷新 {market.value} 失败: {e}")
+            except Exception as exc:
+                print(f"批量刷新 {market.value} 失败: {exc}")
 
             for position in positions:
                 quote = quote_map.get(position.stock.symbol)
@@ -183,12 +190,11 @@ class ManualPortfolioProvider(PortfolioProvider):
                     try:
                         quote = await self.market_provider.get_quote(
                             position.stock.symbol,
-                            position.stock.market
+                            position.stock.market,
                         )
-                    except Exception as e:
-                        print(f"刷新 {position.stock.symbol} 价格失败: {e}")
+                    except Exception as exc:
+                        print(f"刷新 {position.stock.symbol} 价格失败: {exc}")
                         quote = None
-
                 if quote:
                     position.current_price = quote.price
 
@@ -198,96 +204,93 @@ class ManualPortfolioProvider(PortfolioProvider):
         self._last_update = datetime.now()
         self._save()
 
-    # 手动管理方法
+    # Legacy provider methods remain for compatibility. New user-visible writes
+    # go through PortfolioWriteService and identify positions by account+code+currency.
     def add_position(
         self,
         symbol: str,
         name: str,
-        quantity: int,
+        quantity: float,
         cost_price: float,
         market: Market = Market.A_SHARE,
-        available_qty: Optional[int] = None,
-        current_price: Optional[float] = None
-        ):
-        """添加持仓（如果已存在则更新）"""
-        symbol = str(symbol).strip()
-        # 检查是否已存在
-        existing_idx = None
-        for idx, p in enumerate(self._portfolio.positions):
-            if p.stock.symbol == symbol:
-                existing_idx = idx
-                break
+        available_qty: Optional[float] = None,
+        current_price: Optional[float] = None,
+        account: str = "",
+        currency: str = "",
+        asset_type: str = "",
+    ) -> None:
+        code = str(symbol).strip()
+        resolved_currency = str(currency or self._infer_currency(code)).upper()
+        identity = self._identity(account, code, resolved_currency)
+        matches = [p for p in self._portfolio.positions if self._position_identity(p) == identity]
+        if len(matches) > 1:
+            raise ValueError(f"检测到重复持仓身份: {identity}")
 
-        stock = Stock(symbol=symbol, name=name, market=market)
         position = Position(
-            stock=stock,
+            stock=Stock(symbol=code, name=name, market=market),
             quantity=quantity,
             available_qty=available_qty if available_qty is not None else quantity,
             cost_price=cost_price,
-            current_price=current_price if current_price is not None else cost_price
+            current_price=current_price if current_price is not None else cost_price,
         )
+        position.account = account
+        position.currency = resolved_currency
+        position.asset_type = asset_type or self._infer_asset_type(code)
+        position.total_cost = quantity * cost_price
+        position.fee = None
+        position.note = ""
+        position.source = "manual"
+        position.created_at = datetime.now().isoformat()
+        position.updated_at = datetime.now().isoformat()
 
-        if existing_idx is not None:
-            # 更新现有持仓
-            self._portfolio.positions[existing_idx] = position
+        if matches:
+            index = self._portfolio.positions.index(matches[0])
+            self._portfolio.positions[index] = position
         else:
-            # 添加新持仓
             self._portfolio.positions.append(position)
-
-        meta = self._position_meta.get(symbol, {})
-        meta.setdefault("account", "")
-        meta.setdefault("group", meta.get("account", ""))
-        meta.setdefault("currency", self._infer_currency(symbol))
-        meta.setdefault("asset_type", self._infer_asset_type(symbol))
-        meta["total_cost"] = quantity * cost_price
-        meta.setdefault("fee", None)
-        meta.setdefault("note", "")
-        meta.setdefault("source", "manual")
-        meta.setdefault("created_at", datetime.now().isoformat())
-        self._position_meta[symbol] = meta
-
         self._save()
 
-    def remove_position(self, symbol: str):
-        """删除持仓"""
-        self._portfolio.positions = [
-            p for p in self._portfolio.positions
-            if p.stock.symbol != symbol
-        ]
+    def remove_position(self, symbol: str, account: str = "", currency: str = "") -> None:
+        identity = self._identity(account, symbol, currency or self._infer_currency(symbol))
+        matches = [p for p in self._portfolio.positions if self._position_identity(p) == identity]
+        if not matches:
+            raise FileNotFoundError(identity)
+        if len(matches) > 1:
+            raise ValueError(f"检测到重复持仓身份: {identity}")
+        self._portfolio.positions.remove(matches[0])
         self._save()
 
     def update_position(
         self,
         symbol: str,
-        quantity: Optional[int] = None,
+        quantity: Optional[float] = None,
         cost_price: Optional[float] = None,
-        available_qty: Optional[int] = None
-    ):
-        """更新持仓"""
-        for p in self._portfolio.positions:
-            if p.stock.symbol == symbol:
-                if quantity is not None:
-                    p.quantity = quantity
-                if cost_price is not None:
-                    p.cost_price = cost_price
-                if available_qty is not None:
-                    p.available_qty = available_qty
-                break
+        available_qty: Optional[float] = None,
+        account: str = "",
+        currency: str = "",
+    ) -> None:
+        identity = self._identity(account, symbol, currency or self._infer_currency(symbol))
+        matches = [p for p in self._portfolio.positions if self._position_identity(p) == identity]
+        if not matches:
+            raise FileNotFoundError(identity)
+        if len(matches) > 1:
+            raise ValueError(f"检测到重复持仓身份: {identity}")
+        position = matches[0]
+        if quantity is not None:
+            position.quantity = quantity
+        if cost_price is not None:
+            position.cost_price = cost_price
+        if available_qty is not None:
+            position.available_qty = available_qty
+        position.total_cost = position.quantity * position.cost_price
+        position.updated_at = datetime.now().isoformat()
         self._save()
 
-    def set_cash(self, cash: float):
-        """设置现金"""
+    def set_cash(self, cash: float) -> None:
         self._portfolio.cash = cash
         self._save()
 
-    def import_from_csv(self, csv_file: str):
-        """
-        从 CSV 导入持仓
-
-        CSV 格式：
-        代码,名称,数量,成本价,可卖数量
-        000001,平安银行,1000,12.50,1000
-        """
+    def import_from_csv(self, csv_file: str) -> None:
         import csv
 
         with open(csv_file, "r", encoding="utf-8") as f:
@@ -296,7 +299,9 @@ class ManualPortfolioProvider(PortfolioProvider):
                 self.add_position(
                     symbol=row["代码"],
                     name=row["名称"],
-                    quantity=int(row["数量"]),
+                    quantity=float(row["数量"]),
                     cost_price=float(row["成本价"]),
-                    available_qty=int(row.get("可卖数量", row["数量"]))
+                    available_qty=float(row.get("可卖数量", row["数量"])),
+                    account=row.get("账户", ""),
+                    currency=row.get("币种", ""),
                 )

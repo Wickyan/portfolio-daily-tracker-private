@@ -1,9 +1,7 @@
 // 持仓相关类型
 export interface Position {
-  account?: string
-  group?: string
+  account: string
   code: string
-  symbol: string
   name: string
   currency: 'CNY' | 'USD' | 'HKD' | string
   asset_type: 'stock' | 'fund' | 'etf' | 'cash' | 'custom' | 'fund_or_custom' | string
@@ -81,7 +79,6 @@ export interface ChatResponse {
 export interface PendingChange {
   action_type?: string
   account?: string
-  group?: string
   name?: string
   code?: string | null
   currency?: string | null

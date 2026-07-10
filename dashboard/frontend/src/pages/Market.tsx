@@ -114,7 +114,7 @@ export default function Market() {
 
   // 按持仓进行操作建议匹配
   const activeSuggestions = suggestions.filter(s => 
-    s.symbol && portfolio?.positions.some(p => p.symbol === s.symbol || s.symbol!.includes(p.symbol))
+    s.symbol && portfolio?.positions.some(p => p.code === s.symbol || s.symbol!.includes(p.code))
   )
 
   return (
@@ -171,7 +171,7 @@ export default function Market() {
             {activeSuggestions.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 {activeSuggestions.map((s, i) => {
-                  const pos = portfolio.positions.find(p => p.symbol === s.symbol || s.symbol!.includes(p.symbol))
+                  const pos = portfolio.positions.find(p => p.code === s.symbol || s.symbol!.includes(p.code))
                   const isBuy = s.type === 'buy' || s.type === 'add'
                   const isSell = s.type === 'sell' || s.type === 'reduce'
                   const isHold = s.type === 'hold'

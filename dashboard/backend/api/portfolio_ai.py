@@ -97,7 +97,6 @@ def compact_positions() -> List[Dict[str, Any]]:
     return [
         {
             "account": p.get("account"),
-            "group": p.get("group"),
             "name": p.get("name"),
             "code": p.get("code"),
             "currency": p.get("currency"),
@@ -325,8 +324,8 @@ def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
         return []
     if action_type == "deposit":
         missing = []
-        if not (change.get("account") or change.get("group")):
-            missing.append("account/group")
+        if not change.get("account"):
+            missing.append("account")
         if not change.get("currency"):
             missing.append("currency")
         if to_float(change.get("amount"), None) is None:
@@ -334,8 +333,8 @@ def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
         return missing
 
     missing = []
-    if not (change.get("account") or change.get("group")):
-        missing.append("account/group")
+    if not change.get("account"):
+        missing.append("account")
     if not change.get("name") and not change.get("code"):
         missing.append("name/code")
     if not change.get("code"):
@@ -356,12 +355,11 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
     existing_positions = compact_positions()
     text = message.strip()
 
-    if previous and previous.get("changes") and previous.get("missing_fields") == ["account/group"]:
+    if previous and previous.get("changes") and previous.get("missing_fields") in (["account"], ["account/group"]):
         account, _ = infer_account(text, allow_single=True)
         if account:
             updated = previous["changes"][0].copy()
             updated["account"] = account
-            updated["group"] = account
             updated["updated_at"] = utc_now_iso()
             warnings = list(previous.get("warnings", []))
             if account not in COMMON_ACCOUNTS:
@@ -399,7 +397,6 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
     change = {
         "action_type": action_type,
         "account": account,
-        "group": account,
         "name": asset.get("name"),
         "code": asset.get("code"),
         "currency": asset.get("currency"),

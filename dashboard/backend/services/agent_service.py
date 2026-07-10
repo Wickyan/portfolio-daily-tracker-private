@@ -420,8 +420,8 @@ class AgentService:
         ]
         for p in portfolio.get("positions", []):
             portfolio_lines.append(
-                f"- account/group={p.get('account') or p.get('group', '')}, "
-                f"name={p.get('name', '')}, code={p.get('code') or p.get('symbol', '')}, "
+                f"- account={p.get('account', '')}, "
+                f"name={p.get('name', '')}, code={p.get('code', '')}, "
                 f"currency={p.get('currency', '')}, asset_type={p.get('asset_type', '')}, "
                 f"quantity={p.get('quantity', 0)}, cost_price={p.get('cost_price', 0)}"
             )
@@ -672,14 +672,12 @@ class AgentService:
             market_value = quantity * current_price
             profit = market_value - (quantity * cost_price)
             profit_pct = (profit / (quantity * cost_price) * 100) if quantity * cost_price > 0 else 0.0
-            code = raw.get("code") or raw.get("symbol", "")
+            code = raw.get("code", "")
             total_market_value += market_value
             total_profit += profit
             positions.append({
-                "account": raw.get("account") or raw.get("group", ""),
-                "group": raw.get("group") or raw.get("account", ""),
+                "account": raw.get("account", ""),
                 "code": code,
-                "symbol": code,
                 "name": raw.get("name", ""),
                 "currency": raw.get("currency", ""),
                 "asset_type": raw.get("asset_type", "custom"),

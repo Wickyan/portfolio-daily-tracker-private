@@ -34,16 +34,16 @@ export default function PortfolioPanel() {
 
     return (
       <div
-        key={`${position.account || position.group}-${position.code || position.symbol}`}
+        key={`${position.account}-${position.code}-${position.currency}`}
         className="flex items-center justify-between py-3 border-b border-slate-700 last:border-b-0"
       >
         <div className="flex-1">
           <div className="flex items-center gap-2">
             <span className="font-medium">{position.name}</span>
-            <span className="text-sm text-slate-400">{position.code || position.symbol}</span>
+            <span className="text-sm text-slate-400">{position.code}</span>
           </div>
           <div className="text-sm text-slate-400 mt-1">
-            {(position.account || position.group) && `${position.account || position.group} | `}
+            {position.account && `${position.account} | `}
             {position.quantity} | 成本 {position.cost_price.toFixed(2)} {position.currency}
           </div>
         </div>

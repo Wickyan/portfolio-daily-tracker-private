@@ -23,7 +23,7 @@ export default function SuggestionsPanel() {
   
   const getStockName = (symbol: string) => {
     if (!portfolio || !portfolio.positions) return ''
-    const position = portfolio.positions.find(p => p.symbol === symbol || symbol.includes(p.symbol))
+    const position = portfolio.positions.find(p => p.code === symbol || symbol.includes(p.code))
     return position ? position.name : ''
   }
 

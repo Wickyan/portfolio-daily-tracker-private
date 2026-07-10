@@ -1,36 +1,37 @@
 import api from './api'
 import type { OperationSummary, PendingAction, Portfolio, PortfolioSummary } from '@/types'
 
+export interface PositionIdentity {
+  account: string
+  code: string
+  currency: string
+}
+
 export const portfolioService = {
-  // 获取持仓
   async getPortfolio(): Promise<Portfolio> {
     const response = await api.get<Portfolio>('/portfolio')
     return response.data
   },
 
-  // 获取实时持仓（先刷新行情再返回）
   async getLivePortfolio(): Promise<Portfolio> {
     const response = await api.get<Portfolio>('/portfolio/live')
     return response.data
   },
 
-  // 获取持仓摘要
   async getSummary(): Promise<PortfolioSummary> {
     const response = await api.get<PortfolioSummary>('/portfolio/summary')
     return response.data
   },
 
-  // 添加持仓
   async addPosition(data: {
-    account?: string
-    group?: string
-    code?: string
-    symbol?: string
+    account: string
+    code: string
     name: string
-    currency?: string
-    asset_type?: string
+    currency: string
+    asset_type: string
     quantity: number
     cost_price: number
+    total_cost?: number
     fee?: number | null
     note?: string
   }) {
@@ -38,19 +39,28 @@ export const portfolioService = {
     return response.data
   },
 
-  // 更新持仓
-  async updatePosition(symbol: string, data: { quantity?: number; cost_price?: number }) {
-    const response = await api.put(`/portfolio/${symbol}`, data)
+  async updatePosition(
+    identity: PositionIdentity,
+    data: { quantity?: number; cost_price?: number },
+  ) {
+    const response = await api.put(`/portfolio/${encodeURIComponent(identity.code)}`, {
+      account: identity.account,
+      currency: identity.currency,
+      ...data,
+    })
     return response.data
   },
 
-  // 删除持仓
-  async removePosition(symbol: string) {
-    const response = await api.delete(`/portfolio/${symbol}`)
+  async removePosition(identity: PositionIdentity) {
+    const response = await api.delete(`/portfolio/${encodeURIComponent(identity.code)}`, {
+      params: {
+        account: identity.account,
+        currency: identity.currency,
+      },
+    })
     return response.data
   },
 
-  // 刷新持仓价格
   async refresh() {
     const response = await api.post('/portfolio/refresh')
     return response.data
