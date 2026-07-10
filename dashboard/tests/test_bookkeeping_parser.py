@@ -304,6 +304,36 @@ class BookkeepingParserTest(unittest.TestCase):
             checked = enrich_cash_availability(parsed)
         self.assertEqual(checked["missing_fields"], [])
 
+
+    def test_galaxy_generic_increase_creates_confirmable_cny_deposit(self) -> None:
+        parsed = parse_bookkeeping_message("银河增加2w")
+        self.assertEqual(parsed["intent"], "bookkeeping")
+        self.assertEqual(parsed["action_type"], "deposit")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "银河")
+        self.assertEqual(change["currency"], "CNY")
+        self.assertEqual(change["amount"], 20000)
+
+    def test_noisy_xiaomi_sentence_with_ge_unit_is_fully_parsed(self) -> None:
+        parsed = parse_bookkeeping_message("小米托存 尊嘉买入100个 20")
+        self.assertEqual(parsed["intent"], "bookkeeping")
+        self.assertEqual(parsed["action_type"], "add_or_update")
+        self.assertEqual(parsed["missing_fields"], [])
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "尊嘉")
+        self.assertEqual(change["name"], "小米集团")
+        self.assertEqual(change["code"], "1810")
+        self.assertEqual(change["currency"], "HKD")
+        self.assertEqual(change["asset_type"], "stock")
+        self.assertEqual(change["quantity"], 100)
+        self.assertEqual(change["cost_price"], 20)
+        self.assertEqual(change["total_cost"], 2000)
+
+    def test_broker_after_asset_phrase_is_still_detected(self) -> None:
+        parsed = parse_bookkeeping_message("小米 尊嘉买入100股 20")
+        self.assertEqual(parsed["changes"][0]["account"], "尊嘉")
+
     def test_confirmation_word_alone_is_not_a_new_bookkeeping_record(self) -> None:
         parsed = parse_bookkeeping_message("确认写入")
         self.assertEqual(parsed["intent"], "chat_only")

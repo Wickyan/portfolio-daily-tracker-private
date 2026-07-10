@@ -359,7 +359,7 @@ export default function ChatPanel() {
     const currentImages = [...selectedImages]
     const userMessage = input.trim()
     const normalizedCommand = userMessage.replace(/\s+/g, '')
-    const confirmCommands = new Set(['确认', '确认写入', '写入', '保存', '录入', '提交'])
+    const confirmCommands = new Set(['确认', '确定', '确认写入', '写入', '保存', '录入', '提交'])
     const cancelCommands = new Set(['取消', '取消写入', '不写了'])
     const isRollbackCommand = /撤回|撤销|回滚|undo/i.test(normalizedCommand)
 

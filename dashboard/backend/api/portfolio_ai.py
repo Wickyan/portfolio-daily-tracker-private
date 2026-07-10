@@ -254,8 +254,17 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
     # Prefer known broker names before generic "账户:" parsing so phrases
     # like "长桥账户现金5000港币" do not treat "现金5000港币" as the account.
     known_account_tokens = COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES)
+    account_action = r"(?:买|买了|买入|新增|添加|卖|卖了|卖出|入金|出金|提现|增加|减少|转入|转出|现金|余额|人民币|港币|美元|CNY|HKD|USD|换|兑换|改|变)"
     for account in sorted(known_account_tokens, key=len, reverse=True):
+        # Original leading/preposition form: 长桥..., 在IB..., 从银河...
         if re.search(rf"(?:^|在|从|转入|转出){re.escape(account)}(?:账户)?", text, re.IGNORECASE):
+            return normalize_account(account), "explicit"
+        # Also allow a broker after an asset/noise phrase: 小米... 尊嘉买入...
+        if re.search(
+            rf"[\s，,。；;]{re.escape(account)}(?:账户)?(?=\s*{account_action}|$)",
+            text,
+            re.IGNORECASE,
+        ):
             return normalize_account(account), "explicit"
 
     account_match = re.search(
@@ -325,10 +334,10 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
         # Examples: "IBKR买了2股亚马逊" / "买入100份纳指ETF" / "腾讯卖出10股".
         asset_token = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff]{1,29}"
         patterns = [
-            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)\s*({asset_token})",
-            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*({asset_token})\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
-            rf"({asset_token}?)(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
-            rf"({asset_token}?)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)",
+            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)\s*({asset_token})",
+            rf"(?:买了|买入|新增|添加|卖了|卖出)\s*({asset_token})\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
+            rf"({asset_token}?)(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
+            rf"({asset_token}?)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
         ]
         for pattern in patterns:
             match = re.search(pattern, message, re.IGNORECASE)
@@ -382,11 +391,13 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
         code = code or "0700"
         currency = currency or "HKD"
         asset_type = asset_type or "stock"
-    elif "小米" in message and ("港" in message or "HK" in message.upper()):
+    elif "小米" in message:
         name = "小米集团"
         code = code or "1810"
         currency = currency or "HKD"
         asset_type = asset_type or "stock"
+        if "港" not in message and "HK" not in message.upper():
+            warnings.append("根据“小米”推断为港股小米集团1810；请在确认写入前核对")
 
     if not name and raw_symbol:
         name = code or raw_symbol
@@ -484,6 +495,8 @@ def resolve_sell_account(
 
 def infer_action(message: str) -> str:
     currency_mentions = re.findall(CURRENCY_TOKEN_PATTERN, message, re.IGNORECASE)
+    account, _ = infer_account(message)
+    has_security_unit = bool(re.search(r"(?:股|股票|份|个)", message))
     if (
         len(currency_mentions) >= 2
         and re.search(r"换成了?|换为了?|换为|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换", message)
@@ -494,11 +507,21 @@ def infer_action(message: str) -> str:
     if (
         any(token in message for token in ["出金", "现金减少", "转出", "提现", "取出"])
         or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|扣除了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+        or (
+            account is not None
+            and not has_security_unit
+            and re.search(rf"(?:减少了?|减了?|减掉了?|扣除了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+        )
     ):
         return "withdraw"
     if (
         any(token in message for token in ["入金", "现金增加", "转入", "存入", "充值"])
         or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:增加了?|加了?|加上了?)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+        or (
+            account is not None
+            and not has_security_unit
+            and re.search(rf"(?:增加了?|加了?|加上了?)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+        )
     ):
         return "deposit"
     if (
@@ -511,7 +534,7 @@ def infer_action(message: str) -> str:
         return "add_or_update"
     # Accept concise bookkeeping such as "海外科技100股，一共花了9000元"
     # even when the user omits an explicit buy/add verb.
-    has_quantity = bool(re.search(r"[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份)", message))
+    has_quantity = bool(re.search(r"[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)", message))
     has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
     if has_quantity and has_total_amount:
         return "add_or_update"
@@ -524,7 +547,7 @@ def parse_quantity(message: str) -> Optional[float]:
     value = parse_number_after(message, ("quantity", "数量"))
     if value is not None:
         return value
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:股|份)", message)
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:股|份|个)", message)
     return to_float(match.group(1)) if match else None
 
 
@@ -559,6 +582,7 @@ def parse_cash_amount(message: str) -> Optional[float]:
         return explicit
     patterns = [
         rf"(?:入金|出金|转入|转出|存入|提现|取出|充值|现金增加|现金减少)了?\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:增加了?|加了?|加上了?|减少了?|减了?|减掉了?|扣除了?|少了)\s*({NUMBER_TOKEN_PATTERN})",
         rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|扣除了?|少了|增加了?|加了?|加上了?|变为|变成|改为|改成|调整为|调整成|设置为|设为)\s*({NUMBER_TOKEN_PATTERN})",
         rf"(?:现金余额|账户现金|现金有|有现金)\s*(?:是|为|:|：)?\s*({NUMBER_TOKEN_PATTERN})",
         rf"({NUMBER_TOKEN_PATTERN})\s*{CURRENCY_TOKEN_PATTERN}\s*(?:现金)?",
@@ -775,6 +799,8 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
 
     if action_type in {"deposit", "withdraw", "set_cash"}:
         currency = (parse_first_key_value(text, ("currency", "币种")) or infer_currency(text) or "").upper() or None
+        if currency is None and account == "银河":
+            currency = "CNY"
         amount = parse_cash_amount(text)
         warnings: List[str] = []
         if account and account not in COMMON_ACCOUNTS and account_source in {"candidate", "single", "explicit"}:
