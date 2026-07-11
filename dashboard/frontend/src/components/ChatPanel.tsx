@@ -350,7 +350,7 @@ function PendingActionCard({
             className="w-full rounded bg-slate-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
           />
           {workError && (
-            <div className="text-sm text-red-300">修改失败：{workError}</div>
+            <div className="text-sm text-red-300">操作失败：{workError}</div>
           )}
           {reviseText.trim() && (
             <div className="text-xs text-slate-400">系统会结合当前确认卡理解这条补充，并生成一张新的确认卡。</div>

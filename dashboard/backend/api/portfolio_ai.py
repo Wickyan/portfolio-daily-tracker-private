@@ -1168,13 +1168,39 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
         }
 
     missing = collect_missing_fields(changes, action_type)
+    if action_type == "fx_exchange" and len(changes) >= 2:
+        source = changes[0]
+        target = changes[1]
+        source_currency = str(source.get("currency") or "").upper()
+        target_currency = str(target.get("currency") or "").upper()
+        source_amount = to_float(source.get("amount"), None)
+        target_amount = to_float(target.get("amount"), None)
+        if source_currency and target_currency and source_currency == target_currency:
+            missing.append("distinct_currencies")
+            warnings.append("换出币种和换入币种不能相同")
+        if (
+            source_amount is not None
+            and target_amount is not None
+            and source_amount > 0
+            and target_amount > 0
+            and source_currency
+            and target_currency
+            and source_currency != target_currency
+        ):
+            effective_rate = target_amount / source_amount
+            warnings.append(
+                f"复制的换汇记录：{source_amount:g}{source_currency}→{target_amount:g}{target_currency}；"
+                f"成交比率1{source_currency}={effective_rate:.8g}{target_currency}"
+            )
+            warnings.append("将按复制文本中的实际换出/换入金额记账；总资产仍按当前实时汇率折算")
+
     return enrich_instrument_currency_consistency({
         "intent": "bookkeeping",
         "summary": "已识别复制的可编辑记账文本",
         "action_type": action_type,
         "changes": changes,
-        "missing_fields": missing,
-        "warnings": warnings,
+        "missing_fields": list(dict.fromkeys(missing)),
+        "warnings": list(dict.fromkeys(warnings)),
     })
 
 
@@ -2730,7 +2756,25 @@ async def ai_confirm(request: ConfirmRequest):
                 "quote_refresh": {"ok": True, "refreshed": False},
             }
 
-        for change in pending.get("changes", []):
+        pending_changes = pending.get("changes", [])
+        if str(pending.get("action_type") or "") == "fx_exchange":
+            if len(pending_changes) != 2:
+                raise HTTPException(status_code=400, detail="换汇必须包含且仅包含一笔换出和一笔换入")
+            source, target = pending_changes
+            source_action = str(source.get("action_type") or "")
+            target_action = str(target.get("action_type") or "")
+            if source_action != "withdraw" or target_action != "deposit":
+                raise HTTPException(status_code=400, detail="换汇顺序必须是先换出、后换入")
+            source_account = str(source.get("account") or "").strip()
+            target_account = str(target.get("account") or "").strip()
+            if source_account and target_account and source_account != target_account:
+                raise HTTPException(status_code=400, detail="同一笔换汇的换出和换入必须属于同一账户")
+            source_currency = str(source.get("currency") or "").upper().strip()
+            target_currency = str(target.get("currency") or "").upper().strip()
+            if source_currency and target_currency and source_currency == target_currency:
+                raise HTTPException(status_code=400, detail="换出币种和换入币种不能相同")
+
+        for change in pending_changes:
             missing = service.validate_confirmable_change(change)
             if missing:
                 raise HTTPException(status_code=400, detail=f"无法确认，字段无效: {', '.join(missing)}")
