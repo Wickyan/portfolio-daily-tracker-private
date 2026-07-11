@@ -6,8 +6,10 @@ PortfolioWriteService with backup and operation logs.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Literal, Optional
@@ -19,6 +21,8 @@ from pydantic import BaseModel
 from backend.services.instrument_search_service import InstrumentSearchService
 from backend.services.portfolio_write_service import (
     PENDING_DIR,
+    PORTFOLIO_MUTATION_LOCK,
+    SUPPORTED_CURRENCIES,
     PortfolioWriteService,
     ensure_data_dirs,
     strip_code_prefix,
@@ -41,7 +45,7 @@ COMMON_ASSET_WORDS = {"苹果", "微软", "英伟达", "特斯拉", "比亚迪",
 NEW_ACCOUNT_HINTS = {"富途", "老虎", "雪盈", "中信证券", "银河2号"}
 
 NUMBER_TOKEN_PATTERN = r"[0-9]+(?:\.[0-9]+)?\s*(?:[kKwW]|千|万)?"
-CURRENCY_TOKEN_PATTERN = r"(?:人民币|港币|美元|CNY|RMB|HKD|USD|元|刀)"
+CURRENCY_TOKEN_PATTERN = r"(?:人民币|港币|美元|欧元|日元|英镑|新加坡元|新币|澳元|加元|瑞郎|CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF|元|刀)"
 CURRENCY_ALIASES = {
     "人民币": "CNY",
     "元": "CNY",
@@ -52,6 +56,21 @@ CURRENCY_ALIASES = {
     "美元": "USD",
     "USD": "USD",
     "刀": "USD",
+    "欧元": "EUR",
+    "EUR": "EUR",
+    "日元": "JPY",
+    "JPY": "JPY",
+    "英镑": "GBP",
+    "GBP": "GBP",
+    "新加坡元": "SGD",
+    "新币": "SGD",
+    "SGD": "SGD",
+    "澳元": "AUD",
+    "AUD": "AUD",
+    "加元": "CAD",
+    "CAD": "CAD",
+    "瑞郎": "CHF",
+    "CHF": "CHF",
 }
 
 
@@ -106,18 +125,85 @@ def pending_path(pending_id: str) -> Path:
 def save_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
     ensure_data_dirs()
     path = pending_path(pending["pending_id"])
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(pending, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(pending, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return pending
 
 
 def load_pending(pending_id: str) -> Dict[str, Any]:
     path = pending_path(pending_id)
     if not path.exists():
-        raise HTTPException(status_code=404, detail="pending_action 不存在")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raise HTTPException(status_code=404, detail="pending_action不存在")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            pending = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="pending_action文件损坏") from exc
+    if not isinstance(pending, dict):
+        raise HTTPException(status_code=500, detail="pending_action格式错误")
+    return pending
+
+
+def expire_pending_if_needed(pending: Dict[str, Any]) -> bool:
+    expires_at_raw = pending.get("expires_at")
+    if not expires_at_raw:
+        return False
+    try:
+        expired = datetime.fromisoformat(str(expires_at_raw)) < datetime.now()
+    except ValueError:
+        expired = True
+    if expired and pending.get("status") == "pending":
+        pending["status"] = "expired"
+        pending["requires_confirmation"] = False
+        pending["expired_at"] = utc_now_iso()
+        save_pending(pending)
+    return expired
+
+
+def require_open_pending(pending: Dict[str, Any]) -> None:
+    if pending.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"pending_action已结束：{pending.get('status')}")
+    if expire_pending_if_needed(pending):
+        raise HTTPException(status_code=409, detail="pending_action已过期")
+
+
+def reconcile_pending_with_operations(pending: Dict[str, Any]) -> Dict[str, Any]:
+    """Repair pending status from durable operation history when possible."""
+    pending_id = str(pending.get("pending_id") or "").strip()
+    if not pending_id:
+        return pending
+    operation = PortfolioWriteService().find_confirm_operation_by_pending_id(pending_id)
+    if not operation:
+        return pending
+
+    changed = False
+    operation_id = str(operation.get("operation_id") or "")
+    if operation.get("is_rolled_back"):
+        if pending.get("status") != "rolled_back" or pending.get("operation_id") != operation_id:
+            pending["status"] = "rolled_back"
+            pending["requires_confirmation"] = False
+            pending["operation_id"] = operation_id
+            pending["reconciled_at"] = utc_now_iso()
+            changed = True
+    elif pending.get("status") in {"pending", "confirmed"}:
+        if pending.get("status") != "confirmed" or pending.get("operation_id") != operation_id:
+            pending["status"] = "confirmed"
+            pending["requires_confirmation"] = False
+            pending["operation_id"] = operation_id
+            pending["confirmed_at"] = pending.get("confirmed_at") or operation.get("created_at") or utc_now_iso()
+            pending["reconciled_at"] = utc_now_iso()
+            changed = True
+    if changed:
+        save_pending(pending)
+    return pending
 
 
 def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,18 +309,21 @@ def parse_number_after(message: str, labels: tuple[str, ...]) -> Optional[float]
 
 def infer_currency(message: str) -> Optional[str]:
     lower = message.lower()
-    if any(token in message for token in ["人民币", "港币", "美元"]):
-        if "人民币" in message:
-            return "CNY"
-        if "港币" in message:
-            return "HKD"
-        if "美元" in message:
-            return "USD"
-    if "rmb" in lower or "cny" in lower or re.search(rf"{NUMBER_TOKEN_PATTERN}\s*元", message, re.IGNORECASE):
+    named_tokens = (
+        ("人民币", "CNY"), ("港币", "HKD"), ("美元", "USD"),
+        ("欧元", "EUR"), ("日元", "JPY"), ("英镑", "GBP"),
+        ("新加坡元", "SGD"), ("新币", "SGD"), ("澳元", "AUD"),
+        ("加元", "CAD"), ("瑞郎", "CHF"),
+    )
+    for token, currency in named_tokens:
+        if token in message:
+            return currency
+    for token in ("cny", "rmb", "hkd", "usd", "eur", "jpy", "gbp", "sgd", "aud", "cad", "chf"):
+        if re.search(rf"(?<![a-z]){token}(?![a-z])", lower):
+            return "CNY" if token == "rmb" else token.upper()
+    if re.search(rf"{NUMBER_TOKEN_PATTERN}\s*元", message, re.IGNORECASE):
         return "CNY"
-    if "hkd" in lower:
-        return "HKD"
-    if "usd" in lower or "刀" in message:
+    if "刀" in message:
         return "USD"
     return None
 
@@ -684,8 +773,11 @@ def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
         missing = []
         if not change.get("account"):
             missing.append("account")
-        if not change.get("currency"):
+        currency = str(change.get("currency") or "").upper().strip()
+        if not currency:
             missing.append("currency")
+        elif currency not in SUPPORTED_CURRENCIES:
+            missing.append("unsupported_currency")
         amount = to_float(change.get("amount"), None)
         if amount is None:
             missing.append("amount")
@@ -702,14 +794,26 @@ def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
         missing.append("name/code")
     if not change.get("code"):
         missing.append("code")
-    if not change.get("currency"):
+    currency = str(change.get("currency") or "").upper().strip()
+    if not currency:
         missing.append("currency")
+    elif currency not in SUPPORTED_CURRENCIES:
+        missing.append("unsupported_currency")
     if not change.get("asset_type"):
         missing.append("asset_type")
-    if to_float(change.get("quantity"), None) is None:
-        missing.append("quantity")
-    if to_float(change.get("cost_price"), None) is None and to_float(change.get("total_cost"), None) is None:
-        missing.append("cost_price")
+    quantity = to_float(change.get("quantity"), None)
+    if action_type != "delete":
+        if quantity is None:
+            missing.append("quantity")
+        elif quantity <= 0:
+            missing.append("positive_quantity")
+    if action_type not in {"sell", "delete"}:
+        cost_price = to_float(change.get("cost_price"), None)
+        total_cost = to_float(change.get("total_cost"), None)
+        if cost_price is None and total_cost is None:
+            missing.append("cost_price")
+        elif (cost_price is not None and cost_price < 0) or (total_cost is not None and total_cost < 0):
+            missing.append("cost_price_non_negative")
     return missing
 
 
@@ -1210,9 +1314,17 @@ async def ai_preview(request: PreviewRequest):
 
 @router.post("/ai-revise")
 async def ai_revise(request: ReviseRequest):
-    pending = load_pending(request.pending_id)
-    if pending.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="pending_action已结束")
+    with PORTFOLIO_MUTATION_LOCK:
+        current = load_pending(request.pending_id)
+        if current.get("status") == "superseded" and current.get("revised_to_pending_id"):
+            successor = load_pending(str(current["revised_to_pending_id"]))
+            revision_marker = f"[revise] {request.message}"
+            if revision_marker in str(successor.get("message") or ""):
+                return public_pending(successor)
+            raise HTTPException(status_code=409, detail="该确认卡已被另一条修改替代")
+        require_open_pending(current)
+        pending = deepcopy(current)
+        revision_token = current.get("updated_at") or current.get("created_at")
 
     parsed = apply_direct_code_revision(pending, request.message)
     if parsed is None:
@@ -1220,82 +1332,154 @@ async def ai_revise(request: ReviseRequest):
     if parsed is None:
         parsed = parse_bookkeeping_message(request.message, previous=pending)
         parsed = await enrich_with_online_instrument_search(parsed, request.message)
-        parsed = enrich_cash_availability(parsed)
+    parsed = enrich_cash_availability(parsed)
     if parsed.get("intent") == "chat_only":
         raise HTTPException(status_code=400, detail="未识别到可用于补充的记账信息")
 
-    combined_message = f"{pending.get('message', '')}\n[revise] {request.message}".strip()
-    successor = make_pending(
-        parsed,
-        str(pending.get("input_type") or "text"),
-        combined_message,
-    )
-    successor["revises_pending_id"] = pending["pending_id"]
-    successor["updated_at"] = utc_now_iso()
-    save_pending(successor)
+    with PORTFOLIO_MUTATION_LOCK:
+        latest = load_pending(request.pending_id)
+        require_open_pending(latest)
+        latest_token = latest.get("updated_at") or latest.get("created_at")
+        if latest_token != revision_token:
+            raise HTTPException(status_code=409, detail="该确认卡已被其他修改更新，请刷新后重试")
 
-    pending["status"] = "superseded"
-    pending["requires_confirmation"] = False
-    pending["revised_to_pending_id"] = successor["pending_id"]
-    pending["updated_at"] = utc_now_iso()
-    save_pending(pending)
-    return public_pending(successor)
+        combined_message = f"{latest.get('message', '')}\n[revise] {request.message}".strip()
+        successor = make_pending(
+            parsed,
+            str(latest.get("input_type") or "text"),
+            combined_message,
+        )
+        successor["revises_pending_id"] = latest["pending_id"]
+        successor["updated_at"] = utc_now_iso()
+        save_pending(successor)
+
+        try:
+            latest["status"] = "superseded"
+            latest["requires_confirmation"] = False
+            latest["revised_to_pending_id"] = successor["pending_id"]
+            latest["updated_at"] = utc_now_iso()
+            save_pending(latest)
+        except Exception:
+            pending_path(successor["pending_id"]).unlink(missing_ok=True)
+            raise
+        return public_pending(successor)
 
 
 @router.post("/ai-confirm")
 async def ai_confirm(request: ConfirmRequest):
-    pending = load_pending(request.pending_id)
-    if pending.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="pending_action 已结束")
-    expires_at = datetime.fromisoformat(pending["expires_at"])
-    if expires_at < datetime.now():
-        pending["status"] = "expired"
+    refresh_quotes = False
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = load_pending(request.pending_id)
+        service = PortfolioWriteService()
+
+        if pending.get("status") == "confirmed":
+            operation_id = str(pending.get("operation_id") or "").strip()
+            existing = service.find_confirm_operation_by_pending_id(request.pending_id)
+            if existing and existing.get("is_rolled_back"):
+                pending["status"] = "rolled_back"
+                pending["requires_confirmation"] = False
+                pending["operation_id"] = existing.get("operation_id")
+                save_pending(pending)
+                raise HTTPException(status_code=409, detail="该确认卡对应的写入已经撤回")
+            if not operation_id and existing:
+                operation_id = str(existing.get("operation_id") or "")
+                pending["operation_id"] = operation_id
+                save_pending(pending)
+            if operation_id:
+                return {
+                    "ok": True,
+                    "operation_id": operation_id,
+                    "imported_positions": (existing or {}).get("imported_positions", 0),
+                    "backup_path": (existing or {}).get("backup_path", ""),
+                    "portfolio_updated": False,
+                    "already_confirmed": True,
+                    "quote_refresh": {"ok": True, "refreshed": False},
+                }
+            raise HTTPException(status_code=409, detail="该确认卡已确认，但缺少operation记录")
+
+        require_open_pending(pending)
+        if pending.get("missing_fields"):
+            raise HTTPException(status_code=400, detail=f"仍有缺失字段: {', '.join(pending['missing_fields'])}")
+
+        existing = service.find_confirm_operation_by_pending_id(request.pending_id)
+        if existing and existing.get("is_rolled_back"):
+            pending["status"] = "rolled_back"
+            pending["requires_confirmation"] = False
+            pending["operation_id"] = existing.get("operation_id")
+            save_pending(pending)
+            raise HTTPException(status_code=409, detail="该确认卡对应的写入已经撤回")
+        if existing:
+            pending["status"] = "confirmed"
+            pending["requires_confirmation"] = False
+            pending["confirmed_at"] = pending.get("confirmed_at") or utc_now_iso()
+            pending["operation_id"] = existing["operation_id"]
+            save_pending(pending)
+            return {
+                "ok": True,
+                "operation_id": existing["operation_id"],
+                "imported_positions": existing.get("imported_positions", 0),
+                "backup_path": existing.get("backup_path", ""),
+                "portfolio_updated": False,
+                "already_confirmed": True,
+                "quote_refresh": {"ok": True, "refreshed": False},
+            }
+
+        for change in pending.get("changes", []):
+            missing = service.validate_confirmable_change(change)
+            if missing:
+                raise HTTPException(status_code=400, detail=f"无法确认，字段无效: {', '.join(missing)}")
+
+        try:
+            result = service.safe_add_positions(
+                pending.get("changes", []),
+                summary=pending.get("summary", "AI确认写入"),
+                pending_action=pending,
+            )
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        pending["status"] = "confirmed"
+        pending["requires_confirmation"] = False
+        pending["confirmed_at"] = utc_now_iso()
+        pending["operation_id"] = result["operation_id"]
         save_pending(pending)
-        raise HTTPException(status_code=400, detail="pending_action 已过期")
-    if pending.get("missing_fields"):
-        raise HTTPException(status_code=400, detail=f"仍有缺失字段: {', '.join(pending['missing_fields'])}")
-
-    service = PortfolioWriteService()
-    for change in pending.get("changes", []):
-        missing = service.validate_confirmable_change(change)
-        if missing:
-            raise HTTPException(status_code=400, detail=f"无法确认，缺少: {', '.join(missing)}")
-
-    try:
-        result = service.safe_add_positions(
-            pending.get("changes", []),
-            summary=pending.get("summary", "AI确认写入"),
-            pending_action=pending,
-        )
-    except (ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    pending["status"] = "confirmed"
-    pending["confirmed_at"] = utc_now_iso()
-    pending["operation_id"] = result["operation_id"]
-    save_pending(pending)
-    refresh_result = await reload_and_refresh_portfolio_provider(
-        refresh_quotes=any(
+        refresh_quotes = any(
             str(change.get("action_type") or change.get("action") or "add_or_update")
             not in {"deposit", "withdraw", "set_cash"}
             for change in pending.get("changes", [])
         )
-    )
+
+    refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=refresh_quotes)
     result["quote_refresh"] = refresh_result
     return result
 
 
 @router.post("/ai-cancel")
 async def ai_cancel(request: CancelRequest):
-    pending = load_pending(request.pending_id)
-    pending["status"] = "cancelled"
-    pending["cancelled_at"] = utc_now_iso()
-    save_pending(pending)
-    return {"ok": True, "pending_id": request.pending_id, "status": "cancelled"}
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = load_pending(request.pending_id)
+        if pending.get("status") == "cancelled":
+            return {
+                "ok": True,
+                "pending_id": request.pending_id,
+                "status": "cancelled",
+                "already_cancelled": True,
+            }
+        require_open_pending(pending)
+        pending["status"] = "cancelled"
+        pending["requires_confirmation"] = False
+        pending["cancelled_at"] = utc_now_iso()
+        save_pending(pending)
+        return {"ok": True, "pending_id": request.pending_id, "status": "cancelled"}
 
 
 @router.get("/pending/{pending_id}")
 async def get_pending(pending_id: str):
-    return public_pending(load_pending(pending_id))
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = load_pending(pending_id)
+        pending = reconcile_pending_with_operations(pending)
+        expire_pending_if_needed(pending)
+        return public_pending(pending)
 
 
 @router.get("/operations")

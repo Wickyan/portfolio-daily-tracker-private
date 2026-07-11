@@ -9,11 +9,14 @@ written back to portfolio.json. market/exchange/canonical_symbol are discarded.
 """
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
+import re
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -53,6 +56,7 @@ POSITION_STORAGE_FIELDS = {
 }
 
 PositionIdentity = Tuple[str, str, str]
+SUPPORTED_CURRENCIES = {"CNY", "USD", "HKD"}
 PORTFOLIO_MUTATION_LOCK = RLock()
 
 
@@ -71,9 +75,10 @@ def to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     if value is None or value == "":
         return default
     try:
-        return float(str(value).replace(",", "").strip())
+        number = float(str(value).replace(",", "").strip())
     except (TypeError, ValueError):
         return default
+    return number if math.isfinite(number) else default
 
 
 def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]:
@@ -142,15 +147,32 @@ class PortfolioWriteService:
         try:
             with open(self.portfolio_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
-            data = {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"portfolio账本损坏，已拒绝按空账本继续写入：{self.portfolio_file}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"无法读取portfolio账本：{self.portfolio_file}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("portfolio账本顶层必须是JSON对象")
 
         positions = [self.normalize_position(p, for_storage=True) for p in data.get("positions", [])]
-        cash_accounts = [
-            self.normalize_cash_account(item)
-            for item in data.get("cash_accounts", [])
-            if self.normalize_cash_account(item).get("account")
-        ]
+        cash_accounts = []
+        for raw in data.get("cash_accounts", []):
+            if not isinstance(raw, dict):
+                raise RuntimeError("cash_accounts中的记录必须是JSON对象")
+            raw_amount = to_float(raw.get("amount"), None)
+            if raw_amount is None:
+                raise RuntimeError("cash_accounts存在无效amount")
+            item = self.normalize_cash_account(raw)
+            if not item.get("account") and not item.get("currency") and abs(item.get("amount", 0.0)) <= 1e-12:
+                continue
+            if not item.get("account") or not item.get("currency"):
+                raise RuntimeError("cash_accounts存在缺少account或currency的记录")
+            cash_accounts.append(item)
+
+        self._validate_portfolio_records(positions, cash_accounts)
+
         return {
             "positions": positions,
             "cash": to_float(data.get("cash"), 0.0) or 0.0,
@@ -158,23 +180,83 @@ class PortfolioWriteService:
             "updated_at": data.get("updated_at") or utc_now_iso(),
         }
 
-    def save_portfolio_atomic(self, portfolio: Dict[str, Any]) -> None:
+    def _validate_portfolio_records(
+        self,
+        positions: List[Dict[str, Any]],
+        cash_accounts: List[Dict[str, Any]],
+    ) -> None:
+        position_ids = [position_identity(position) for position in positions]
+        duplicate_positions = sorted(identity for identity, count in Counter(position_ids).items() if count > 1)
+        if duplicate_positions:
+            raise RuntimeError(f"portfolio账本存在重复持仓身份：{duplicate_positions}")
+        for position, identity in zip(positions, position_ids):
+            if not all(identity):
+                raise RuntimeError(f"portfolio账本存在不完整持仓身份：{identity}")
+            if identity[2] not in SUPPORTED_CURRENCIES:
+                raise RuntimeError(f"portfolio账本包含暂不支持的币种：{identity[2]}")
+            quantity = to_float(position.get("quantity"), None)
+            cost_price = to_float(position.get("cost_price"), None)
+            if quantity is None or quantity <= 0:
+                raise RuntimeError(f"portfolio账本持仓数量无效：{identity}")
+            if cost_price is None or cost_price < 0:
+                raise RuntimeError(f"portfolio账本成本价无效：{identity}")
+
+        cash_ids = [(item["account"], item["currency"]) for item in cash_accounts]
+        duplicate_cash = sorted(identity for identity, count in Counter(cash_ids).items() if count > 1)
+        if duplicate_cash:
+            raise RuntimeError(f"portfolio账本存在重复现金账户：{duplicate_cash}")
+        for item, identity in zip(cash_accounts, cash_ids):
+            if not all(identity):
+                raise RuntimeError(f"portfolio账本存在不完整现金账户：{identity}")
+            if identity[1] not in SUPPORTED_CURRENCIES:
+                raise RuntimeError(f"portfolio账本包含暂不支持的币种：{identity[1]}")
+            amount = to_float(item.get("amount"), None)
+            if amount is None or amount < 0:
+                raise RuntimeError(f"portfolio账本现金余额无效：{identity}")
+
+    def save_portfolio_atomic(
+        self,
+        portfolio: Dict[str, Any],
+        *,
+        preserve_updated_at: bool = False,
+    ) -> None:
         ensure_data_dirs()
+        positions = [self.normalize_position(p, for_storage=True) for p in portfolio.get("positions", [])]
+        cash_accounts = []
+        for raw in portfolio.get("cash_accounts", []):
+            if not isinstance(raw, dict) or to_float(raw.get("amount"), None) is None:
+                raise RuntimeError("cash_accounts存在无效记录")
+            item = self.normalize_cash_account(raw)
+            if not item.get("account") and not item.get("currency") and abs(item.get("amount", 0.0)) <= 1e-12:
+                continue
+            cash_accounts.append(item)
+        self._validate_portfolio_records(positions, cash_accounts)
+        raw_legacy_cash = portfolio.get("cash", 0.0)
+        legacy_cash = to_float(raw_legacy_cash, None)
+        if legacy_cash is None or legacy_cash < 0:
+            raise RuntimeError("legacy cash必须是非负有限数字")
         data = {
-            "positions": [self.normalize_position(p, for_storage=True) for p in portfolio.get("positions", [])],
-            "cash": to_float(portfolio.get("cash"), 0.0) or 0.0,
-            "cash_accounts": [
-                self.normalize_cash_account(item)
-                for item in portfolio.get("cash_accounts", [])
-                if self.normalize_cash_account(item).get("account")
-            ],
-            "updated_at": utc_now_iso(),
+            "positions": positions,
+            "cash": legacy_cash,
+            "cash_accounts": cash_accounts,
+            "updated_at": (
+                str(portfolio.get("updated_at") or utc_now_iso())
+                if preserve_updated_at else utc_now_iso()
+            ),
         }
-        tmp_path = self.portfolio_file.with_suffix(".json.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, self.portfolio_file)
+        self.portfolio_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.portfolio_file.with_name(
+            f".{self.portfolio_file.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.portfolio_file)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def backup_portfolio(self) -> str:
         ensure_data_dirs()
@@ -291,8 +373,11 @@ class PortfolioWriteService:
             missing = []
             if not str(change.get("account") or "").strip():
                 missing.append("account")
-            if not str(change.get("currency") or "").strip():
+            currency = str(change.get("currency") or "").upper().strip()
+            if not currency:
                 missing.append("currency")
+            elif currency not in SUPPORTED_CURRENCIES:
+                missing.append("unsupported_currency")
             amount = to_float(change.get("amount"), None)
             if amount is None:
                 missing.append("amount")
@@ -307,12 +392,23 @@ class PortfolioWriteService:
             missing.append("account")
         if not normalized.get("code"):
             missing.append("code")
-        if not normalized.get("currency"):
+        currency = str(normalized.get("currency") or "").upper().strip()
+        if not currency:
             missing.append("currency")
-        if to_float(normalized.get("quantity"), None) is None:
-            missing.append("quantity")
-        if to_float(normalized.get("cost_price"), None) is None:
-            missing.append("cost_price")
+        elif currency not in SUPPORTED_CURRENCIES:
+            missing.append("unsupported_currency")
+        quantity = to_float(normalized.get("quantity"), None)
+        if action_type != "delete":
+            if quantity is None:
+                missing.append("quantity")
+            elif quantity <= 0:
+                missing.append("positive_quantity")
+        if action_type not in {"sell", "delete"}:
+            cost_price = to_float(normalized.get("cost_price"), None)
+            if cost_price is None:
+                missing.append("cost_price")
+            elif cost_price < 0:
+                missing.append("cost_price_non_negative")
         return missing
 
     def apply_changes(self, portfolio: Dict[str, Any], changes: List[Dict[str, Any]]) -> tuple[Dict[str, Any], int]:
@@ -464,10 +560,49 @@ class PortfolioWriteService:
             "status": "confirmed" if operation_type != "rollback" else "rolled_back",
         }
         path = OPERATIONS_DIR / f"{operation_id}.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(operation, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+        tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(operation, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         return operation
+
+    def _commit_portfolio_change(
+        self,
+        *,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        operation_type: str,
+        summary: str,
+        pending_action: Optional[Dict[str, Any]] = None,
+        imported_positions: int = 0,
+    ) -> tuple[Dict[str, Any], str]:
+        """Commit ledger and operation log as one recoverable unit.
+
+        If operation-log creation fails after the atomic ledger replace, restore
+        the exact before snapshot so no untracked write remains.
+        """
+        backup_path = self.backup_portfolio()
+        self.save_portfolio_atomic(after)
+        try:
+            operation = self.create_operation(
+                operation_type=operation_type,
+                summary=summary,
+                before_snapshot=before,
+                after_snapshot=after,
+                pending_action=pending_action,
+                backup_path=backup_path,
+                imported_positions=imported_positions,
+            )
+        except Exception:
+            self.save_portfolio_atomic(before, preserve_updated_at=True)
+            raise
+        return operation, backup_path
 
     def _load_all_operations(self) -> List[Dict[str, Any]]:
         ensure_data_dirs()
@@ -475,9 +610,12 @@ class PortfolioWriteService:
         for path in sorted(OPERATIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    operations.append(json.load(f))
-            except Exception:
-                continue
+                    operation = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"operation日志损坏：{path.name}") from exc
+            if not isinstance(operation, dict) or not operation.get("operation_id"):
+                raise RuntimeError(f"operation日志格式错误：{path.name}")
+            operations.append(operation)
         return operations
 
     def _rolled_back_operation_ids(self, operations: Optional[List[Dict[str, Any]]] = None) -> set[str]:
@@ -512,6 +650,28 @@ class PortfolioWriteService:
             })
         return summaries[:limit]
 
+    def find_confirm_operation_by_pending_id(self, pending_id: str) -> Optional[Dict[str, Any]]:
+        """Return the existing AI-confirm operation for idempotent retries."""
+        target = str(pending_id or "").strip()
+        if not target:
+            return None
+        operations = self._load_all_operations()
+        rolled_back_ids = self._rolled_back_operation_ids(operations)
+        matches = [
+            operation
+            for operation in operations
+            if operation.get("type") == "ai_confirm"
+            and str(operation.get("pending_action", {}).get("pending_id") or "").strip() == target
+        ]
+        if len(matches) > 1:
+            operation_ids = [str(operation.get("operation_id") or "") for operation in matches]
+            raise RuntimeError(f"同一pending_id存在重复确认operation：{target} -> {operation_ids}")
+        if not matches:
+            return None
+        result = dict(matches[0])
+        result["is_rolled_back"] = str(result.get("operation_id") or "") in rolled_back_ids
+        return result
+
     def get_latest_rollbackable_operation(self) -> Dict[str, Any]:
         operations = self._load_all_operations()
         rolled_back_ids = self._rolled_back_operation_ids(operations)
@@ -526,11 +686,19 @@ class PortfolioWriteService:
         raise FileNotFoundError("没有可撤回的写入操作")
 
     def load_operation(self, operation_id: str) -> Dict[str, Any]:
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", str(operation_id or "")):
+            raise FileNotFoundError(operation_id)
         path = OPERATIONS_DIR / f"{operation_id}.json"
         if not path.exists():
             raise FileNotFoundError(operation_id)
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                operation = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"operation日志损坏：{path.name}") from exc
+        if not isinstance(operation, dict):
+            raise RuntimeError(f"operation日志格式错误：{path.name}")
+        return operation
 
     def _apply_selective_inverse(
         self,
@@ -656,72 +824,79 @@ class PortfolioWriteService:
         return result
 
     def rollback_operation(self, operation_id: str) -> Dict[str, Any]:
-        operation = self.load_operation(operation_id)
-        if operation.get("type") == "rollback":
-            raise ValueError("回滚操作本身不能再次回滚")
-        if operation_id in self._rolled_back_operation_ids():
-            raise ValueError("该操作已经撤回")
-        before_snapshot = operation.get("before_snapshot")
-        if not before_snapshot:
-            raise ValueError("operation does not have before_snapshot")
-        current = self.load_portfolio()
-        restored = self._apply_selective_inverse(current, operation)
-        backup_path = self.backup_portfolio()
-        self.save_portfolio_atomic(restored)
-        rollback = self.create_operation(
-            operation_type="rollback",
-            summary=f"Rollback operation {operation_id}",
-            before_snapshot=current,
-            after_snapshot=restored,
-            pending_action={"rolled_back_operation_id": operation_id},
-            backup_path=backup_path,
-            imported_positions=0,
-        )
+        with PORTFOLIO_MUTATION_LOCK:
+            operation = self.load_operation(operation_id)
+            if operation.get("type") == "rollback":
+                raise ValueError("回滚操作本身不能再次回滚")
+            if operation_id in self._rolled_back_operation_ids():
+                raise ValueError("该操作已经撤回")
+            before_snapshot = operation.get("before_snapshot")
+            if not before_snapshot:
+                raise ValueError("operation does not have before_snapshot")
+            current = self.load_portfolio()
+            restored = self._apply_selective_inverse(current, operation)
+            rollback, backup_path = self._commit_portfolio_change(
+                before=current,
+                after=restored,
+                operation_type="rollback",
+                summary=f"Rollback operation {operation_id}",
+                pending_action={"rolled_back_operation_id": operation_id},
+                imported_positions=0,
+            )
 
-        pending_id = str(operation.get("pending_action", {}).get("pending_id") or "").strip()
-        if pending_id:
-            pending_path = PENDING_DIR / f"{pending_id}.json"
-            if pending_path.exists():
-                try:
-                    with open(pending_path, "r", encoding="utf-8") as f:
-                        pending = json.load(f)
-                    pending["status"] = "rolled_back"
-                    pending["requires_confirmation"] = False
-                    pending["rolled_back_at"] = utc_now_iso()
-                    pending["rollback_operation_id"] = rollback["operation_id"]
-                    tmp_path = pending_path.with_suffix(".json.tmp")
-                    with open(tmp_path, "w", encoding="utf-8") as f:
-                        json.dump(pending, f, ensure_ascii=False, indent=2)
-                        f.write("\n")
-                    os.replace(tmp_path, pending_path)
-                except Exception as exc:
-                    print(f"[Rollback] 更新pending状态失败: {exc}")
+            pending_id = str(operation.get("pending_action", {}).get("pending_id") or "").strip()
+            if pending_id and re.fullmatch(r"[A-Za-z0-9-]{8,80}", pending_id):
+                pending_path = PENDING_DIR / f"{pending_id}.json"
+                if pending_path.exists():
+                    try:
+                        with open(pending_path, "r", encoding="utf-8") as f:
+                            pending = json.load(f)
+                        pending["status"] = "rolled_back"
+                        pending["requires_confirmation"] = False
+                        pending["rolled_back_at"] = utc_now_iso()
+                        pending["rollback_operation_id"] = rollback["operation_id"]
+                        tmp_path = pending_path.with_name(f".{pending_path.name}.{uuid4().hex}.tmp")
+                        try:
+                            with open(tmp_path, "w", encoding="utf-8") as f:
+                                json.dump(pending, f, ensure_ascii=False, indent=2)
+                                f.write("\n")
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(tmp_path, pending_path)
+                        finally:
+                            tmp_path.unlink(missing_ok=True)
+                    except Exception as exc:
+                        print(f"[Rollback] 更新pending状态失败: {exc}")
 
-        return {
-            "ok": True,
-            "rolled_back_operation_id": operation_id,
-            "rollback_operation_id": rollback["operation_id"],
-            "backup_path": backup_path,
-        }
+            return {
+                "ok": True,
+                "rolled_back_operation_id": operation_id,
+                "rollback_operation_id": rollback["operation_id"],
+                "backup_path": backup_path,
+            }
 
 
     def rollback_latest_operation(self) -> Dict[str, Any]:
-        operation = self.get_latest_rollbackable_operation()
-        result = self.rollback_operation(str(operation["operation_id"]))
-        result["summary"] = operation.get("summary") or operation.get("type") or "最近一次写入"
-        result["operation_type"] = operation.get("type")
-        pending_action = operation.get("pending_action") or {}
-        changes = pending_action.get("changes") or []
-        if changes:
-            change = changes[0]
-            account = str(change.get("account") or "").strip()
-            target = str(change.get("name") or change.get("code") or "持仓").strip()
-            quantity = change.get("quantity")
-            description = "/".join(part for part in [account, target] if part)
-            if quantity is not None:
-                description = f"{description}，数量{quantity:g}" if isinstance(quantity, (int, float)) else f"{description}，数量{quantity}"
-            result["description"] = description
-        return result
+        with PORTFOLIO_MUTATION_LOCK:
+            operation = self.get_latest_rollbackable_operation()
+            result = self.rollback_operation(str(operation["operation_id"]))
+            result["summary"] = operation.get("summary") or operation.get("type") or "最近一次写入"
+            result["operation_type"] = operation.get("type")
+            pending_action = operation.get("pending_action") or {}
+            changes = pending_action.get("changes") or []
+            if changes:
+                change = changes[0]
+                account = str(change.get("account") or "").strip()
+                target = str(change.get("name") or change.get("code") or change.get("currency") or "记录").strip()
+                quantity = change.get("quantity")
+                amount = change.get("amount")
+                description = "/".join(part for part in [account, target] if part)
+                if quantity is not None:
+                    description = f"{description}，数量{quantity:g}" if isinstance(quantity, (int, float)) else f"{description}，数量{quantity}"
+                elif amount is not None:
+                    description = f"{description}，金额{amount:g}" if isinstance(amount, (int, float)) else f"{description}，金额{amount}"
+                result["description"] = description
+            return result
 
     def safe_set_cash_account(self, account: str, currency: str, amount: float) -> Dict[str, Any]:
         change = {
@@ -747,16 +922,20 @@ class PortfolioWriteService:
     ) -> Dict[str, Any]:
         with PORTFOLIO_MUTATION_LOCK:
             before = self.load_portfolio()
-            backup_path = self.backup_portfolio()
+            for change in changes:
+                missing = self.validate_confirmable_change(change)
+                if missing:
+                    action_type = str(change.get("action_type") or change.get("action") or "add_or_update")
+                    if action_type in {"deposit", "withdraw", "set_cash"}:
+                        raise ValueError("现金操作缺少有效的account/currency/amount")
+                    raise ValueError(f"写入字段无效：{', '.join(missing)}")
             after, imported = self.apply_changes(before, changes)
-            self.save_portfolio_atomic(after)
-            operation = self.create_operation(
+            operation, backup_path = self._commit_portfolio_change(
+                before=before,
+                after=after,
                 operation_type="manual_add" if not pending_action else "ai_confirm",
                 summary=summary,
-                before_snapshot=before,
-                after_snapshot=after,
                 pending_action=pending_action,
-                backup_path=backup_path,
                 imported_positions=imported,
             )
             return {
@@ -777,7 +956,7 @@ class PortfolioWriteService:
                 if identity not in prices:
                     continue
                 price = to_float(prices[identity], None)
-                if price is None:
+                if price is None or price <= 0:
                     continue
                 position["current_price"] = price
                 position["updated_at"] = utc_now_iso()
@@ -793,79 +972,81 @@ class PortfolioWriteService:
         currency: str,
         updates: Dict[str, Any],
     ) -> Dict[str, Any]:
-        identity = position_identity({"account": account, "code": code, "currency": currency})
-        before = self.load_portfolio()
-        matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
-        if not matches:
-            raise FileNotFoundError(identity)
-        if len(matches) > 1:
-            raise ValueError(f"检测到重复持仓身份: {identity}")
+        with PORTFOLIO_MUTATION_LOCK:
+            identity = position_identity({"account": account, "code": code, "currency": currency})
+            before = self.load_portfolio()
+            matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
+            if not matches:
+                raise FileNotFoundError(identity)
+            if len(matches) > 1:
+                raise ValueError(f"检测到重复持仓身份: {identity}")
 
-        existing = matches[0]
-        updated = dict(existing)
-        if updates.get("quantity") is not None:
-            updated["quantity"] = to_float(updates.get("quantity"), existing.get("quantity"))
-            updated["available_qty"] = updated["quantity"]
-        if updates.get("cost_price") is not None:
-            updated["cost_price"] = to_float(updates.get("cost_price"), existing.get("cost_price"))
-        updated["total_cost"] = (
-            (to_float(updated.get("quantity"), 0.0) or 0.0)
-            * (to_float(updated.get("cost_price"), 0.0) or 0.0)
-        )
-        updated["updated_at"] = utc_now_iso()
-        updated = self.normalize_position(updated, for_storage=True)
+            existing = matches[0]
+            updated = dict(existing)
+            if updates.get("quantity") is not None:
+                quantity = to_float(updates.get("quantity"), None)
+                if quantity is None or quantity <= 0:
+                    raise ValueError("持仓数量必须大于0；清空持仓请使用删除")
+                updated["quantity"] = quantity
+                updated["available_qty"] = quantity
+            if updates.get("cost_price") is not None:
+                cost_price = to_float(updates.get("cost_price"), None)
+                if cost_price is None or cost_price < 0:
+                    raise ValueError("成本价必须是非负有限数字")
+                updated["cost_price"] = cost_price
+            updated["total_cost"] = (
+                (to_float(updated.get("quantity"), 0.0) or 0.0)
+                * (to_float(updated.get("cost_price"), 0.0) or 0.0)
+            )
+            updated["updated_at"] = utc_now_iso()
+            updated = self.normalize_position(updated, for_storage=True)
 
-        after = deepcopy(before)
-        after["positions"] = [
-            updated if position_identity(p) == identity else self.normalize_position(p, for_storage=True)
-            for p in before.get("positions", [])
-        ]
-        backup_path = self.backup_portfolio()
-        self.save_portfolio_atomic(after)
-        operation = self.create_operation(
-            operation_type="manual_update",
-            summary=f"手动更新持仓 {account}/{code}/{currency}",
-            before_snapshot=before,
-            after_snapshot=after,
-            backup_path=backup_path,
-            imported_positions=1,
-        )
-        return {
-            "ok": True,
-            "operation_id": operation["operation_id"],
-            "backup_path": backup_path,
-            "portfolio_updated": True,
-        }
+            after = deepcopy(before)
+            after["positions"] = [
+                updated if position_identity(p) == identity else self.normalize_position(p, for_storage=True)
+                for p in before.get("positions", [])
+            ]
+            operation, backup_path = self._commit_portfolio_change(
+                before=before,
+                after=after,
+                operation_type="manual_update",
+                summary=f"手动更新持仓 {account}/{code}/{currency}",
+                imported_positions=1,
+            )
+            return {
+                "ok": True,
+                "operation_id": operation["operation_id"],
+                "backup_path": backup_path,
+                "portfolio_updated": True,
+            }
 
     def safe_remove_position(self, account: str, code: str, currency: str) -> Dict[str, Any]:
-        identity = position_identity({"account": account, "code": code, "currency": currency})
-        before = self.load_portfolio()
-        matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
-        if not matches:
-            raise FileNotFoundError(identity)
-        if len(matches) > 1:
-            raise ValueError(f"检测到重复持仓身份: {identity}")
+        with PORTFOLIO_MUTATION_LOCK:
+            identity = position_identity({"account": account, "code": code, "currency": currency})
+            before = self.load_portfolio()
+            matches = [p for p in before.get("positions", []) if position_identity(p) == identity]
+            if not matches:
+                raise FileNotFoundError(identity)
+            if len(matches) > 1:
+                raise ValueError(f"检测到重复持仓身份: {identity}")
 
-        backup_path = self.backup_portfolio()
-        after = deepcopy(before)
-        after["positions"] = [
-            p for p in after.get("positions", [])
-            if position_identity(p) != identity
-        ]
-        after["updated_at"] = utc_now_iso()
-        self.save_portfolio_atomic(after)
-        operation = self.create_operation(
-            operation_type="manual_delete",
-            summary=f"删除持仓 {account}/{code}/{currency}",
-            before_snapshot=before,
-            after_snapshot=after,
-            backup_path=backup_path,
-            imported_positions=1,
-        )
-        return {
-            "ok": True,
-            "operation_id": operation["operation_id"],
-            "removed_positions": 1,
-            "backup_path": backup_path,
-            "portfolio_updated": True,
-        }
+            after = deepcopy(before)
+            after["positions"] = [
+                p for p in after.get("positions", [])
+                if position_identity(p) != identity
+            ]
+            after["updated_at"] = utc_now_iso()
+            operation, backup_path = self._commit_portfolio_change(
+                before=before,
+                after=after,
+                operation_type="manual_delete",
+                summary=f"删除持仓 {account}/{code}/{currency}",
+                imported_positions=1,
+            )
+            return {
+                "ok": True,
+                "operation_id": operation["operation_id"],
+                "removed_positions": 1,
+                "backup_path": backup_path,
+                "portfolio_updated": True,
+            }

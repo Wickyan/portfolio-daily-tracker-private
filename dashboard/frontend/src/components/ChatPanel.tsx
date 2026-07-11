@@ -116,6 +116,9 @@ function PendingActionCard({
             amount: '金额',
             positive_amount: '金额必须大于0',
             amount_non_negative: '余额不能为负',
+            positive_quantity: '数量必须大于0',
+            cost_price_non_negative: '成本价不能为负',
+            unsupported_currency: '暂仅支持CNY/USD/HKD',
             available_cash: '可用现金不足',
             distinct_currencies: '换出和换入币种必须不同',
             'source_amount/currency': '换出金额和币种',
@@ -175,6 +178,8 @@ function PendingActionCard({
         <div className="text-sm text-sky-300">原卡片已被修改后的新确认卡替代，不能再确认这一版。</div>
       ) : pending.status === 'cancelled' ? (
         <div className="text-sm text-slate-400">已取消。</div>
+      ) : pending.status === 'expired' ? (
+        <div className="text-sm text-amber-300">该确认卡已过期，请重新提交原始记账信息。</div>
       ) : (
         <div className="space-y-2">
           <input
