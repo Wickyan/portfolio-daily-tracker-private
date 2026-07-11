@@ -329,6 +329,8 @@ export default function Portfolio() {
   const totalMarketValue = portfolio?.total_market_value || 0
   const cash = portfolio?.cash || 0
   const totalProfit = portfolio?.total_profit || 0
+  const holdingPercent = totalAssets > 0 ? (totalMarketValue / totalAssets) * 100 : 0
+  const cashPercent = totalAssets > 0 ? (cash / totalAssets) * 100 : 0
   const profitPercent = totalMarketValue > 0 ? (totalProfit / (totalMarketValue - totalProfit)) * 100 : 0
 
   return (
@@ -341,11 +343,19 @@ export default function Portfolio() {
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
           <div className="text-sm text-slate-400 mb-2">持仓市值(CNY)</div>
-          <div className="text-2xl font-bold">¥{formatNumber(totalMarketValue)}</div>
+          <div className="flex items-baseline gap-2">
+            <div className="text-2xl font-bold">¥{formatNumber(totalMarketValue)}</div>
+            <div className="text-sm text-slate-400">{formatPercent(holdingPercent)}%</div>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">占总资产</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
           <div className="text-sm text-slate-400 mb-2">账户现金(CNY)</div>
-          <div className="text-2xl font-bold text-green-400">¥{formatNumber(cash)}</div>
+          <div className="flex items-baseline gap-2">
+            <div className="text-2xl font-bold text-green-400">¥{formatNumber(cash)}</div>
+            <div className="text-sm text-slate-400">{formatPercent(cashPercent)}%</div>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">占总资产</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
           <div className="text-sm text-slate-400 mb-2">总盈亏(CNY)</div>
