@@ -435,8 +435,8 @@ export default function Portfolio() {
                   <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">盈亏</th>
                   <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">持仓/可用</th>
                   <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">成本/现价</th>
-                  <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">市值</th>
-                  <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">持仓比例</th>
+                  <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">总余额/市值</th>
+                  <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">资产比例</th>
                   <th className="px-6 py-4 text-right text-sm font-medium text-slate-400">盈亏比例</th>
                   <th className="px-6 py-4 text-center text-sm font-medium text-slate-400">操作</th>
                 </tr>
@@ -475,9 +475,15 @@ export default function Portfolio() {
                           <div className="text-xs text-slate-500">≈¥{formatNumber(position.market_value_cny)}</div>
                         )}
                       </td>
-                      <td className="px-6 py-4 text-right font-semibold text-primary-300">
-                        {formatPercent(position.asset_weight_pct || 0)}%
-                        <div className="text-xs font-normal text-slate-500">占总资产</div>
+                      <td className="px-6 py-4 text-right">
+                        <div className="font-semibold text-primary-300">
+                          {formatPercent(position.asset_weight_pct || 0)}%
+                        </div>
+                        <div className="text-xs text-slate-500">占总资产</div>
+                        <div className="mt-1 text-sm font-medium text-slate-300">
+                          {formatPercent(position.holding_weight_pct || 0)}%
+                        </div>
+                        <div className="text-xs text-slate-500">占证券持仓</div>
                       </td>
                       <td className={`px-6 py-4 text-right font-bold ${profitClass}`}>
                         {formatPercent(position.profit_pct)}%
