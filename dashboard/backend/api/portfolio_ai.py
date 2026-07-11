@@ -751,9 +751,20 @@ def infer_action(message: str) -> str:
         return "set_cash"
     if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "帮我记一下", "记一笔", "录入"]) or re.search(rf"买\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message):
         return "add_or_update"
-    has_quantity = bool(re.search(r"[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)", message))
+    has_quantity = bool(re.search(rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message, re.IGNORECASE))
     has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
     if has_quantity and has_total_amount:
+        return "add_or_update"
+    # Concise ledger entry: "银河 比亚迪 500个 102.742元".
+    # Require a known account, a known asset, quantity unit and a trailing price+currency
+    # so ordinary numeric chat does not become a bookkeeping card.
+    has_known_asset = any(asset.lower() in message.lower() for asset in COMMON_ASSET_WORDS)
+    has_trailing_price = bool(re.search(
+        rf"{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}\s*$",
+        message,
+        re.IGNORECASE,
+    ))
+    if account is not None and has_known_asset and has_quantity and has_trailing_price:
         return "add_or_update"
     if looks_like_structured_bookkeeping(message):
         return "add_or_update"

@@ -475,5 +475,23 @@ class UserSimulationTest(unittest.TestCase):
 
 
 
+    def test_concise_account_asset_quantity_price_is_bookkeeping(self) -> None:
+        for text in (
+            "银河 比亚迪 500个 102.742元",
+            "银河 比亚迪 500股 102.742元",
+        ):
+            with self.subTest(text=text):
+                parsed = parse_bookkeeping_message(text)
+                self.assertEqual(parsed["action_type"], "add_or_update")
+                self.assertEqual(parsed["missing_fields"], [])
+                change = parsed["changes"][0]
+                self.assertEqual(change["account"], "银河")
+                self.assertEqual(change["code"], "002594")
+                self.assertEqual(change["quantity"], 500)
+                self.assertEqual(change["cost_price"], 102.742)
+                self.assertEqual(change["total_cost"], 51371)
+
+
+
 if __name__ == "__main__":
     unittest.main()
