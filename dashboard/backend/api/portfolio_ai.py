@@ -1413,24 +1413,15 @@ def instrument_search_keywords(keyword: str) -> List[str]:
     return list(dict.fromkeys(item for item in keywords if item))[:6]
 
 
-async def enrich_with_online_instrument_search(
-    parsed: Dict[str, Any],
-    message: str,
-) -> Dict[str, Any]:
-    """Resolve a missing code from an instrument name before asking the user."""
-    if parsed.get("intent") != "bookkeeping" or not parsed.get("changes"):
-        return parsed
-    if parsed.get("action_type") in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
-        return parsed
-
-    change = dict(parsed["changes"][0])
-    if change.get("code"):
-        return parsed
-    keyword = str(change.get("name") or "").strip()
-    if not keyword:
-        return parsed
-
-    search_keywords = instrument_search_keywords(keyword)
+async def search_ranked_listed_candidates(
+    keyword: str,
+    extra_keywords: Optional[List[str]] = None,
+) -> tuple[List[Dict[str, Any]], List[Exception]]:
+    search_keywords = list(dict.fromkeys(
+        instrument_search_keywords(keyword) + [
+            str(item or "").strip() for item in (extra_keywords or []) if str(item or "").strip()
+        ]
+    ))[:10]
     service = InstrumentSearchService()
     results = await asyncio.gather(
         *(service.search(search_keyword, limit=20) for search_keyword in search_keywords),
@@ -1448,8 +1439,253 @@ async def enrich_with_online_instrument_search(
             existing = pooled.get(key)
             if existing is None or int(candidate.get("score") or 0) > int(existing.get("score") or 0):
                 pooled[key] = candidate
+    return InstrumentSearchService.rank_candidates(keyword, list(pooled.values())), search_errors
 
-    candidates = InstrumentSearchService.rank_candidates(keyword, list(pooled.values()))
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(raw[start:end + 1])
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _clean_instrument_revision_text(message: str) -> str:
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    correction = re.search(r"(?:而是|不是.+?[，,；;]?\s*是)\s*(.+?)\s*$", text)
+    if correction:
+        text = correction.group(1).strip()
+    text = re.sub(
+        r"^(?:我想强调(?:一下)?|强调(?:一下)?|其实|应该|他是|它是|标的(?:是|改成|改为)?|名称(?:是|改成|改为)?|改成|改为|修改为|修改成|换成|是)\s*[:：]?\s*",
+        "",
+        text,
+    )
+    return text.strip(" ，,。；;：:")
+
+
+def contextual_instrument_queries(pending: Dict[str, Any], revision: str) -> List[str]:
+    fragment = _clean_instrument_revision_text(revision)
+    if not fragment:
+        return []
+    change = (pending.get("changes") or [{}])[0]
+    current_name = str(change.get("name") or "").strip()
+    candidate_names = [str(item.get("name") or "") for item in pending.get("instrument_candidates", [])]
+    has_etf_context = "ETF" in current_name.upper() or any("ETF" in name.upper() for name in candidate_names)
+    context_base = InstrumentSearchService._fuzzy_text(current_name)
+    fragment_base = InstrumentSearchService._fuzzy_text(fragment)
+
+    queries = [fragment]
+    if current_name:
+        queries.extend([f"{current_name}{fragment}", f"{fragment}{current_name}"])
+    if has_etf_context:
+        if context_base and context_base not in fragment_base:
+            queries.append(f"{context_base}ETF{fragment}")
+        chinese = "".join(re.findall(r"[\u4e00-\u9fff]", fragment))
+        if len(chinese) >= 4 and "ETF" not in fragment.upper():
+            queries.append(f"{chinese[:-2]}ETF{chinese[-2:]}")
+    return list(dict.fromkeys(query for query in queries if query))[:8]
+
+
+async def resolve_revision_with_llm(
+    pending: Dict[str, Any],
+    instruction: str,
+) -> Optional[Dict[str, Any]]:
+    """Interpret a free-form revision using the current card as context.
+
+    The LLM may propose field updates or an instrument search phrase, but it
+    may not invent a security code. Every instrument result is still resolved
+    against the listed-security search service and requires user confirmation.
+    """
+    try:
+        from backend.main import get_agent_service
+        agent_service = get_agent_service()
+        provider = getattr(agent_service, "llm_provider", None) if agent_service else None
+        if provider is None:
+            return None
+
+        current_card = {
+            "action_type": pending.get("action_type"),
+            "changes": pending.get("changes", []),
+            "missing_fields": pending.get("missing_fields", []),
+            "instrument_candidates": pending.get("instrument_candidates", [])[:8],
+        }
+        system_prompt = """你是Portfolio记账确认卡的修改解析器。用户正在修改一张已有确认卡，不是在创建无关聊天。
+只输出一个JSON对象，不要Markdown，不要解释。格式：
+{"field_updates":{},"instrument_query":"","reason":""}
+规则：
+1. 保留用户没有修改的原字段。
+2. field_updates只允许account、currency、quantity、cost_price、fee、amount、note。
+3. 用户修改标的名称、简称、发行方或基金管理人时，不要编造code；把结合当前卡片上下文后的场内证券搜索词写入instrument_query。
+4. 用户只补充很短的名称片段时，要结合当前标的主题和候选理解它是在限定哪一个标的。
+5. 不确定时instrument_query仍可给出较宽的搜索词，最终由候选列表让用户选择。
+6. reason用一句中文说明你理解了什么修改。"""
+        user_prompt = json.dumps(
+            {"current_card": current_card, "user_revision": instruction},
+            ensure_ascii=False,
+        )
+        response = await provider.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=700,
+        )
+        payload = _extract_json_object(response.content)
+        if not payload:
+            return None
+
+        allowed_fields = {"account", "currency", "quantity", "cost_price", "fee", "amount", "note"}
+        updates: Dict[str, Any] = {}
+        raw_updates = payload.get("field_updates")
+        if isinstance(raw_updates, dict):
+            for key, value in raw_updates.items():
+                if key not in allowed_fields or value is None:
+                    continue
+                if key in {"quantity", "cost_price", "fee", "amount"}:
+                    number = to_float(value, None)
+                    if number is None or not math.isfinite(number):
+                        continue
+                    updates[key] = number
+                else:
+                    updates[key] = str(value).strip()
+        instrument_query = str(payload.get("instrument_query") or "").strip()[:100]
+        reason = str(payload.get("reason") or "").strip()[:200]
+        if not updates and not instrument_query:
+            return None
+        return {
+            "field_updates": updates,
+            "instrument_query": instrument_query,
+            "reason": reason,
+        }
+    except Exception:
+        return None
+
+
+async def apply_contextual_revision(
+    pending: Dict[str, Any],
+    instruction: str,
+) -> Optional[Dict[str, Any]]:
+    if not pending.get("changes") or len(pending.get("changes", [])) != 1:
+        return None
+    action_type = str(pending.get("action_type") or "add_or_update")
+    if action_type in {"multi_cash", "fx_exchange"}:
+        return None
+
+    llm_result = await resolve_revision_with_llm(pending, instruction)
+    updates = dict((llm_result or {}).get("field_updates") or {})
+    instrument_query = str((llm_result or {}).get("instrument_query") or "").strip()
+    is_position_action = action_type not in {"deposit", "withdraw", "set_cash"}
+    if is_position_action and not instrument_query:
+        cleaned = _clean_instrument_revision_text(instruction)
+        if cleaned and re.fullmatch(r"[A-Za-z0-9._\-\u4e00-\u9fff]{1,40}", cleaned):
+            instrument_query = cleaned
+    if not updates and not instrument_query:
+        return None
+
+    changes = [dict(change) for change in pending.get("changes", [])]
+    change = changes[0]
+    for key, value in updates.items():
+        if key == "currency":
+            value = normalize_currency_token(str(value)) or str(value).upper()
+        if key == "account":
+            value = normalize_account(str(value)) or str(value)
+        change[key] = value
+    if any(key in updates for key in {"quantity", "cost_price", "fee"}):
+        quantity = to_float(change.get("quantity"), None)
+        cost_price = to_float(change.get("cost_price"), None)
+        fee = to_float(change.get("fee"), 0.0) or 0.0
+        if quantity is not None and cost_price is not None:
+            change["total_cost"] = quantity * cost_price + fee
+    change["updated_at"] = utc_now_iso()
+
+    warnings = [
+        warning for warning in pending.get("warnings", [])
+        if "未能唯一确定标的" not in warning
+        and "联网找到多个候选" not in warning
+        and "请选择正确代码" not in warning
+        and "可能包含简称或错别字" not in warning
+    ]
+    candidates: List[Dict[str, Any]] = list(pending.get("instrument_candidates", []))
+
+    if instrument_query and is_position_action:
+        instruction_queries = contextual_instrument_queries(pending, instruction)
+        llm_queries = contextual_instrument_queries(pending, instrument_query)
+        extra_queries = list(dict.fromkeys(instruction_queries + llm_queries + [instrument_query]))
+        candidates, search_errors = await search_ranked_listed_candidates(
+            instrument_query,
+            extra_keywords=extra_queries,
+        )
+        ranking_query = instrument_query
+        instruction_etf_queries = [query for query in instruction_queries if "ETF" in query.upper()]
+        if instruction_etf_queries:
+            ranking_query = min(instruction_etf_queries, key=len)
+            candidates = InstrumentSearchService.rank_candidates(ranking_query, candidates)
+        chosen = InstrumentSearchService.choose_confident(candidates)
+        if chosen:
+            change["code"] = chosen["code"]
+            change["name"] = chosen["name"]
+            change["currency"] = chosen["currency"]
+            change["asset_type"] = chosen["asset_type"]
+            warnings.append(
+                f"已结合原确认卡和补充“{instruction}”推测为“{chosen['name']}”（{chosen['code']}）；请重新确认"
+            )
+        elif candidates:
+            change.pop("code", None)
+            preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
+            warnings.append(
+                f"结合原确认卡和补充“{instruction}”仍无法唯一确定标的：{preview}。请选择正确代码"
+            )
+        elif search_errors:
+            warnings.append(f"标的在线搜索暂时失败：{search_errors[0]}")
+        else:
+            warnings.append(f"未找到与“{instruction}”匹配的场内证券，请补充更完整的名称或代码")
+
+    change = PortfolioWriteService().normalize_position(change) if is_position_action else change
+    changes[0] = change
+    missing = build_missing(change, action_type)
+    parsed = {
+        "intent": "bookkeeping",
+        "summary": "已结合原确认卡应用补充信息，请重新确认",
+        "action_type": action_type,
+        "changes": changes,
+        "missing_fields": missing,
+        "warnings": list(dict.fromkeys(warnings)),
+        "instrument_candidates": candidates[:5],
+    }
+    if action_type == "sell":
+        parsed = enrich_sell_availability(parsed)
+    if action_type in {"deposit", "withdraw", "set_cash"}:
+        parsed = enrich_cash_availability(parsed)
+    return enrich_instrument_currency_consistency(parsed)
+
+
+async def enrich_with_online_instrument_search(
+    parsed: Dict[str, Any],
+    message: str,
+) -> Dict[str, Any]:
+    """Resolve a missing code from an instrument name before asking the user."""
+    if parsed.get("intent") != "bookkeeping" or not parsed.get("changes"):
+        return parsed
+    if parsed.get("action_type") in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
+        return parsed
+
+    change = dict(parsed["changes"][0])
+    if change.get("code"):
+        return parsed
+    keyword = str(change.get("name") or "").strip()
+    if not keyword:
+        return parsed
+
+    candidates, search_errors = await search_ranked_listed_candidates(keyword)
     if not candidates:
         if search_errors:
             warnings = list(parsed.get("warnings", []))
@@ -1796,6 +2032,8 @@ async def ai_revise(request: ReviseRequest):
     parsed = apply_direct_field_revision(pending, request.message)
     if parsed is None:
         parsed = apply_direct_code_revision(pending, request.message)
+    if parsed is None:
+        parsed = await apply_contextual_revision(pending, request.message)
     if parsed is None:
         parsed = parse_bookkeeping_message(request.message, previous=pending)
         parsed = await enrich_with_online_instrument_search(parsed, request.message)

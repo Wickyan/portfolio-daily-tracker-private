@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from backend.api.portfolio_ai import enrich_with_online_instrument_search, instrument_search_keywords, parse_bookkeeping_message
+from backend.api.portfolio_ai import apply_contextual_revision, contextual_instrument_queries, enrich_with_online_instrument_search, instrument_search_keywords, parse_bookkeeping_message
 from backend.services.instrument_search_service import InstrumentSearchService
 
 
@@ -159,6 +159,101 @@ class InstrumentSearchTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(enriched["changes"][0]["code"], "159513")
         self.assertNotIn("000834", str(enriched))
+
+
+    def test_contextual_queries_combine_short_issuer_with_existing_etf_theme(self) -> None:
+        pending = {
+            "changes": [{"name": "纳斯达克", "currency": "CNY"}],
+            "instrument_candidates": [
+                {"code": "159513", "name": "纳斯达克100ETF大成"},
+                {"code": "513100", "name": "纳指ETF国泰"},
+            ],
+        }
+        queries = contextual_instrument_queries(pending, "国泰")
+        self.assertIn("纳指ETF国泰", queries)
+
+    async def test_llm_context_revision_selects_guotai_and_preserves_other_fields(self) -> None:
+        pending = {
+            "action_type": "add_or_update",
+            "changes": [{
+                "account": "银河",
+                "name": "纳斯达克",
+                "currency": "CNY",
+                "asset_type": "stock",
+                "quantity": 12700.0,
+                "cost_price": 1.243,
+                "total_cost": 15786.1,
+            }],
+            "missing_fields": ["code"],
+            "warnings": ["旧候选提示"],
+            "instrument_candidates": [
+                {"code": "159513", "name": "纳斯达克100ETF大成", "currency": "CNY", "asset_type": "stock", "classify": "Fund", "score": 80},
+            ],
+        }
+        guotai = {
+            "code": "513100",
+            "name": "纳指ETF国泰",
+            "currency": "CNY",
+            "asset_type": "stock",
+            "score": 210,
+            "classify": "Fund",
+            "source": "test",
+        }
+
+        async def fake_search(_self, keyword: str, limit: int = 20):
+            return [guotai] if "国泰" in keyword else []
+
+        llm_patch = {
+            "field_updates": {},
+            "instrument_query": "纳指ETF国泰",
+            "reason": "用户强调基金管理人为国泰，其他字段保持不变",
+        }
+        with patch("backend.api.portfolio_ai.resolve_revision_with_llm", new=AsyncMock(return_value=llm_patch)), patch.object(InstrumentSearchService, "search", new=fake_search):
+            revised = await apply_contextual_revision(pending, "国泰")
+
+        self.assertIsNotNone(revised)
+        change = revised["changes"][0]
+        self.assertEqual(change["code"], "513100")
+        self.assertEqual(change["name"], "纳指ETF国泰")
+        self.assertEqual(change["account"], "银河")
+        self.assertEqual(change["quantity"], 12700)
+        self.assertEqual(change["cost_price"], 1.243)
+        self.assertAlmostEqual(change["total_cost"], 15786.1)
+        self.assertEqual(revised["missing_fields"], [])
+        self.assertTrue(any("结合原确认卡" in warning for warning in revised["warnings"]))
+
+    async def test_contextual_revision_has_deterministic_fallback_when_llm_is_unavailable(self) -> None:
+        pending = {
+            "action_type": "add_or_update",
+            "changes": [{
+                "account": "银河",
+                "name": "纳斯达克",
+                "currency": "CNY",
+                "asset_type": "stock",
+                "quantity": 12700.0,
+                "cost_price": 1.243,
+                "total_cost": 15786.1,
+            }],
+            "missing_fields": ["code"],
+            "warnings": [],
+            "instrument_candidates": [
+                {"code": "159513", "name": "纳斯达克100ETF大成", "currency": "CNY", "asset_type": "stock", "classify": "Fund", "score": 80},
+            ],
+        }
+        guotai = {
+            "code": "513100", "name": "纳指ETF国泰", "currency": "CNY",
+            "asset_type": "stock", "score": 210, "classify": "Fund", "source": "test",
+        }
+
+        async def fake_search(_self, keyword: str, limit: int = 20):
+            return [guotai] if "国泰" in keyword else []
+
+        with patch("backend.api.portfolio_ai.resolve_revision_with_llm", new=AsyncMock(return_value=None)), patch.object(InstrumentSearchService, "search", new=fake_search):
+            revised = await apply_contextual_revision(pending, "国泰")
+
+        self.assertEqual(revised["changes"][0]["code"], "513100")
+        self.assertEqual(revised["changes"][0]["name"], "纳指ETF国泰")
+        self.assertEqual(revised["missing_fields"], [])
 
 
 

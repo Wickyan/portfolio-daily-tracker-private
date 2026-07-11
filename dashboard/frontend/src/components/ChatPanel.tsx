@@ -29,6 +29,12 @@ function looksLikePendingRevision(pending: PendingAction, text: string): boolean
   if (!value || pending.requires_confirmation) return false
   if (missing.has('account') && /^(?:账户|券商|分组)?\s*(?:改成|改为|是|为|[:：])?\s*(?:长桥|哈富|IBKR|IB|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)$/i.test(value)) return true
   if (missing.has('code') && /^(?:代码|code)?\s*[:：]?\s*(?:[A-Za-z]{1,8}|\d{4,6})$/i.test(value)) return true
+  if (
+    missing.has('code')
+    && pending.changes?.[0]?.name
+    && !/[？?吗]$/.test(value)
+    && /^[A-Za-z0-9._\-一-鿿]{1,40}$/.test(value)
+  ) return true
   if (missing.has('currency') && /^(?:币种)?\s*(?:改成|改为|是|为|[:：])?\s*(?:人民币|人民币元|元|CNY|RMB|港币|港元|HKD|美元|美金|美刀|USD)$/i.test(value)) return true
   if (missing.has('quantity') && /^(?:数量)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+\s*(?:股|份|个)?$/i.test(value)) return true
   if ((missing.has('cost_price') || missing.has('cost_price_non_negative')) && /^(?:成本价|均价|成交价)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+$/i.test(value)) return true
@@ -58,6 +64,7 @@ function PendingActionCard({
 }) {
   const [reviseText, setReviseText] = useState('')
   const [isWorking, setIsWorking] = useState(false)
+  const [workError, setWorkError] = useState('')
   const changes: PendingChange[] = pending.changes?.length ? pending.changes : [{}]
   const change: PendingChange = changes[0]
 
@@ -75,8 +82,11 @@ function PendingActionCard({
 
   const run = async (fn: () => Promise<void>) => {
     setIsWorking(true)
+    setWorkError('')
     try {
       await fn()
+    } catch (error) {
+      setWorkError(getApiErrorMessage(error))
     } finally {
       setIsWorking(false)
     }
@@ -211,22 +221,18 @@ function PendingActionCard({
             placeholder="补充/修改信息"
             className="w-full rounded bg-slate-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
           />
+          {workError && (
+            <div className="text-sm text-red-300">修改失败：{workError}</div>
+          )}
+          {reviseText.trim() && (
+            <div className="text-xs text-slate-400">系统会结合当前确认卡理解这条补充，并生成一张新的确认卡。</div>
+          )}
           <div className="flex flex-wrap gap-2">
             <button
               onClick={() => run(async () => {
-                if (!reviseText.trim()) return
-                await onRevise(reviseText.trim())
-                setReviseText('')
-              })}
-              disabled={isWorking || !reviseText.trim()}
-              className="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600 disabled:opacity-50"
-            >
-              修改
-            </button>
-            <button
-              onClick={() => run(async () => {
-                if (reviseText.trim()) {
-                  await onRevise(reviseText.trim())
+                const revision = reviseText.trim()
+                if (revision) {
+                  await onRevise(revision)
                   setReviseText('')
                   return
                 }
@@ -235,7 +241,7 @@ function PendingActionCard({
               disabled={isWorking || (!pending.requires_confirmation && !reviseText.trim())}
               className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
             >
-              {reviseText.trim() ? '生成新确认卡' : '确认写入'}
+              {isWorking ? '处理中…' : (reviseText.trim() ? '应用修改并生成新卡' : '确认写入')}
             </button>
             <button
               onClick={() => run(onCancel)}
