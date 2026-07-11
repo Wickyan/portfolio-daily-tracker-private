@@ -164,13 +164,15 @@ class CopyCardFormatTest(unittest.TestCase):
         self.assertEqual(parsed["missing_fields"], [])
         self.assertEqual(len(parsed["changes"]), 2)
 
-    def test_mixed_position_and_cash_copy_is_rejected_as_one_operation(self) -> None:
+    def test_mixed_position_and_cash_copy_creates_independent_items(self) -> None:
         parsed = self.parse(
             "记账1：账户=银河；操作=买入；标的=比亚迪；代码=002594；币种=CNY；数量=1；成本价=100\n"
             "记账2：账户=银河；操作=增加现金；币种=CNY；金额=100"
         )
-        self.assertEqual(parsed["action_type"], "multiple_operations")
-        self.assertIn("multiple_operations", parsed["missing_fields"])
+        self.assertEqual(parsed["action_type"], "multi_records")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertEqual(len(parsed["changes"]), 2)
+        self.assertEqual([spec["action_type"] for spec in parsed["item_specs"]], ["add_or_update", "deposit"])
 
 
 class CopyCardConfirmFlowTest(unittest.TestCase):

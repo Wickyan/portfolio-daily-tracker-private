@@ -320,7 +320,18 @@ def build_pending_items(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
     parent_action = str(parsed.get("action_type") or "add_or_update")
     groups: List[tuple[str, List[Dict[str, Any]], List[int]]] = []
-    if parent_action == "fx_exchange":
+    item_specs = parsed.get("item_specs") if isinstance(parsed.get("item_specs"), list) else []
+    if item_specs:
+        for spec in item_specs:
+            source_indexes = [
+                int(index) for index in spec.get("source_indexes", [])
+                if isinstance(index, int) and 0 <= index < len(changes)
+            ]
+            if not source_indexes:
+                continue
+            action_type = str(spec.get("action_type") or changes[source_indexes[0]].get("action_type") or parent_action)
+            groups.append((action_type, [changes[index] for index in source_indexes], source_indexes))
+    elif parent_action == "fx_exchange":
         groups.append(("fx_exchange", changes, list(range(len(changes)))))
     else:
         for index, change in enumerate(changes):
@@ -892,6 +903,7 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
             rf"(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)\s*({asset_token})",
             rf"(?:买了|买入|新增|添加|卖了|卖出)\s*({asset_token})\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
             rf"({asset_token}?)(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
+            rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)\s*({asset_token})(?=[，,\s]|$)",
             rf"({asset_token}?)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
         ]
         for pattern in patterns:
@@ -1046,6 +1058,17 @@ def resolve_sell_account(
 
     warnings.append("当前账户中未找到该持仓，暂不支持卖空")
     return None, []
+
+
+def explicit_position_action(message: str) -> Optional[str]:
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(message or "")))
+    if re.search(r"(?:卖了|卖出|减持|清仓|全卖|卖光|卖掉)", text):
+        return "sell"
+    if re.search(r"(?:账户里有|账户中有|现在持有|目前持有|当前持有|现有持仓|当前持仓|更新持仓|设置持仓|持仓(?:是|为|改为|改成|更新为|设置为)|剩下|还剩|剩余)", text):
+        return "set_position"
+    if re.search(r"(?:买了|买入|加仓|补仓|刚买|本次买|新增|添加)", text):
+        return "add_or_update"
+    return None
 
 
 def infer_action(message: str) -> str:
@@ -1404,6 +1427,7 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
     service = PortfolioWriteService()
     changes: List[Dict[str, Any]] = []
     action_types: List[str] = []
+    item_specs: List[Dict[str, Any]] = []
     warnings: List[str] = ["已按可编辑复制格式重新生成确认卡；请核对后再写入"]
 
     action_aliases = {
@@ -1431,6 +1455,7 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
             return None
         action_types.append(action_type)
         account = normalize_account(fields.get("账户")) if fields.get("账户") else None
+        source_start = len(changes)
 
         if action_type == "fx_exchange":
             source_amount, source_currency = _parse_amount_currency_pair(fields.get("换出", ""))
@@ -1457,6 +1482,10 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
                 {key: value for key, value in change.items() if value is not None}
                 for change in fx_changes
             ])
+            item_specs.append({
+                "action_type": "fx_exchange",
+                "source_indexes": list(range(source_start, len(changes))),
+            })
             continue
 
         if action_type in {"deposit", "withdraw", "set_cash"}:
@@ -1471,6 +1500,7 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
                 "source": "copy",
             }
             changes.append({key: value for key, value in change.items() if value is not None})
+            item_specs.append({"action_type": action_type, "source_indexes": [source_start]})
             continue
 
         raw_code = fields.get("代码", "")
@@ -1496,28 +1526,38 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
         }
         raw_change = {key: value for key, value in raw_change.items() if value not in (None, "")}
         changes.append(service.normalize_position(raw_change))
+        item_specs.append({"action_type": action_type, "source_indexes": [source_start]})
 
+    unique_actions = set(action_types)
+    position_actions = {"add_or_update", "sell", "set_position"}
+    cash_actions = {"deposit", "withdraw", "set_cash"}
     if action_types == ["fx_exchange"]:
         action_type = "fx_exchange"
-    elif len(action_types) > 1 and all(item in {"deposit", "withdraw", "set_cash"} for item in action_types):
-        action_type = "multi_cash"
-        warnings.append("多条现金记录将作为同一个原子操作一起写入或一起失败")
-    elif len(set(action_types)) == 1:
+    elif unique_actions.issubset(cash_actions):
+        action_type = "multi_cash" if len(action_types) > 1 else action_types[0]
+        if len(action_types) > 1:
+            warnings.append("多条现金记录将作为同一个原子操作一起写入或一起失败")
+    elif unique_actions.issubset(position_actions):
+        action_type = next(iter(unique_actions)) if len(unique_actions) == 1 else "multi_position"
+    elif len(action_types) == 1:
         action_type = action_types[0]
     else:
-        return {
-            "intent": "bookkeeping",
-            "summary": "复制文本中包含多种不同操作，请拆成多条提交",
-            "action_type": "multiple_operations",
-            "changes": [],
-            "missing_fields": ["multiple_operations"],
-            "warnings": ["为避免错配，请将不同类型的记录拆开提交"],
-        }
+        action_type = "multi_records"
 
-    missing = collect_missing_fields(changes, action_type)
-    if action_type == "fx_exchange" and len(changes) >= 2:
-        source = changes[0]
-        target = changes[1]
+    missing: List[str] = []
+    for spec in item_specs:
+        indexes = spec.get("source_indexes", [])
+        item_changes = [changes[index] for index in indexes]
+        missing.extend(collect_missing_fields(item_changes, str(spec.get("action_type") or action_type)))
+
+    for spec in item_specs:
+        if spec.get("action_type") != "fx_exchange":
+            continue
+        indexes = spec.get("source_indexes", [])
+        if len(indexes) < 2:
+            continue
+        source = changes[indexes[0]]
+        target = changes[indexes[1]]
         source_currency = str(source.get("currency") or "").upper()
         target_currency = str(target.get("currency") or "").upper()
         source_amount = to_float(source.get("amount"), None)
@@ -1546,6 +1586,7 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
         "summary": "已识别复制的可编辑记账文本",
         "action_type": action_type,
         "changes": changes,
+        "item_specs": item_specs,
         "missing_fields": list(dict.fromkeys(missing)),
         "warnings": list(dict.fromkeys(warnings)),
     })
@@ -1695,75 +1736,127 @@ def parse_bookkeeping_message(
             if len(actionable) == 1:
                 return actionable[0]
             if len(actionable) > 1:
-                cash_actions = {"deposit", "withdraw", "set_cash"}
-                if all(parsed.get("action_type") in cash_actions and len(parsed.get("changes", [])) == 1 for parsed in actionable):
+                position_actions = {"add_or_update", "sell", "set_position"}
+                supported_actions = position_actions | {"deposit", "withdraw", "set_cash", "fx_exchange"}
+
+                # A leading explicit position verb/state applies to following
+                # shorthand rows until another explicit operation changes it.
+                inherited_position_action: Optional[str] = None
+                inherited_account: Optional[str] = None
+                normalized_actionable: List[tuple[int, Dict[str, Any]]] = []
+                for clause_index, (clause, parsed) in enumerate(zip(clauses, parsed_clauses)):
+                    if parsed.get("intent") != "bookkeeping":
+                        continue
+                    parsed = deepcopy(parsed)
+                    parsed_action = str(parsed.get("action_type") or "")
+                    explicit_action = explicit_position_action(clause)
+                    if parsed_action in position_actions:
+                        effective_action = explicit_action or inherited_position_action or parsed_action
+                        if explicit_action:
+                            inherited_position_action = explicit_action
+                        elif inherited_position_action and effective_action != parsed_action:
+                            warnings = list(parsed.get("warnings", []))
+                            warnings.append(
+                                f"沿用上一条持仓操作语义：{_item_summary(effective_action, parsed.get('changes', []), clause_index)}；请核对"
+                            )
+                            parsed["warnings"] = warnings
+                        parsed["action_type"] = effective_action
+                        for change in parsed.get("changes", []):
+                            change["action_type"] = effective_action
+                    normalized_actionable.append((clause_index, parsed))
+
+                action_types = {
+                    str(parsed.get("action_type") or "")
+                    for _, parsed in normalized_actionable
+                }
+                if action_types and action_types.issubset(supported_actions):
                     combined_changes: List[Dict[str, Any]] = []
                     combined_warnings: List[str] = []
-                    inherited_account: Optional[str] = None
-                    for parsed in actionable:
-                        change = dict(parsed["changes"][0])
-                        if not change.get("account") and inherited_account:
-                            change["account"] = inherited_account
-                        if change.get("account"):
-                            inherited_account = str(change["account"])
-                        combined_changes.append(change)
-                        combined_warnings.extend(parsed.get("warnings", []))
-                    return {
-                        "intent": "bookkeeping",
-                        "summary": f"识别到{len(combined_changes)}条待确认账户现金信息",
-                        "action_type": "multi_cash",
-                        "changes": combined_changes,
-                        "missing_fields": collect_missing_fields(combined_changes, "multi_cash"),
-                        "warnings": list(dict.fromkeys(combined_warnings + ["多条现金变化将作为同一个原子操作一起写入或一起失败"])),
-                    }
+                    item_specs: List[Dict[str, Any]] = []
+                    combined_missing: List[str] = []
 
-                position_actions = {"add_or_update", "sell", "set_position"}
-                action_types = {str(parsed.get("action_type") or "") for parsed in actionable}
-                if (
-                    action_types.issubset(position_actions)
-                    and all(len(parsed.get("changes", [])) == 1 for parsed in actionable)
-                ):
-                    combined_action = next(iter(action_types)) if len(action_types) == 1 else "multi_position"
-                    combined_changes = []
-                    combined_warnings = []
-                    inherited_account = None
-                    for index, parsed in enumerate(actionable):
-                        change = dict(parsed["changes"][0])
-                        if not change.get("account") and inherited_account:
-                            change["account"] = inherited_account
+                    for item_index, (_clause_index, parsed) in enumerate(normalized_actionable):
+                        item_action = str(parsed.get("action_type") or "")
+                        item_changes = [dict(change) for change in parsed.get("changes", [])]
+                        if not item_changes:
+                            continue
+                        for change in item_changes:
+                            if not change.get("account") and inherited_account:
+                                change["account"] = inherited_account
+                            if change.get("account"):
+                                inherited_account = str(change["account"])
+                        if not any(change.get("account") for change in parsed.get("changes", [])) and inherited_account:
                             combined_warnings.append(
-                                f"第{index + 1}条未单独填写账户，沿用上一条账户{inherited_account}；请核对"
+                                f"第{item_index + 1}条未单独填写账户，沿用上一条账户{inherited_account}；请核对"
                             )
-                        if change.get("account"):
-                            inherited_account = str(change["account"])
-                        combined_changes.append(change)
-                        combined_warnings.extend(parsed.get("warnings", []))
-                    if len(action_types) == 1:
-                        action_label = {
-                            "add_or_update": "买入",
-                            "sell": "卖出",
-                            "set_position": "更新持仓",
-                        }.get(combined_action, "持仓")
-                        summary = f"识别到{len(combined_changes)}条待确认{action_label}记录"
+
+                        source_start = len(combined_changes)
+                        combined_changes.extend(item_changes)
+                        source_indexes = list(range(source_start, source_start + len(item_changes)))
+                        item_specs.append({
+                            "action_type": item_action,
+                            "source_indexes": source_indexes,
+                        })
+                        combined_missing.extend(collect_missing_fields(item_changes, item_action))
+                        combined_missing.extend(
+                            field for field in parsed.get("missing_fields", [])
+                            if field in {
+                                "invalid_number", "distinct_currencies",
+                                "source_amount/currency", "target_amount/currency",
+                                "multiple_operations", "unparsed_record",
+                            }
+                        )
+                        for warning in parsed.get("warnings", []):
+                            warning_text = str(warning)
+                            combined_warnings.append(
+                                warning_text if warning_text.startswith(f"第{item_index + 1}条")
+                                else f"第{item_index + 1}条{warning_text}"
+                            )
+
+                    cash_actions = {"deposit", "withdraw", "set_cash"}
+                    if action_types.issubset(cash_actions):
+                        parent_action = "multi_cash"
+                        summary = f"识别到{len(item_specs)}条待确认账户现金信息"
+                    elif action_types.issubset(position_actions):
+                        parent_action = next(iter(action_types)) if len(action_types) == 1 else "multi_position"
+                        if len(action_types) == 1:
+                            label = {
+                                "add_or_update": "买入",
+                                "sell": "卖出",
+                                "set_position": "更新持仓",
+                            }.get(parent_action, "持仓")
+                            summary = f"识别到{len(item_specs)}条待确认{label}记录"
+                        else:
+                            summary = f"识别到{len(item_specs)}条不同持仓操作"
                     else:
-                        summary = f"识别到{len(combined_changes)}条不同持仓操作"
-                    return enrich_instrument_currency_consistency({
+                        parent_action = "multi_records"
+                        summary = f"识别到{len(item_specs)}条不同类型的账户记录"
+
+                    general_warnings = [
+                        f"已分别解析为{len(item_specs)}个可独立确认、修改和撤回的子项"
+                    ]
+                    if action_types.issubset(position_actions):
+                        general_warnings.append(f"已分别解析为{len(item_specs)}条持仓记录，请逐条核对操作类型")
+                    if action_types.issubset(cash_actions):
+                        general_warnings.append("多条现金变化将按用户顺序作为原子操作一起写入或一起失败")
+                    result = {
                         "intent": "bookkeeping",
                         "summary": summary,
-                        "action_type": combined_action,
+                        "action_type": parent_action,
                         "changes": combined_changes,
-                        "missing_fields": collect_missing_fields(combined_changes, combined_action),
-                        "warnings": list(dict.fromkeys(combined_warnings + [
-                            f"已分别解析为{len(combined_changes)}条持仓记录，请逐条核对操作类型"
-                        ])),
-                    })
+                        "item_specs": item_specs,
+                        "missing_fields": list(dict.fromkeys(combined_missing)),
+                        "warnings": list(dict.fromkeys(combined_warnings + general_warnings)),
+                    }
+                    return enrich_instrument_currency_consistency(result)
+
                 return {
                     "intent": "bookkeeping",
-                    "summary": "一条消息中识别到多笔不同类型的操作",
+                    "summary": "一条消息中包含暂不支持合并的操作",
                     "action_type": "multiple_operations",
                     "changes": [],
                     "missing_fields": ["multiple_operations"],
-                    "warnings": ["为避免漏记或错配，请将不同类型的交易拆成多条消息提交"],
+                    "warnings": ["为避免漏记或错配，请将这几种操作拆开后重新提交"],
                 }
 
     action_type = action_probe

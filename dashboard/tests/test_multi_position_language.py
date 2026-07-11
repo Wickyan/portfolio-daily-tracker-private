@@ -122,13 +122,14 @@ class MultiPositionLanguageParseTest(unittest.TestCase):
         self.assertEqual(changes[0]["account"], "银河")
         self.assertEqual(changes[1]["account"], "IBKR")
 
-    def test_buy_and_cash_remain_blocked_as_mixed_operations(self) -> None:
+    def test_buy_and_cash_create_independent_batch_items(self) -> None:
         parsed = parse_bookkeeping_message(
             "银河增加100元；长桥买入2股苹果，均价200美元"
         )
-        self.assertEqual(parsed["action_type"], "multiple_operations")
-        self.assertIn("multiple_operations", parsed["missing_fields"])
-        self.assertEqual(parsed["changes"], [])
+        self.assertEqual(parsed["action_type"], "multi_records")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertEqual([change["action_type"] for change in parsed["changes"]], ["deposit", "add_or_update"])
+        self.assertEqual([spec["action_type"] for spec in parsed["item_specs"]], ["deposit", "add_or_update"])
 
     def test_buy_and_sell_can_share_one_position_batch(self) -> None:
         parsed = parse_bookkeeping_message(

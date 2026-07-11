@@ -144,11 +144,12 @@ class UserSimulationTest(unittest.TestCase):
         self.assertIn("available_cash", blocked["missing_fields"])
         self.assertFalse(blocked["requires_confirmation"])
 
-    def test_mixed_operations_are_not_silently_truncated(self) -> None:
+    def test_mixed_operations_are_kept_as_independent_items(self) -> None:
         parsed = parse_bookkeeping_message("IBKR买入1股苹果均价200美元，银河增加100元")
-        self.assertEqual(parsed["action_type"], "multiple_operations")
-        self.assertIn("multiple_operations", parsed["missing_fields"])
-        self.assertEqual(parsed["changes"], [])
+        self.assertEqual(parsed["action_type"], "multi_records")
+        self.assertEqual(parsed["missing_fields"], [])
+        self.assertEqual(len(parsed["changes"]), 2)
+        self.assertEqual([spec["action_type"] for spec in parsed["item_specs"]], ["add_or_update", "deposit"])
 
     def test_cash_revision_language_corpus(self) -> None:
         cases = [
