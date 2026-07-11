@@ -246,23 +246,18 @@ export default function ChatPanel() {
   const {
     messages,
     isLoading,
-    currentResponse,
     addMessage,
     setMessages,
     setLoading,
-    setCurrentResponse,
-    appendToCurrentResponse,
-    setSuggestions,
-    setRisks,
     clearMessages,
   } = useAppStore()
 
   // 自动滚动到底部
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, currentResponse])
+  }, [messages])
 
-  // 页面刷新后恢复当前聊天，并向后端校准pending状态。
+  // 页面刷新后恢复当前记账记录，并向后端校准pending状态。
   useEffect(() => {
     const pendingEntries = messages
       .map((message, index) => ({ index, pending: message.pendingAction }))
@@ -372,15 +367,15 @@ export default function ChatPanel() {
     }
   }, [handleImageFile])
 
-  // 开始新对话
+  // 清空当前记账记录
   const handleNewConversation = async () => {
-    if (window.confirm('确定要开始新对话吗？当前对话将被清空（但已保存到历史记录中）')) {
+    if (window.confirm('确定要清空当前记账记录吗？已写入Portfolio的数据不会受影响。')) {
       try {
         await chatService.clearHistory()
         clearMessages()
       } catch (error) {
         console.error('Failed to start new conversation:', error)
-        alert('开始新对话失败')
+        alert('清空记账记录失败')
       }
     }
   }
@@ -549,7 +544,6 @@ export default function ChatPanel() {
     })
 
     setLoading(true)
-    setCurrentResponse('')
 
     try {
       if (currentImages.length > 0) {
@@ -570,17 +564,11 @@ export default function ChatPanel() {
         } else {
           addMessage({
             role: 'assistant',
-            content: response.response,
+            content: '未能从图片中生成可确认的记账卡。请补充账户、标的/代码、数量、成本价或现金币种与金额后重新提交。',
           })
         }
 
-        // 更新建议和风险
-        if (response.suggestions) {
-          setSuggestions(response.suggestions)
-        }
-        if (response.risks) {
-          setRisks(response.risks)
-        }
+        // 图片模型仅负责提取记账信息；本页面不展示投资建议或普通聊天内容。
 
         // 如果有持仓导入，刷新持仓数据
         if (response.imported_positions && response.imported_positions > 0) {
@@ -597,40 +585,14 @@ export default function ChatPanel() {
           return
         }
 
-        // 普通文本消息默认流式返回
-        let streamedResponse = ''
-        await chatService.streamMessage(
-          userMessage,
-          (chunk) => {
-            streamedResponse += chunk
-            appendToCurrentResponse(chunk)
-          },
-          () => {}
-        )
-
+        // 本页面是专用记账入口，不再把未识别内容转发到通用聊天模型。
+        const reason = preview.summary && !preview.summary.includes('普通聊天')
+          ? `：${preview.summary}`
+          : ''
         addMessage({
           role: 'assistant',
-          content: streamedResponse,
+          content: `未生成记账确认卡${reason}。本页面只处理已经发生的持仓、现金和换汇记录，请补充明确的账户、标的、数量、价格或币种金额。`,
         })
-        setCurrentResponse('')
-        setLoading(false)
-
-        // 在回复已展示后，异步提取建议/风险/记忆
-        void chatService.extractResponse(userMessage, streamedResponse)
-          .then((result) => {
-            if (result.suggestions) {
-              setSuggestions(result.suggestions)
-            }
-            if (result.risks) {
-              setRisks(result.risks)
-            }
-            if (result.imported_positions && result.imported_positions > 0) {
-              queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-            }
-          })
-          .catch((extractError) => {
-            console.error('Extraction error:', extractError)
-          })
         return
       }
     } catch (error) {
@@ -641,7 +603,6 @@ export default function ChatPanel() {
       })
     } finally {
       setLoading(false)
-      setCurrentResponse('')
     }
   }
 
@@ -807,14 +768,14 @@ export default function ChatPanel() {
         <div className="flex items-center space-x-2">
           <MessageSquare className="h-5 w-5 text-slate-400" />
           <span className="text-sm font-medium text-slate-300">
-            {messages.length > 0 ? `对话中 (${messages.length} 条消息)` : '准备开始对话'}
+            {messages.length > 0 ? `记账记录 (${messages.length} 条消息)` : '准备记账'}
           </span>
         </div>
         <div className="flex items-center space-x-2">
           <button
             onClick={() => setShowHistory(true)}
             className="flex items-center space-x-1.5 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors"
-            title="查看历史对话"
+            title="查看历史记账记录"
           >
             <History className="h-4 w-4" />
             <span>历史</span>
@@ -823,10 +784,10 @@ export default function ChatPanel() {
             onClick={handleNewConversation}
             disabled={messages.length === 0}
             className="flex items-center space-x-1.5 px-3 py-1.5 text-sm bg-primary-600 hover:bg-primary-500 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed rounded-lg transition-colors"
-            title="开始新对话"
+            title="清空当前记账记录"
           >
             <PlusCircle className="h-4 w-4" />
-            <span>新对话</span>
+            <span>清空记录</span>
           </button>
         </div>
       </div>
@@ -836,29 +797,19 @@ export default function ChatPanel() {
         {messages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-slate-400">
             <div className="text-center">
-              <p className="text-lg">开始与交易助手对话</p>
+              <p className="text-lg">开始记录持仓或现金变化</p>
               <p className="mt-2 text-sm">
-                我可以帮你分析市场、管理持仓、提供交易建议
+                例如：银河增加2万元；长桥买入100股苹果，均价200美元
               </p>
               <p className="mt-4 text-xs text-slate-500">
-                提示：可以直接拖拽图片到这里上传
+                也可以拖拽或粘贴券商持仓截图生成待确认记账卡
               </p>
             </div>
           </div>
         ) : (
           <>
             {messages.map(renderMessage)}
-            {/* 流式回复 */}
-            {currentResponse && (
-              <div className="flex justify-start mb-4">
-                <div className="max-w-[80%] rounded-lg px-4 py-3 bg-slate-700 text-slate-100">
-                  <div className="prose prose-invert max-w-none prose-td:border prose-td:border-slate-600 prose-th:border prose-th:border-slate-600 prose-th:bg-slate-800 prose-table:w-auto overflow-x-auto">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{currentResponse}</ReactMarkdown>
-                  </div>
-                </div>
-              </div>
-            )}
-            {isLoading && !currentResponse && (
+            {isLoading && (
               <div className="flex justify-start mb-4">
                 <div className="rounded-lg px-4 py-3 bg-slate-700">
                   <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
@@ -925,7 +876,7 @@ export default function ChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
-            placeholder="输入消息...（可拖拽或 Ctrl+V 粘贴图片）"
+            placeholder="输入已发生的持仓/现金/换汇记录…（支持拖拽或Ctrl+V粘贴图片）"
             className="flex-1 input-field"
             disabled={isLoading}
           />
@@ -939,7 +890,7 @@ export default function ChatPanel() {
         </div>
       </form>
 
-      {/* 历史对话模态框 */}
+      {/* 历史记账记录模态框 */}
       <ConversationHistory
         isOpen={showHistory}
         onClose={() => setShowHistory(false)}
