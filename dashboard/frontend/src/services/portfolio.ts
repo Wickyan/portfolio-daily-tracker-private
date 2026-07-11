@@ -87,6 +87,31 @@ export const portfolioService = {
     return response.data
   },
 
+  async aiReviseItem(pendingId: string, itemId: string, message: string) {
+    const response = await api.post('/portfolio/ai-revise-item', {
+      pending_id: pendingId,
+      item_id: itemId,
+      message,
+    })
+    return response.data
+  },
+
+  async aiConfirmItem(pendingId: string, itemId: string) {
+    const response = await api.post('/portfolio/ai-confirm-item', {
+      pending_id: pendingId,
+      item_id: itemId,
+    })
+    return response.data
+  },
+
+  async aiRollbackItem(pendingId: string, itemId: string) {
+    const response = await api.post('/portfolio/ai-rollback-item', {
+      pending_id: pendingId,
+      item_id: itemId,
+    })
+    return response.data
+  },
+
   async aiCancel(pendingId: string) {
     const response = await api.post('/portfolio/ai-cancel', { pending_id: pendingId })
     return response.data

@@ -153,18 +153,41 @@ export interface InstrumentCandidate {
   change_index?: number
 }
 
+export interface PendingItem {
+  item_id: string
+  index: number
+  summary?: string
+  action_type?: string
+  changes: PendingChange[]
+  missing_fields: string[]
+  warnings: string[]
+  instrument_candidates?: InstrumentCandidate[]
+  revision_options?: RevisionOption[]
+  revision_diffs?: RevisionDiff[]
+  status?: string
+  requires_confirmation: boolean
+  operation_id?: string | null
+  version?: number
+}
+
 export interface PendingAction {
   ok: boolean
   pending_id?: string
   summary: string
   action_type?: string
   changes: PendingChange[]
+  items?: PendingItem[]
   missing_fields: string[]
   warnings: string[]
   requires_confirmation: boolean
   intent?: 'bookkeeping' | 'chat_only' | string
   status?: string
-  operation_id?: string
+  operation_id?: string | null
+  operation_ids?: string[]
+  can_confirm_all?: boolean
+  pending_item_count?: number
+  confirmed_item_count?: number
+  rolled_back_item_count?: number
   instrument_candidates?: InstrumentCandidate[]
   revision_options?: RevisionOption[]
   revision_diffs?: RevisionDiff[]

@@ -7,7 +7,7 @@ import { useAppStore } from '@/store'
 import { chatService, portfolioService } from '@/services'
 import { getApiErrorMessage } from '@/services/chat'
 import ConversationHistory from './ConversationHistory'
-import type { ChatMessage, PendingAction, PendingChange } from '@/types'
+import type { ChatMessage, PendingAction, PendingItem } from '@/types'
 
 const TERMINAL_PENDING_STATUSES = new Set(['confirmed', 'cancelled', 'rolled_back', 'expired', 'superseded'])
 
@@ -57,41 +57,73 @@ function compactCopyNumber(value?: number | null): string {
   return String(value)
 }
 
-function formatPendingForClipboard(pending: PendingAction): string {
-  const changes = pending.changes || []
-  const actionLabels: Record<string, string> = {
-    add_or_update: '买入',
-    sell: '卖出',
-    deposit: '增加现金',
-    withdraw: '减少现金',
-    set_cash: '设置现金余额',
-  }
+const ACTION_LABELS: Record<string, string> = {
+  add_or_update: '买入/加仓',
+  sell: '卖出/减仓',
+  set_position: '更新当前持仓',
+  deposit: '增加现金',
+  withdraw: '减少现金',
+  set_cash: '设置现金余额',
+  fx_exchange: '换汇',
+}
 
-  if (pending.action_type === 'fx_exchange' && changes.length >= 2) {
-    const source = changes.find((item) => item.action_type === 'withdraw') || changes[0]
-    const target = changes.find((item) => item.action_type === 'deposit') || changes[1]
+const COPY_ACTION_LABELS: Record<string, string> = {
+  add_or_update: '买入',
+  sell: '卖出',
+  set_position: '更新持仓',
+  deposit: '增加现金',
+  withdraw: '减少现金',
+  set_cash: '设置现金余额',
+  fx_exchange: '换汇',
+}
+
+function formatItemForClipboard(item: PendingItem, prefix = '记账：'): string {
+  const changes = item.changes || []
+  if (item.action_type === 'fx_exchange' && changes.length >= 2) {
+    const source = changes.find((change) => change.action_type === 'withdraw') || changes[0]
+    const target = changes.find((change) => change.action_type === 'deposit') || changes[1]
     const account = source.account || target.account || ''
-    return `记账：账户=${account}；操作=换汇；换出=${compactCopyNumber(source.amount)}${source.currency || ''}；换入=${compactCopyNumber(target.amount)}${target.currency || ''}`
+    return `${prefix}账户=${account}；操作=换汇；换出=${compactCopyNumber(source.amount)}${source.currency || ''}；换入=${compactCopyNumber(target.amount)}${target.currency || ''}`
   }
 
-  return changes.map((item, index) => {
-    const action = item.action_type || pending.action_type || 'add_or_update'
-    const prefix = changes.length > 1 ? `记账${index + 1}：` : '记账：'
-    const fields = [`账户=${item.account || ''}`, `操作=${actionLabels[action] || action}`]
-    if (['deposit', 'withdraw', 'set_cash'].includes(action)) {
-      fields.push(`币种=${item.currency || ''}`, `金额=${compactCopyNumber(item.amount)}`)
-    } else {
-      fields.push(
-        `标的=${item.name || ''}`,
-        `代码=${item.code || ''}`,
-        `币种=${item.currency || ''}`,
-        `数量=${compactCopyNumber(item.quantity)}`,
-        `${action === 'sell' ? '成交价' : '成本价'}=${compactCopyNumber(item.cost_price)}`,
-      )
-      if (item.fee !== undefined && item.fee !== null) fields.push(`手续费=${compactCopyNumber(item.fee)}`)
-    }
-    return `${prefix}${fields.join('；')}`
-  }).join('\n')
+  const change = changes[0] || {}
+  const action = change.action_type || item.action_type || 'add_or_update'
+  const fields = [`账户=${change.account || ''}`, `操作=${COPY_ACTION_LABELS[action] || action}`]
+  if (['deposit', 'withdraw', 'set_cash'].includes(action)) {
+    fields.push(`币种=${change.currency || ''}`, `金额=${compactCopyNumber(change.amount)}`)
+  } else {
+    fields.push(
+      `标的=${change.name || ''}`,
+      `代码=${change.code || ''}`,
+      `币种=${change.currency || ''}`,
+      `数量=${compactCopyNumber(change.quantity)}`,
+      `${action === 'sell' ? '成交价' : '成本价'}=${compactCopyNumber(change.cost_price)}`,
+    )
+    if (change.fee !== undefined && change.fee !== null) fields.push(`手续费=${compactCopyNumber(change.fee)}`)
+  }
+  return `${prefix}${fields.join('；')}`
+}
+
+function formatPendingForClipboard(pending: PendingAction): string {
+  const items = pending.items || []
+  if (items.length > 0) {
+    return items
+      .map((item, index) => formatItemForClipboard(item, items.length > 1 ? `记账${index + 1}：` : '记账：'))
+      .join('\n')
+  }
+  const legacyItems: PendingItem[] = (pending.changes || []).map((change, index) => ({
+    item_id: `legacy-${index}`,
+    index,
+    action_type: change.action_type || pending.action_type,
+    changes: [change],
+    missing_fields: pending.missing_fields || [],
+    warnings: pending.warnings || [],
+    requires_confirmation: pending.requires_confirmation,
+    status: pending.status,
+  }))
+  return legacyItems
+    .map((item, index) => formatItemForClipboard(item, legacyItems.length > 1 ? `记账${index + 1}：` : '记账：'))
+    .join('\n')
 }
 
 async function copyTextWithFallback(text: string): Promise<void> {
@@ -111,35 +143,96 @@ async function copyTextWithFallback(text: string): Promise<void> {
   if (!copied) throw new Error('浏览器未允许复制，请长按文本手动复制')
 }
 
-function PendingActionCard({
-  pending,
+function actionTheme(actionType?: string) {
+  switch (actionType) {
+    case 'add_or_update':
+    case 'deposit':
+      return {
+        card: 'border-emerald-500/55 bg-emerald-950/55',
+        title: 'text-emerald-200',
+        soft: 'bg-emerald-900/40 text-emerald-100',
+        button: 'bg-emerald-600 hover:bg-emerald-500',
+      }
+    case 'sell':
+    case 'withdraw':
+      return {
+        card: 'border-red-500/55 bg-red-950/55',
+        title: 'text-red-200',
+        soft: 'bg-red-900/40 text-red-100',
+        button: 'bg-red-600 hover:bg-red-500',
+      }
+    case 'set_position':
+      return {
+        card: 'border-sky-500/55 bg-sky-950/55',
+        title: 'text-sky-200',
+        soft: 'bg-sky-900/40 text-sky-100',
+        button: 'bg-sky-600 hover:bg-sky-500',
+      }
+    case 'set_cash':
+      return {
+        card: 'border-cyan-500/55 bg-cyan-950/55',
+        title: 'text-cyan-200',
+        soft: 'bg-cyan-900/40 text-cyan-100',
+        button: 'bg-cyan-600 hover:bg-cyan-500',
+      }
+    case 'fx_exchange':
+      return {
+        card: 'border-violet-500/55 bg-violet-950/55',
+        title: 'text-violet-200',
+        soft: 'bg-violet-900/40 text-violet-100',
+        button: 'bg-violet-600 hover:bg-violet-500',
+      }
+    default:
+      return {
+        card: 'border-amber-500/55 bg-amber-950/45',
+        title: 'text-amber-200',
+        soft: 'bg-amber-900/40 text-amber-100',
+        button: 'bg-amber-600 hover:bg-amber-500',
+      }
+  }
+}
+
+const MISSING_LABELS: Record<string, string> = {
+  account: '账户',
+  amount: '金额',
+  positive_amount: '金额必须大于0',
+  amount_non_negative: '余额不能为负',
+  positive_quantity: '数量必须大于0',
+  cost_price_non_negative: '成本价不能为负',
+  unsupported_currency: '暂仅支持CNY/USD/HKD',
+  currency_conflict: '代码与币种不匹配',
+  invalid_number: '数字格式无效',
+  multiple_operations: '请拆分不同类型的操作',
+  unparsed_record: '有记录未完整识别',
+  existing_position: '未找到对应持仓',
+  available_quantity: '卖出数量超过现有持仓',
+  available_cash: '可用现金不足',
+  distinct_currencies: '换出和换入币种必须不同',
+  'source_amount/currency': '换出金额和币种',
+  'target_amount/currency': '换入金额和币种',
+}
+
+function PendingItemCard({
+  item,
+  totalItems,
   onRevise,
   onConfirm,
   onRollback,
 }: {
-  pending: PendingAction
+  item: PendingItem
+  totalItems: number
   onRevise: (message: string) => Promise<void>
   onConfirm: () => Promise<void>
-  onRollback?: () => Promise<void>
+  onRollback: () => Promise<void>
 }) {
+  const [isEditing, setIsEditing] = useState(false)
   const [reviseText, setReviseText] = useState('')
   const [isWorking, setIsWorking] = useState(false)
   const [workError, setWorkError] = useState('')
   const [copied, setCopied] = useState(false)
-  const changes: PendingChange[] = pending.changes?.length ? pending.changes : [{}]
-  const change: PendingChange = changes[0]
-
-  const field = (label: string, value?: string | number | null) => {
-    const displayValue = typeof value === 'number'
-      ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 8 }).format(value)
-      : value
-    return (
-      <div className="flex justify-between gap-4 border-b border-slate-700/60 py-1.5 text-sm">
-        <span className="text-slate-400">{label}</span>
-        <span className="text-right font-medium">{displayValue === undefined || displayValue === null || displayValue === '' ? '缺失' : displayValue}</span>
-      </div>
-    )
-  }
+  const theme = actionTheme(item.action_type)
+  const changes = item.changes?.length ? item.changes : [{}]
+  const status = item.status || 'pending'
 
   const run = async (fn: () => Promise<void>) => {
     setIsWorking(true)
@@ -153,10 +246,289 @@ function PendingActionCard({
     }
   }
 
+  const field = (label: string, value?: string | number | null) => {
+    const displayValue = typeof value === 'number'
+      ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 8 }).format(value)
+      : value
+    return (
+      <div className="flex justify-between gap-3 border-b border-white/10 py-1.5 text-sm last:border-b-0">
+        <span className="text-slate-400">{label}</span>
+        <span className="break-all text-right font-medium text-slate-100">
+          {displayValue === undefined || displayValue === null || displayValue === '' ? '缺失' : displayValue}
+        </span>
+      </div>
+    )
+  }
+
+  const statusLabel: Record<string, string> = {
+    pending: '待确认',
+    confirmed: '已写入',
+    rolled_back: '已撤回',
+    expired: '已过期',
+    superseded: '已替代',
+  }
+
   return (
-    <div className="space-y-3 rounded-lg border border-primary-500/40 bg-slate-800 p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
+    <div className={`space-y-3 rounded-xl border p-3.5 shadow-sm ${theme.card}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className={`font-semibold ${theme.title}`}>
+            {totalItems > 1 ? `第${item.index + 1}条 · ` : ''}{ACTION_LABELS[item.action_type || ''] || item.action_type || '记录'}
+          </div>
+          <div className="mt-1 text-xs text-slate-400">{item.summary}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className={`rounded px-2 py-1 text-xs ${theme.soft}`}>{statusLabel[status] || status}</span>
+          <button
+            type="button"
+            onClick={() => run(async () => {
+              await copyTextWithFallback(formatItemForClipboard(item))
+              setCopied(true)
+              window.setTimeout(() => setCopied(false), 1600)
+            })}
+            disabled={isWorking}
+            className="flex items-center gap-1 rounded border border-white/15 bg-slate-900/40 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800/70 disabled:opacity-50"
+            title="复制这一条为可编辑记账文本"
+          >
+            {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+            {copied ? '已复制' : '复制'}
+          </button>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {changes.map((change, changeIndex) => {
+          const childAction = change.action_type || item.action_type || ''
+          const isCash = ['deposit', 'withdraw', 'set_cash'].includes(childAction)
+          const subTitle = item.action_type === 'fx_exchange'
+            ? (childAction === 'withdraw' ? '换出' : '换入')
+            : (changes.length > 1 ? `子记录${changeIndex + 1}` : '')
+          return (
+            <div key={`${childAction}-${changeIndex}`} className="rounded-lg bg-slate-950/45 px-3 py-2">
+              {subTitle && <div className={`mb-1 text-sm font-semibold ${theme.title}`}>{subTitle}</div>}
+              {field('账户分组', change.account)}
+              {isCash ? (
+                <>
+                  {field('币种', change.currency)}
+                  {field('金额', change.amount)}
+                </>
+              ) : (
+                <>
+                  {field('标的', change.name)}
+                  {field('代码', change.code)}
+                  {field('币种', change.currency)}
+                  {field(item.action_type === 'set_position' ? '目标数量' : '数量', change.quantity)}
+                  {field(item.action_type === 'sell' ? '卖出价' : (item.action_type === 'set_position' ? '目标成本价' : '成本价'), change.cost_price)}
+                  {field('总成本', change.total_cost)}
+                  {field('手续费', change.fee ?? '未提供')}
+                </>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {item.revision_diffs && item.revision_diffs.length > 0 && (
+        <div className="space-y-2 rounded-lg border border-sky-500/25 bg-slate-950/35 p-3">
+          {item.revision_diffs.some((diff) => diff.kind === 'reverted') && (
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-amber-200">已撤销上一步修改</div>
+              {item.revision_diffs.filter((diff) => diff.kind === 'reverted').map((diff, index) => (
+                <div key={`reverted-${diff.field}-${index}`} className="text-sm text-slate-300">
+                  {diff.label}：<span className="line-through text-slate-500">{diff.before_text}</span>
+                  <span className="mx-1">→</span><span className="text-amber-100">{diff.after_text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {item.revision_diffs.some((diff) => diff.kind === 'applied') && (
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-sky-200">本次修改</div>
+              {item.revision_diffs.filter((diff) => diff.kind === 'applied').map((diff, index) => (
+                <div key={`applied-${diff.field}-${index}`} className="text-sm text-slate-300">
+                  {diff.label}：<span className="text-slate-500">{diff.before_text}</span>
+                  <span className="mx-1">→</span><span className="text-sky-100">{diff.after_text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {item.missing_fields?.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
+          缺少/阻止写入：{item.missing_fields.map((fieldName) => MISSING_LABELS[fieldName] || fieldName).join('、')}
+        </div>
+      )}
+
+      {item.warnings?.length > 0 && (
+        <div className="space-y-1 text-sm text-slate-300">
+          {item.warnings.map((warning, index) => <div key={index}>- {warning}</div>)}
+        </div>
+      )}
+
+      {item.revision_options && item.revision_options.length > 0 && status === 'pending' && (
+        <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-950/25 p-3">
+          <div className="text-sm font-medium text-amber-200">请选择这个值要修改的字段：</div>
+          <div className="flex flex-wrap gap-2">
+            {item.revision_options.map((option) => (
+              <button
+                key={`${option.field}-${option.message}`}
+                onClick={() => run(() => onRevise(option.message))}
+                disabled={isWorking}
+                className="rounded border border-amber-500/35 bg-slate-900/50 px-3 py-1.5 text-sm hover:bg-slate-800 disabled:opacity-50"
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {item.instrument_candidates && item.instrument_candidates.length > 0 && status === 'pending' && !changes[0]?.code && (
+        <div className="space-y-2">
+          <div className="text-sm text-slate-300">搜索候选：</div>
+          <div className="flex flex-wrap gap-2">
+            {item.instrument_candidates.slice(0, 8).map((candidate) => (
+              <button
+                key={`${candidate.code}-${candidate.currency}`}
+                onClick={() => run(() => onRevise(`代码${candidate.code}`))}
+                disabled={isWorking}
+                className="rounded border border-white/15 bg-slate-900/50 px-2.5 py-1.5 text-left text-xs hover:bg-slate-800 disabled:opacity-50"
+              >
+                <span className="font-semibold">{candidate.code}</span> {candidate.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {workError && <div className="text-sm text-red-300">操作失败：{workError}</div>}
+
+      {status === 'pending' && (
+        <div className="space-y-2">
+          {isEditing && (
+            <div className="space-y-2 rounded-lg border border-white/10 bg-slate-950/35 p-3">
+              <div className="text-xs text-slate-400">只修改这一条，不会影响其他子项。</div>
+              <input
+                value={reviseText}
+                onChange={(event) => setReviseText(event.target.value)}
+                placeholder="例如：数量改成5 / 不是买入，是更新持仓"
+                className="w-full rounded bg-slate-900/70 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+              />
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => run(async () => {
+                    if (!reviseText.trim()) return
+                    await onRevise(reviseText.trim())
+                    setReviseText('')
+                    setIsEditing(false)
+                  })}
+                  disabled={isWorking || !reviseText.trim()}
+                  className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
+                >
+                  应用修改
+                </button>
+                <button
+                  onClick={() => { setIsEditing(false); setReviseText(''); setWorkError('') }}
+                  disabled={isWorking}
+                  className="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600 disabled:opacity-50"
+                >
+                  收起修改
+                </button>
+              </div>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => setIsEditing((value) => !value)}
+              disabled={isWorking}
+              className="rounded border border-white/15 bg-slate-900/45 px-3 py-1.5 text-sm hover:bg-slate-800 disabled:opacity-50"
+            >
+              {isEditing ? '关闭修改' : '修改这一条'}
+            </button>
+            <button
+              onClick={() => run(onConfirm)}
+              disabled={isWorking || !item.requires_confirmation}
+              className={`rounded px-3 py-1.5 text-sm text-white disabled:cursor-not-allowed disabled:opacity-40 ${theme.button}`}
+            >
+              {isWorking ? '处理中…' : `确认${ACTION_LABELS[item.action_type || ''] || '这一条'}`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {status === 'confirmed' && (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm text-emerald-300">这一条已写入Portfolio。</div>
+          <button
+            onClick={() => run(async () => {
+              if (!window.confirm(`确定撤回第${item.index + 1}条写入吗？其他子项会保留。`)) return
+              await onRollback()
+            })}
+            disabled={isWorking}
+            className="flex items-center gap-1.5 rounded bg-amber-600 px-3 py-1.5 text-sm text-white hover:bg-amber-500 disabled:opacity-50"
+          >
+            <RotateCcw className="h-4 w-4" />撤回这一条
+          </button>
+        </div>
+      )}
+      {status === 'rolled_back' && <div className="text-sm text-amber-300">这一条写入已经撤回，其他子项不受影响。</div>}
+      {status === 'expired' && <div className="text-sm text-amber-300">这一条已经过期，请复制后重新提交。</div>}
+    </div>
+  )
+}
+
+function PendingActionCard({
+  pending,
+  onReviseItem,
+  onConfirmItem,
+  onRollbackItem,
+  onConfirmAll,
+}: {
+  pending: PendingAction
+  onReviseItem: (itemId: string, message: string) => Promise<void>
+  onConfirmItem: (itemId: string) => Promise<void>
+  onRollbackItem: (itemId: string) => Promise<void>
+  onConfirmAll: () => Promise<void>
+}) {
+  const [isWorking, setIsWorking] = useState(false)
+  const [workError, setWorkError] = useState('')
+  const [copied, setCopied] = useState(false)
+  const items = pending.items || []
+  const pendingCount = pending.pending_item_count ?? items.filter((item) => (item.status || 'pending') === 'pending').length
+  const confirmedCount = pending.confirmed_item_count ?? items.filter((item) => item.status === 'confirmed').length
+  const rolledBackCount = pending.rolled_back_item_count ?? items.filter((item) => item.status === 'rolled_back').length
+
+  const run = async (fn: () => Promise<void>) => {
+    setIsWorking(true)
+    setWorkError('')
+    try {
+      await fn()
+    } catch (error) {
+      setWorkError(getApiErrorMessage(error))
+    } finally {
+      setIsWorking(false)
+    }
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="rounded-xl border border-slate-600 bg-slate-800 p-4 text-sm text-slate-300">
+        旧确认卡正在与后端同步，请稍后刷新。
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4 rounded-xl border border-slate-600/70 bg-slate-800/90 p-3 sm:p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="font-semibold text-slate-100">{pending.summary || `识别到${items.length}条记录`}</div>
+          <div className="mt-1 text-xs text-slate-400">
+            待确认{pendingCount}条 · 已写入{confirmedCount}条 · 已撤回{rolledBackCount}条
+          </div>
+        </div>
         <button
           type="button"
           onClick={() => run(async () => {
@@ -165,226 +537,47 @@ function PendingActionCard({
             window.setTimeout(() => setCopied(false), 1600)
           })}
           disabled={isWorking}
-          className="flex shrink-0 items-center gap-1 rounded border border-slate-600 bg-slate-700 px-2 py-1 text-xs text-slate-200 hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
-          title="复制为可编辑记账文本"
+          className="flex items-center gap-1 rounded border border-slate-600 bg-slate-700 px-2.5 py-1.5 text-xs hover:bg-slate-600 disabled:opacity-50"
         >
           {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-          {copied ? '已复制' : '复制'}
+          {copied ? '已复制全部' : '复制全部'}
         </button>
       </div>
-      <div className="space-y-2">
-        {changes.map((item, index) => {
-          const childAction = item.action_type || pending.action_type || ''
-          const isCashAction = ['deposit', 'withdraw', 'set_cash'].includes(childAction)
-          const actionLabel: Record<string, string> = {
-            deposit: '增加现金',
-            withdraw: '减少现金',
-            set_cash: '设置现金余额',
-            fx_exchange: '换汇',
-            sell: '卖出',
-            add_or_update: '买入/新增',
-          }
-          const sectionTitle = pending.action_type === 'fx_exchange'
-            ? (childAction === 'withdraw' ? '换出' : '换入')
-            : (changes.length > 1 ? `第${index + 1}条` : '')
-          return (
-            <div key={`${childAction}-${item.account || ''}-${item.currency || ''}-${index}`} className="rounded bg-slate-900/60 px-3 py-2">
-              {sectionTitle && <div className="mb-1 text-sm font-semibold text-primary-300">{sectionTitle}</div>}
-              {field('账户分组', item.account)}
-              {isCashAction ? (
-                <>
-                  {field('币种', item.currency)}
-                  {field('金额', item.amount)}
-                  {field('操作', actionLabel[childAction] || childAction)}
-                </>
-              ) : (
-                <>
-                  {field('标的', item.name)}
-                  {field('代码', item.code)}
-                  {field('币种', item.currency)}
-                  {field('类型', item.asset_type)}
-                  {field('操作', actionLabel[childAction] || childAction)}
-                  {field('数量', item.quantity)}
-                  {field('成本价', item.cost_price)}
-                  {field('总成本', item.total_cost)}
-                  {field('手续费', item.fee ?? '未提供')}
-                </>
-              )}
-            </div>
-          )
-        })}
-      </div>
-      {pending.revision_diffs && pending.revision_diffs.length > 0 && (
-        <div className="space-y-2 rounded border border-sky-500/30 bg-sky-500/5 p-3">
-          {pending.revision_diffs.some((item) => item.kind === 'reverted') && (
-            <div className="space-y-1">
-              <div className="text-sm font-semibold text-amber-200">已撤销上一步修改</div>
-              {pending.revision_diffs
-                .filter((item) => item.kind === 'reverted')
-                .map((item, index) => (
-                  <div key={`reverted-${item.field}-${index}`} className="text-sm text-slate-300">
-                    {item.label}：<span className="line-through text-slate-500">{item.before_text}</span>
-                    <span className="mx-1">→</span>
-                    <span className="font-medium text-amber-100">{item.after_text}</span>
-                  </div>
-                ))}
-            </div>
-          )}
-          {pending.revision_diffs.some((item) => item.kind === 'applied') && (
-            <div className="space-y-1">
-              <div className="text-sm font-semibold text-sky-200">本次修改</div>
-              {pending.revision_diffs
-                .filter((item) => item.kind === 'applied')
-                .map((item, index) => (
-                  <div key={`applied-${item.field}-${index}`} className="text-sm text-slate-300">
-                    {item.label}：<span className="text-slate-500">{item.before_text}</span>
-                    <span className="mx-1">→</span>
-                    <span className="font-medium text-sky-100">{item.after_text}</span>
-                  </div>
-                ))}
-            </div>
-          )}
-        </div>
-      )}
-      {pending.missing_fields?.length > 0 && (
-        <div className="text-sm text-amber-300">
-          缺少/阻止写入：{pending.missing_fields.map((item) => ({
-            account: '账户',
-            amount: '金额',
-            positive_amount: '金额必须大于0',
-            amount_non_negative: '余额不能为负',
-            positive_quantity: '数量必须大于0',
-            cost_price_non_negative: '成本价不能为负',
-            unsupported_currency: '暂仅支持CNY/USD/HKD',
-            currency_conflict: '代码与币种不匹配',
-            invalid_number: '数字格式无效',
-            multiple_operations: '请拆分不同类型的操作',
-            unparsed_record: '有记录未完整识别',
-            existing_position: '未找到对应持仓',
-            available_quantity: '卖出数量超过现有持仓',
-            available_cash: '可用现金不足',
-            distinct_currencies: '换出和换入币种必须不同',
-            'source_amount/currency': '换出金额和币种',
-            'target_amount/currency': '换入金额和币种',
-          }[item] || item)).join('、')}
-        </div>
-      )}
+
       {pending.warnings?.length > 0 && (
-        <div className="space-y-1 text-sm text-slate-300">
-          {pending.warnings.map((warning, index) => (
-            <div key={index}>- {warning}</div>
-          ))}
+        <div className="space-y-1 rounded-lg border border-slate-600/50 bg-slate-900/35 p-3 text-sm text-slate-300">
+          {pending.warnings.map((warning, index) => <div key={index}>- {warning}</div>)}
         </div>
       )}
-      {pending.revision_options && pending.revision_options.length > 0 && (
-        <div className="space-y-2 rounded border border-amber-500/30 bg-amber-500/5 p-3">
-          <div className="text-sm font-medium text-amber-200">这个数字可能表示不同字段，请选择：</div>
-          <div className="flex flex-wrap gap-2">
-            {pending.revision_options.map((option) => (
-              <button
-                key={`${option.field}-${option.message}`}
-                onClick={() => run(async () => {
-                  await onRevise(option.message)
-                })}
-                disabled={isWorking}
-                className="rounded border border-amber-500/40 bg-slate-700 px-3 py-1.5 text-left text-sm hover:border-amber-400 hover:bg-slate-600 disabled:opacity-50"
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-      {pending.instrument_candidates && pending.instrument_candidates.length > 0 && (
-        <div className="space-y-2">
-          <div className="text-sm text-slate-300">搜索候选：</div>
-          <div className="flex flex-wrap gap-2">
-            {pending.instrument_candidates.slice(0, 12).map((candidate) => {
-              const candidateIndex = candidate.change_index ?? 0
-              const targetChange = changes[candidateIndex]
-              if (targetChange?.code) return null
-              const prefix = changes.length > 1 ? `第${candidateIndex + 1}条 ` : ''
-              return (
-                <button
-                  key={`${candidateIndex}-${candidate.code}-${candidate.currency}`}
-                  onClick={() => run(async () => {
-                    await onRevise(changes.length > 1
-                      ? `第${candidateIndex + 1}条代码${candidate.code}`
-                      : `代码${candidate.code}`)
-                  })}
-                  disabled={isWorking}
-                  className="rounded border border-slate-600 bg-slate-700 px-2.5 py-1.5 text-left text-xs hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
-                >
-                  <span className="text-slate-400">{prefix}</span>
-                  <span className="font-semibold">{candidate.code}</span> {candidate.name}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
-      {pending.status === 'confirmed' ? (
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="text-sm text-green-300">写入成功，Portfolio 已刷新。</div>
-          {pending.operation_id && onRollback && (
-            <button
-              onClick={() => run(async () => {
-                const target = pending.action_type === 'fx_exchange'
-                  ? '这笔换汇'
-                  : (changes.length > 1
-                    ? `这${changes.length}条记录`
-                    : (change.name || change.code || '这条记录'))
-                if (!window.confirm(`确定撤回${target}的这次写入吗？后续其他记录会保留。`)) return
-                await onRollback()
-              })}
-              disabled={isWorking}
-              className="flex items-center gap-1.5 rounded bg-amber-600/90 px-3 py-1.5 text-sm text-white hover:bg-amber-500 disabled:opacity-50"
-            >
-              <RotateCcw className="h-4 w-4" />
-              撤回此条
-            </button>
-          )}
-        </div>
-      ) : pending.status === 'rolled_back' ? (
-        <div className="text-sm text-amber-300">该次写入已撤回，Portfolio 已恢复。</div>
-      ) : pending.status === 'superseded' ? (
-        <div className="text-sm text-sky-300">原卡片已被修改后的新确认卡替代，不能再确认这一版。</div>
-      ) : pending.status === 'cancelled' ? (
-        <div className="text-sm text-slate-400">已取消。</div>
-      ) : pending.status === 'expired' ? (
-        <div className="text-sm text-amber-300">该确认卡已过期，请重新提交原始记账信息。</div>
-      ) : (
-        <div className="space-y-2">
-          <input
-            value={reviseText}
-            onChange={(e) => setReviseText(e.target.value)}
-            placeholder="补充/修改信息"
-            className="w-full rounded bg-slate-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+
+      <div className="space-y-3">
+        {items.map((item) => (
+          <PendingItemCard
+            key={item.item_id}
+            item={item}
+            totalItems={items.length}
+            onRevise={(message) => onReviseItem(item.item_id, message)}
+            onConfirm={() => onConfirmItem(item.item_id)}
+            onRollback={() => onRollbackItem(item.item_id)}
           />
-          {workError && (
-            <div className="text-sm text-red-300">操作失败：{workError}</div>
-          )}
-          {changes.length > 1 && (
-            <div className="text-xs text-slate-400">这张卡包含多条记录。修改时请注明序号，例如“第2条数量100”；也可以复制后直接编辑完整文本。</div>
-          )}
-          {reviseText.trim() && changes.length === 1 && (
-            <div className="text-xs text-slate-400">系统会结合当前确认卡理解这条补充，并生成一张新的确认卡。</div>
-          )}
-          <div className="flex flex-wrap gap-2">
+        ))}
+      </div>
+
+      {workError && <div className="text-sm text-red-300">批量操作失败：{workError}</div>}
+
+      {pendingCount > 0 && (
+        <div className="sticky bottom-0 z-10 rounded-xl border border-slate-600 bg-slate-900/95 p-3 shadow-lg backdrop-blur">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm text-slate-300">
+              仍有{pendingCount}条待确认
+              {!pending.can_confirm_all && <span className="ml-2 text-amber-300">请先处理不能确认的子项</span>}
+            </div>
             <button
-              onClick={() => run(async () => {
-                const revision = reviseText.trim()
-                if (revision) {
-                  await onRevise(revision)
-                  setReviseText('')
-                  return
-                }
-                await onConfirm()
-              })}
-              disabled={isWorking || (!pending.requires_confirmation && !reviseText.trim())}
-              className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
+              onClick={() => run(onConfirmAll)}
+              disabled={isWorking || !pending.can_confirm_all}
+              className="rounded bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-500"
             >
-              {isWorking ? '处理中…' : (reviseText.trim() ? '应用修改并生成新卡' : '确认写入')}
+              {isWorking ? '正在确认…' : `一键确认剩余${pendingCount}条`}
             </button>
           </div>
         </div>
@@ -392,6 +585,7 @@ function PendingActionCard({
     </div>
   )
 }
+
 
 export default function ChatPanel() {
   const [input, setInput] = useState('')
@@ -690,7 +884,13 @@ export default function ChatPanel() {
       setLoading(true)
       try {
         const result = await portfolioService.aiConfirm(targetPendingId)
-        const operationId = result.operation_id
+        const latestPending: PendingAction = result.pending || {
+          ...targetPending,
+          status: 'confirmed',
+          requires_confirmation: false,
+          operation_id: result.operation_id,
+          operation_ids: result.operation_ids || [],
+        }
         queryClient.invalidateQueries({ queryKey: ['portfolio'] })
         queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
         await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
@@ -700,15 +900,7 @@ export default function ChatPanel() {
             ...state.messages.map((message): ChatMessage => {
               const currentPending = message.pendingAction
               if (!currentPending || currentPending.pending_id !== targetPendingId) return message
-              return {
-                ...message,
-                pendingAction: {
-                  ...currentPending,
-                  status: 'confirmed',
-                  requires_confirmation: false,
-                  operation_id: operationId,
-                },
-              }
+              return { ...message, pendingAction: latestPending }
             }),
             userEntry,
           ],
@@ -882,11 +1074,11 @@ export default function ChatPanel() {
         className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}
       >
         <div
-          className={`max-w-[80%] rounded-lg px-4 py-3 ${
-            isUser
-              ? 'bg-primary-600 text-white'
-              : 'bg-slate-700 text-slate-100'
-          }`}
+          className={message.pendingAction
+            ? 'w-full max-w-full rounded-lg bg-transparent px-0 py-1 text-slate-100'
+            : `max-w-[80%] rounded-lg px-4 py-3 ${
+                isUser ? 'bg-primary-600 text-white' : 'bg-slate-700 text-slate-100'
+              }`}
         >
           {/* 显示图片 (旧兼容逻辑单图) */}
           {message.image && (
@@ -914,37 +1106,39 @@ export default function ChatPanel() {
           {message.pendingAction ? (
             <PendingActionCard
               pending={message.pendingAction}
-              onRevise={async (text) => {
+              onReviseItem={async (itemId, text) => {
                 if (!message.pendingAction?.pending_id) return
-                const originalPendingId = message.pendingAction.pending_id
-                const updated = await portfolioService.aiRevise(originalPendingId, text)
-                appendRevisedPendingMessage(originalPendingId, updated)
+                const pendingId = message.pendingAction.pending_id
+                const updated = await portfolioService.aiReviseItem(pendingId, itemId, text)
+                updatePendingMessage(pendingId, updated)
               }}
-              onConfirm={async () => {
+              onConfirmItem={async (itemId) => {
                 if (!message.pendingAction?.pending_id) return
-                const result = await portfolioService.aiConfirm(message.pendingAction.pending_id)
+                const pendingId = message.pendingAction.pending_id
+                const result = await portfolioService.aiConfirmItem(pendingId, itemId)
+                updatePendingMessage(pendingId, result.pending)
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
                 queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
                 await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-                updatePendingMessage(message.pendingAction.pending_id, {
-                  ...message.pendingAction,
-                  status: 'confirmed',
-                  requires_confirmation: false,
-                  operation_id: result.operation_id,
-                })
               }}
-              onRollback={message.pendingAction?.operation_id ? async () => {
-                const operationId = message.pendingAction!.operation_id!
-                await portfolioService.rollback(operationId)
+              onRollbackItem={async (itemId) => {
+                if (!message.pendingAction?.pending_id) return
+                const pendingId = message.pendingAction.pending_id
+                const result = await portfolioService.aiRollbackItem(pendingId, itemId)
+                updatePendingMessage(pendingId, result.pending)
                 queryClient.invalidateQueries({ queryKey: ['portfolio'] })
                 queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
                 await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-                updatePendingMessage(message.pendingAction!.pending_id!, {
-                  ...message.pendingAction!,
-                  status: 'rolled_back',
-                  requires_confirmation: false,
-                })
-              } : undefined}
+              }}
+              onConfirmAll={async () => {
+                if (!message.pendingAction?.pending_id) return
+                const pendingId = message.pendingAction.pending_id
+                const result = await portfolioService.aiConfirm(pendingId)
+                updatePendingMessage(pendingId, result.pending)
+                queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+                queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+                await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
+              }}
             />
           ) : isUser ? (
             <p className="whitespace-pre-wrap">{message.content}</p>
