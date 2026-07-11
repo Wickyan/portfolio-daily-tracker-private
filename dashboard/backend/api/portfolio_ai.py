@@ -784,7 +784,19 @@ def infer_action(message: str) -> str:
         or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:变为|变成|改为|改成|调整为|调整成|设置为|设为)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
     ):
         return "set_cash"
-    if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "帮我记一下", "记一笔", "录入"]) or re.search(rf"买\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message):
+    position_state_patterns = [
+        rf"(?:账户里|账户中|现在|目前|当前|现有)\s*(?:一共|总共)?\s*(?:持有|有)\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)",
+        rf"(?:持有|有)\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)",
+        rf"(?:持仓|数量)\s*(?:是|为|有|改为|改成|更新为|设置为|设为|:|：)?\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)?",
+        rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)\s*(?:的)?\s*持仓",
+        rf"(?:剩下|还剩|剩余)\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)",
+    ]
+    if (
+        any(token in message for token in ["更新持仓", "设置持仓", "当前持仓", "现在持有", "目前持有", "账户里有", "账户中有"])
+        or any(re.search(pattern, message, re.IGNORECASE) for pattern in position_state_patterns)
+    ):
+        return "set_position"
+    if any(token in message for token in ["买了", "买入", "加仓", "补仓", "新增", "添加", "刚买", "本次买", "写入数据库", "帮我记上", "帮我记一下", "记一笔", "录入"]) or re.search(rf"买\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message):
         return "add_or_update"
     has_quantity = bool(re.search(rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message, re.IGNORECASE))
     has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
@@ -1094,6 +1106,8 @@ def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
         "买入": "add_or_update",
         "新增": "add_or_update",
         "买入/新增": "add_or_update",
+        "更新持仓": "set_position",
+        "设置持仓": "set_position",
         "卖出": "sell",
         "减持": "sell",
         "增加现金": "deposit",
@@ -1399,14 +1413,13 @@ def parse_bookkeeping_message(
                         "warnings": list(dict.fromkeys(combined_warnings + ["多条现金变化将作为同一个原子操作一起写入或一起失败"])),
                     }
 
-                position_actions = {"add_or_update", "sell"}
+                position_actions = {"add_or_update", "sell", "set_position"}
                 action_types = {str(parsed.get("action_type") or "") for parsed in actionable}
                 if (
-                    len(action_types) == 1
-                    and action_types.issubset(position_actions)
+                    action_types.issubset(position_actions)
                     and all(len(parsed.get("changes", [])) == 1 for parsed in actionable)
                 ):
-                    combined_action = next(iter(action_types))
+                    combined_action = next(iter(action_types)) if len(action_types) == 1 else "multi_position"
                     combined_changes = []
                     combined_warnings = []
                     inherited_account = None
@@ -1421,15 +1434,23 @@ def parse_bookkeeping_message(
                             inherited_account = str(change["account"])
                         combined_changes.append(change)
                         combined_warnings.extend(parsed.get("warnings", []))
-                    action_label = "买入/新增" if combined_action == "add_or_update" else "卖出"
+                    if len(action_types) == 1:
+                        action_label = {
+                            "add_or_update": "买入",
+                            "sell": "卖出",
+                            "set_position": "更新持仓",
+                        }.get(combined_action, "持仓")
+                        summary = f"识别到{len(combined_changes)}条待确认{action_label}记录"
+                    else:
+                        summary = f"识别到{len(combined_changes)}条不同持仓操作"
                     return enrich_instrument_currency_consistency({
                         "intent": "bookkeeping",
-                        "summary": f"识别到{len(combined_changes)}条待确认{action_label}记录",
+                        "summary": summary,
                         "action_type": combined_action,
                         "changes": combined_changes,
                         "missing_fields": collect_missing_fields(combined_changes, combined_action),
                         "warnings": list(dict.fromkeys(combined_warnings + [
-                            f"已分别解析为{len(combined_changes)}条记录；确认后将作为一个原子操作一起写入或一起失败"
+                            f"已分别解析为{len(combined_changes)}条持仓记录，请逐条核对操作类型"
                         ])),
                     })
                 return {

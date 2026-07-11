@@ -32,7 +32,7 @@ class MultiPositionLanguageParseTest(unittest.TestCase):
         self.assertEqual(parsed["action_type"], "add_or_update")
         self.assertEqual(parsed["missing_fields"], [])
         self.assertEqual(len(parsed["changes"]), 2)
-        self.assertTrue(any("分别解析为2条记录" in warning for warning in parsed["warnings"]))
+        self.assertTrue(any("分别解析为2条持仓记录" in warning for warning in parsed["warnings"]))
         return parsed["changes"]
 
     def test_semicolon_separates_two_buy_records(self) -> None:
@@ -130,12 +130,15 @@ class MultiPositionLanguageParseTest(unittest.TestCase):
         self.assertIn("multiple_operations", parsed["missing_fields"])
         self.assertEqual(parsed["changes"], [])
 
-    def test_buy_and_sell_remain_blocked_as_mixed_operations(self) -> None:
+    def test_buy_and_sell_can_share_one_position_batch(self) -> None:
         parsed = parse_bookkeeping_message(
             "IBKR买入2股苹果，均价200美元；IBKR卖出1股苹果"
         )
-        self.assertEqual(parsed["action_type"], "multiple_operations")
-        self.assertIn("multiple_operations", parsed["missing_fields"])
+        self.assertEqual(parsed["action_type"], "multi_position")
+        self.assertEqual(
+            [change["action_type"] for change in parsed["changes"]],
+            ["add_or_update", "sell"],
+        )
 
     def test_one_invalid_record_blocks_whole_batch(self) -> None:
         parsed = parse_bookkeeping_message(

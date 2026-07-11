@@ -507,6 +507,34 @@ class PortfolioWriteService:
                 raise ValueError(f"检测到重复持仓身份: {identity}")
             existing = existing_matches[0] if existing_matches else None
 
+            if action_type == "set_position":
+                target_qty = to_float(change.get("quantity"), 0.0) or 0.0
+                target_cost = to_float(change.get("cost_price"), 0.0) or 0.0
+                fee = to_float(change.get("fee"), 0.0) or 0.0
+                target_total = (target_qty * target_cost) + fee
+                if target_qty <= 0:
+                    raise ValueError("更新持仓数量必须大于0")
+                if target_total < 0:
+                    raise ValueError("更新持仓总成本不能小于0")
+                if existing:
+                    existing["quantity"] = target_qty
+                    existing["available_qty"] = target_qty
+                    existing["cost_price"] = target_total / target_qty
+                    existing["total_cost"] = target_total
+                    existing["name"] = change.get("name") or existing.get("name")
+                    existing["asset_type"] = change.get("asset_type") or existing.get("asset_type")
+                    existing["note"] = change.get("note", existing.get("note", ""))
+                    existing["source"] = change.get("source") or existing.get("source") or "ai"
+                    existing["updated_at"] = utc_now_iso()
+                else:
+                    change["quantity"] = target_qty
+                    change["available_qty"] = target_qty
+                    change["total_cost"] = target_total
+                    change["cost_price"] = target_total / target_qty
+                    positions.append(change)
+                imported += 1
+                continue
+
             if existing:
                 old_qty = to_float(existing.get("quantity"), 0.0) or 0.0
                 old_cost = to_float(existing.get("cost_price"), 0.0) or 0.0
