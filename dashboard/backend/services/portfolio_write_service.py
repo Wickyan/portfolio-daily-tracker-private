@@ -725,27 +725,58 @@ class PortfolioWriteService:
             })
         return summaries[:limit]
 
-    def find_confirm_operation_by_pending_id(self, pending_id: str) -> Optional[Dict[str, Any]]:
-        """Return the existing AI-confirm operation for idempotent retries."""
+    def find_confirm_operations_by_pending_id(self, pending_id: str) -> List[Dict[str, Any]]:
         target = str(pending_id or "").strip()
         if not target:
-            return None
+            return []
         operations = self._load_all_operations()
         rolled_back_ids = self._rolled_back_operation_ids(operations)
+        matches: List[Dict[str, Any]] = []
+        for operation in operations:
+            pending_action = operation.get("pending_action", {}) or {}
+            if operation.get("type") != "ai_confirm":
+                continue
+            if str(pending_action.get("pending_id") or "").strip() != target:
+                continue
+            result = dict(operation)
+            result["is_rolled_back"] = str(result.get("operation_id") or "") in rolled_back_ids
+            matches.append(result)
+        return matches
+
+    def find_confirm_operation_by_pending_id(self, pending_id: str) -> Optional[Dict[str, Any]]:
+        """Return a legacy whole-card confirm operation.
+
+        Item-level operations intentionally share a pending_id and are looked up
+        through find_confirm_operation_by_pending_item instead.
+        """
         matches = [
-            operation
-            for operation in operations
-            if operation.get("type") == "ai_confirm"
-            and str(operation.get("pending_action", {}).get("pending_id") or "").strip() == target
+            operation for operation in self.find_confirm_operations_by_pending_id(pending_id)
+            if not str((operation.get("pending_action") or {}).get("item_id") or "").strip()
         ]
         if len(matches) > 1:
             operation_ids = [str(operation.get("operation_id") or "") for operation in matches]
-            raise RuntimeError(f"同一pending_id存在重复确认operation：{target} -> {operation_ids}")
-        if not matches:
+            raise RuntimeError(f"同一pending_id存在重复确认operation：{pending_id} -> {operation_ids}")
+        return matches[0] if matches else None
+
+    def find_confirm_operation_by_pending_item(
+        self,
+        pending_id: str,
+        item_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        target_item = str(item_id or "").strip()
+        if not target_item:
             return None
-        result = dict(matches[0])
-        result["is_rolled_back"] = str(result.get("operation_id") or "") in rolled_back_ids
-        return result
+        matches = [
+            operation for operation in self.find_confirm_operations_by_pending_id(pending_id)
+            if str((operation.get("pending_action") or {}).get("item_id") or "").strip() == target_item
+        ]
+        if len(matches) > 1:
+            operation_ids = [str(operation.get("operation_id") or "") for operation in matches]
+            raise RuntimeError(
+                f"同一pending/item存在重复确认operation：{pending_id}/{target_item} -> {operation_ids}"
+            )
+        return matches[0] if matches else None
+
 
     def get_latest_rollbackable_operation(self) -> Dict[str, Any]:
         operations = self._load_all_operations()
@@ -1017,6 +1048,94 @@ class PortfolioWriteService:
                 "ok": True,
                 "operation_id": operation["operation_id"],
                 "imported_positions": imported,
+                "backup_path": backup_path,
+                "portfolio_updated": True,
+            }
+
+    def safe_add_items_atomic(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        pending_id: str,
+        summary: str,
+    ) -> Dict[str, Any]:
+        """Atomically apply multiple independently rollbackable child items.
+
+        Portfolio data is replaced once. Each child receives its own operation
+        log with sequential before/after snapshots, so it can later be rolled
+        back without reverting unrelated siblings.
+        """
+        if not items:
+            raise ValueError("没有可写入的子项")
+        with PORTFOLIO_MUTATION_LOCK:
+            before_all = self.load_portfolio()
+            simulated = deepcopy(before_all)
+            steps: List[Dict[str, Any]] = []
+            imported_total = 0
+
+            for index, item in enumerate(items):
+                item_id = str(item.get("item_id") or "").strip()
+                changes = [dict(change) for change in item.get("changes", [])]
+                if not item_id or not changes:
+                    raise ValueError(f"第{index + 1}个子项缺少item_id或changes")
+                for change in changes:
+                    missing = self.validate_confirmable_change(change)
+                    if missing:
+                        raise ValueError(f"第{index + 1}个子项字段无效：{', '.join(missing)}")
+                step_before = deepcopy(simulated)
+                simulated, imported = self.apply_changes(simulated, changes)
+                imported_total += imported
+                steps.append({
+                    "item_id": item_id,
+                    "changes": changes,
+                    "before": step_before,
+                    "after": deepcopy(simulated),
+                    "summary": str(item.get("summary") or f"确认第{index + 1}条记录"),
+                    "imported": imported,
+                })
+
+            backup_path = self.backup_portfolio()
+            self.save_portfolio_atomic(simulated)
+            created_operation_ids: List[str] = []
+            operations: List[Dict[str, Any]] = []
+            batch_id = str(uuid4())
+            try:
+                for step in steps:
+                    operation = self.create_operation(
+                        operation_type="ai_confirm",
+                        summary=step["summary"],
+                        before_snapshot=step["before"],
+                        after_snapshot=step["after"],
+                        pending_action={
+                            "pending_id": pending_id,
+                            "item_id": step["item_id"],
+                            "batch_id": batch_id,
+                            "changes": step["changes"],
+                        },
+                        backup_path=backup_path,
+                        imported_positions=step["imported"],
+                    )
+                    created_operation_ids.append(str(operation["operation_id"]))
+                    operations.append(operation)
+            except Exception:
+                self.save_portfolio_atomic(before_all, preserve_updated_at=True)
+                for operation_id in created_operation_ids:
+                    (OPERATIONS_DIR / f"{operation_id}.json").unlink(missing_ok=True)
+                raise
+
+            return {
+                "ok": True,
+                "batch_id": batch_id,
+                "operation_ids": created_operation_ids,
+                "item_operations": [
+                    {
+                        "item_id": step["item_id"],
+                        "operation_id": operation["operation_id"],
+                        "imported_positions": step["imported"],
+                    }
+                    for step, operation in zip(steps, operations)
+                ],
+                "imported_positions": imported_total,
                 "backup_path": backup_path,
                 "portfolio_updated": True,
             }
