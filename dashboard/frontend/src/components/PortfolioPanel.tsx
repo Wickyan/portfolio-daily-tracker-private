@@ -39,7 +39,10 @@ export default function PortfolioPanel() {
     }
   }
 
-  const formatPercent = (value: number) => `${value.toFixed(2)}%`
+  const formatPercent = (value: number) => {
+    const sign = value >= 0 ? '+' : ''
+    return `${sign}${value.toFixed(2)}%`
+  }
 
   const renderPosition = (position: Position) => {
     const isProfit = position.profit >= 0
@@ -49,40 +52,22 @@ export default function PortfolioPanel() {
         key={`${position.account}-${position.code}-${position.currency}`}
         className="flex items-center justify-between py-3 border-b border-slate-700 last:border-b-0"
       >
-        <div className="min-w-0 flex-1 pr-4">
+        <div className="flex-1">
           <div className="flex items-center gap-2">
-            <span className="truncate font-medium">{position.name}</span>
-            <span className="shrink-0 text-sm text-slate-400">{position.code}</span>
+            <span className="font-medium">{position.name}</span>
+            <span className="text-sm text-slate-400">{position.code}</span>
           </div>
-          <div className="mt-1 text-sm text-slate-400">
+          <div className="text-sm text-slate-400 mt-1">
             {position.account && `${position.account} | `}
             {position.quantity} | 成本 {position.cost_price.toFixed(2)} {position.currency}
-          </div>
-          <div className="mt-2">
-            <div className="mb-1 flex items-center justify-between text-xs text-slate-400">
-              <span>占总资产 {formatPercent(position.asset_weight_pct || 0)}</span>
-              <span>占持仓 {formatPercent(position.holding_weight_pct || 0)}</span>
-            </div>
-            <div className="h-1.5 overflow-hidden rounded-full bg-slate-700">
-              <div
-                className="h-full rounded-full bg-primary-500"
-                style={{ width: `${Math.min(Math.max(position.asset_weight_pct || 0, 0), 100)}%` }}
-              />
-            </div>
+            {' | '}占比 {(position.asset_weight_pct || 0).toFixed(2)}%
           </div>
         </div>
 
-        <div className="shrink-0 text-right">
-          <div className="text-xs text-slate-400">总余额</div>
-          <div className="font-semibold">{formatCurrency(position.market_value, position.currency)}</div>
-          {position.market_value_cny !== null && position.market_value_cny !== undefined && position.currency !== 'CNY' && (
-            <div className="text-xs text-slate-500">≈{formatMoney(position.market_value_cny)}</div>
-          )}
-          <div className="mt-1 text-xs text-slate-400">
-            现价 {formatCurrency(position.current_price, position.currency)}
-          </div>
+        <div className="text-right">
+          <div className="font-medium">{formatCurrency(position.current_price, position.currency)}</div>
           <div
-            className={`mt-1 flex items-center justify-end gap-1 text-sm ${
+            className={`flex items-center justify-end gap-1 text-sm ${
               isProfit ? 'profit-positive' : 'profit-negative'
             }`}
           >
@@ -92,7 +77,7 @@ export default function PortfolioPanel() {
               <TrendingDown className="h-4 w-4" />
             )}
             <span>{formatCurrency(position.profit, position.currency)}</span>
-            <span>({position.profit_pct >= 0 ? '+' : ''}{position.profit_pct.toFixed(2)}%)</span>
+            <span>({formatPercent(position.profit_pct)})</span>
           </div>
         </div>
       </div>
