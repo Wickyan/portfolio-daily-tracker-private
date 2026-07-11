@@ -235,5 +235,150 @@ class BatchItemWorkflowTest(unittest.TestCase):
         self.assertEqual(public["status"], "partially_confirmed")
 
 
+class BatchItemConcurrencyAndMixedTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous_cwd = Path.cwd()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        os.chdir(self.temp_dir.name)
+        self.service = PortfolioWriteService(Path("data/portfolio.json"))
+
+    def tearDown(self) -> None:
+        os.chdir(self.previous_cwd)
+        self.temp_dir.cleanup()
+
+    def preview(self, text: str) -> dict:
+        return asyncio.run(ai_preview(PreviewRequest(message=text, input_type="text")))
+
+    def positions(self) -> dict:
+        return {
+            (item["account"], item["code"], item["currency"]): item
+            for item in self.service.load_portfolio()["positions"]
+        }
+
+    def test_four_mixed_items_confirm_and_one_sell_rolls_back_independently(self) -> None:
+        self.service.safe_add_positions([{
+            "action_type": "add_or_update",
+            "account": "IBKR",
+            "name": "Apple/苹果",
+            "code": "AAPL",
+            "currency": "USD",
+            "asset_type": "stock",
+            "quantity": 5,
+            "cost_price": 180,
+        }], summary="seed")
+        card = self.preview(
+            "银河买入10股比亚迪，均价100元；"
+            "IBKR卖出1股苹果；"
+            "长桥现在持有20股腾讯，成本500港币；"
+            "银河现金余额是20000元"
+        )
+        self.assertEqual(
+            [item["action_type"] for item in card["items"]],
+            ["add_or_update", "sell", "set_position", "set_cash"],
+        )
+        self.assertTrue(card["can_confirm_all"])
+        confirmed = asyncio.run(ai_confirm(ConfirmRequest(pending_id=card["pending_id"])))
+        self.assertEqual(len(confirmed["operation_ids"]), 4)
+        positions = self.positions()
+        self.assertEqual(positions[("银河", "002594", "CNY")]["quantity"], 10)
+        self.assertEqual(positions[("IBKR", "AAPL", "USD")]["quantity"], 4)
+        self.assertEqual(positions[("长桥", "0700", "HKD")]["quantity"], 20)
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 20000)
+
+        sell_item = confirmed["pending"]["items"][1]
+        rolled = asyncio.run(ai_rollback_item(ItemRequest(
+            pending_id=card["pending_id"], item_id=sell_item["item_id"],
+        )))
+        self.assertEqual(rolled["pending"]["items"][1]["status"], "rolled_back")
+        positions = self.positions()
+        self.assertEqual(positions[("IBKR", "AAPL", "USD")]["quantity"], 5)
+        self.assertEqual(positions[("银河", "002594", "CNY")]["quantity"], 10)
+        self.assertEqual(positions[("长桥", "0700", "HKD")]["quantity"], 20)
+        self.assertEqual(self.service.load_portfolio()["cash_accounts"][0]["amount"], 20000)
+
+    def test_concurrent_same_item_confirm_is_idempotent(self) -> None:
+        card = self.preview("银河买入10股比亚迪，均价100元")
+        item = card["items"][0]
+
+        async def run_both():
+            request = ItemRequest(pending_id=card["pending_id"], item_id=item["item_id"])
+            return await asyncio.gather(
+                ai_confirm_item(request),
+                ai_confirm_item(request),
+                return_exceptions=True,
+            )
+
+        results = asyncio.run(run_both())
+        self.assertTrue(all(isinstance(result, dict) for result in results))
+        operation_ids = {result["operation_id"] for result in results if isinstance(result, dict)}
+        self.assertEqual(len(operation_ids), 1)
+        self.assertEqual(self.positions()[("银河", "002594", "CNY")]["quantity"], 10)
+        operations = self.service.find_confirm_operations_by_pending_id(card["pending_id"])
+        self.assertEqual(len(operations), 1)
+
+    def test_concurrent_item_confirm_and_confirm_all_do_not_duplicate(self) -> None:
+        card = self.preview(
+            "银河买入10股比亚迪，均价100元；IBKR买入2股苹果，均价200美元"
+        )
+        first = card["items"][0]
+
+        async def run_both():
+            return await asyncio.gather(
+                ai_confirm_item(ItemRequest(
+                    pending_id=card["pending_id"], item_id=first["item_id"],
+                )),
+                ai_confirm(ConfirmRequest(pending_id=card["pending_id"])),
+                return_exceptions=True,
+            )
+
+        results = asyncio.run(run_both())
+        self.assertTrue(all(isinstance(result, dict) for result in results))
+        public = asyncio.run(get_pending(card["pending_id"]))
+        self.assertEqual(public["status"], "confirmed")
+        self.assertEqual(public["confirmed_item_count"], 2)
+        self.assertEqual(self.positions()[("银河", "002594", "CNY")]["quantity"], 10)
+        self.assertEqual(self.positions()[("IBKR", "AAPL", "USD")]["quantity"], 2)
+        operations = self.service.find_confirm_operations_by_pending_id(card["pending_id"])
+        self.assertEqual(len(operations), 2)
+        self.assertEqual(
+            {str((operation.get("pending_action") or {}).get("item_id")) for operation in operations},
+            {item["item_id"] for item in public["items"]},
+        )
+
+    def test_confirm_all_is_idempotent_for_four_items(self) -> None:
+        card = self.preview(
+            "银河买入10股比亚迪，均价100元；"
+            "IBKR买入2股苹果，均价200美元；"
+            "长桥现在持有20股腾讯，成本500港币；"
+            "银河现金余额是20000元"
+        )
+        first = asyncio.run(ai_confirm(ConfirmRequest(pending_id=card["pending_id"])))
+        second = asyncio.run(ai_confirm(ConfirmRequest(pending_id=card["pending_id"])))
+        self.assertEqual(set(first["operation_ids"]), set(second["operation_ids"]))
+        self.assertTrue(second["already_confirmed"])
+        self.assertEqual(len(self.service.find_confirm_operations_by_pending_id(card["pending_id"])), 4)
+
+
+class FrontendItemCardContractTest(unittest.TestCase):
+    def test_colored_cards_and_per_item_controls_are_present(self) -> None:
+        source = Path("frontend/src/components/ChatPanel.tsx").read_text(encoding="utf-8")
+        self.assertIn("bg-emerald-950/55", source)
+        self.assertIn("bg-red-950/55", source)
+        self.assertIn("bg-sky-950/55", source)
+        self.assertIn("修改这一条", source)
+        self.assertIn("撤回这一条", source)
+        self.assertIn("一键确认剩余", source)
+        self.assertIn("复制全部", source)
+        self.assertIn("onConfirmItem", source)
+        self.assertIn("onRollbackItem", source)
+        self.assertIn("onReviseItem", source)
+
+    def test_frontend_uses_child_endpoints(self) -> None:
+        source = Path("frontend/src/services/portfolio.ts").read_text(encoding="utf-8")
+        self.assertIn("/portfolio/ai-confirm-item", source)
+        self.assertIn("/portfolio/ai-revise-item", source)
+        self.assertIn("/portfolio/ai-rollback-item", source)
+
+
 if __name__ == "__main__":
     unittest.main()
