@@ -493,5 +493,29 @@ class UserSimulationTest(unittest.TestCase):
 
 
 
+    def test_unknown_concise_fund_entry_creates_incomplete_card(self) -> None:
+        parsed = parse_bookkeeping_message("纳之大成 1.243 12700个")
+        self.assertEqual(parsed["action_type"], "add_or_update")
+        change = parsed["changes"][0]
+        self.assertEqual(change["name"], "纳之大成")
+        self.assertEqual(change["quantity"], 12700)
+        self.assertEqual(change["cost_price"], 1.243)
+        self.assertAlmostEqual(change["total_cost"], 15786.1)
+        self.assertIn("account", parsed["missing_fields"])
+        self.assertIn("code", parsed["missing_fields"])
+
+    def test_combined_unknown_fund_entry_keeps_account_and_price(self) -> None:
+        parsed = parse_bookkeeping_message("银河 纳之大成 1.243元 12700个")
+        self.assertEqual(parsed["action_type"], "add_or_update")
+        change = parsed["changes"][0]
+        self.assertEqual(change["account"], "银河")
+        self.assertEqual(change["name"], "纳之大成")
+        self.assertEqual(change["currency"], "CNY")
+        self.assertEqual(change["quantity"], 12700)
+        self.assertEqual(change["cost_price"], 1.243)
+        self.assertIn("code", parsed["missing_fields"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

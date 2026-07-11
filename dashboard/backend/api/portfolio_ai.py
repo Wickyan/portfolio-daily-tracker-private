@@ -549,7 +549,9 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
         # Extract an unknown instrument phrase so online search can resolve it.
         # Examples: "IBKR买了2股亚马逊" / "买入100份纳指ETF" / "腾讯卖出10股".
         asset_token = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff]{1,29}"
+        account_prefix = r"(?:长桥|哈富|IBKR|IB|盈透证券|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)"
         patterns = [
+            rf"^\s*(?:{account_prefix}\s*)?({asset_token}?)\s+{NUMBER_TOKEN_PATTERN}\s*(?:{CURRENCY_TOKEN_PATTERN})?\s+{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)\s*$",
             rf"(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)\s*({asset_token})",
             rf"(?:买了|买入|新增|添加|卖了|卖出)\s*({asset_token})\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
             rf"({asset_token}?)(?:买了|买入|新增|添加|卖了|卖出)\s*[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)",
@@ -634,7 +636,7 @@ def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple
 
     if not currency and ("份" in message or "海外科技" in message) and re.search(r"\d+\s*元", message):
         currency = "CNY"
-    if not asset_type and "份" in message:
+    if not asset_type and re.search(r"(?:股|股票|份|个)", message):
         asset_type = "stock"
 
     return {
@@ -755,6 +757,10 @@ def infer_action(message: str) -> str:
     has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
     if has_quantity and has_total_amount:
         return "add_or_update"
+    numeric_tokens = re.findall(NUMBER_TOKEN_PATTERN, message, re.IGNORECASE)
+    has_asset_text = bool(re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", message))
+    if has_quantity and len(numeric_tokens) >= 2 and has_asset_text:
+        return "add_or_update"
     # Concise ledger entry: "银河 比亚迪 500个 102.742元".
     # Require a known account, a known asset, quantity unit and a trailing price+currency
     # so ordinary numeric chat does not become a bookkeeping card.
@@ -797,6 +803,12 @@ def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[flo
         price_match = re.search(rf"(?:均价|成本价|成交价)?\s*({NUMBER_TOKEN_PATTERN})\s*(?:一股|每股|/股|美元|美金|港币|港元|元|刀)?\s*$", message, re.IGNORECASE)
         if price_match and "花了" not in message and "总" not in message and "一共" not in message:
             cost_price = parse_human_number(price_match.group(1), None)
+    if cost_price is None and total_cost is None and quantity is not None:
+        quantity_match = re.search(rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message, re.IGNORECASE)
+        if quantity_match:
+            preceding_numbers = list(re.finditer(NUMBER_TOKEN_PATTERN, message[:quantity_match.start()], re.IGNORECASE))
+            if preceding_numbers:
+                cost_price = parse_human_number(preceding_numbers[-1].group(0), None)
     if cost_price is None and quantity and total_cost is not None:
         cost_price = total_cost / quantity
     if total_cost is None and quantity is not None and cost_price is not None:
@@ -1376,6 +1388,19 @@ def enrich_sell_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def instrument_search_keywords(keyword: str) -> List[str]:
+    raw = str(keyword or "").strip()
+    if not raw:
+        return []
+    keywords = [raw]
+    normalized = raw.replace("纳之", "纳指")
+    if normalized not in keywords:
+        keywords.append(normalized)
+    if "大成" in normalized and "纳指" in normalized:
+        keywords.append("大成纳斯达克100")
+    return list(dict.fromkeys(keywords))
+
+
 async def enrich_with_online_instrument_search(
     parsed: Dict[str, Any],
     message: str,
@@ -1393,15 +1418,21 @@ async def enrich_with_online_instrument_search(
     if not keyword:
         return parsed
 
-    try:
-        candidates = await InstrumentSearchService().search(keyword, limit=8)
-    except Exception as exc:
-        warnings = list(parsed.get("warnings", []))
-        warnings.append(f"标的在线搜索暂时失败：{exc}")
-        parsed["warnings"] = list(dict.fromkeys(warnings))
-        return parsed
-
+    candidates: List[Dict[str, Any]] = []
+    search_error: Optional[Exception] = None
+    for search_keyword in instrument_search_keywords(keyword):
+        try:
+            candidates = await InstrumentSearchService().search(search_keyword, limit=8)
+        except Exception as exc:
+            search_error = exc
+            continue
+        if candidates:
+            break
     if not candidates:
+        if search_error is not None:
+            warnings = list(parsed.get("warnings", []))
+            warnings.append(f"标的在线搜索暂时失败：{search_error}")
+            parsed["warnings"] = list(dict.fromkeys(warnings))
         return parsed
 
     chosen = InstrumentSearchService.choose_confident(candidates)

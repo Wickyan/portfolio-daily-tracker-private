@@ -23,6 +23,19 @@ function parseChineseOrdinal(value: string): number | null {
   return null
 }
 
+function looksLikePendingRevision(pending: PendingAction, text: string): boolean {
+  const value = text.trim()
+  const missing = new Set(pending.missing_fields || [])
+  if (!value || pending.requires_confirmation) return false
+  if (missing.has('account') && /^(?:账户|券商|分组)?\s*(?:改成|改为|是|为|[:：])?\s*(?:长桥|哈富|IBKR|IB|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)$/i.test(value)) return true
+  if (missing.has('code') && /^(?:代码|code)?\s*[:：]?\s*(?:[A-Za-z]{1,8}|\d{4,6})$/i.test(value)) return true
+  if (missing.has('currency') && /^(?:币种)?\s*(?:改成|改为|是|为|[:：])?\s*(?:人民币|人民币元|元|CNY|RMB|港币|港元|HKD|美元|美金|美刀|USD)$/i.test(value)) return true
+  if (missing.has('quantity') && /^(?:数量)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+\s*(?:股|份|个)?$/i.test(value)) return true
+  if ((missing.has('cost_price') || missing.has('cost_price_non_negative')) && /^(?:成本价|均价|成交价)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+$/i.test(value)) return true
+  return /^(?:改成|改为|修改为|修改成|不是).+/.test(value)
+}
+
+
 function parseTargetedConfirmOrdinal(command: string): number | null {
   const match = command.match(/^(?:再)?确认(?:第)?([一二两三四五六七八九十\d]+)条$/)
   if (!match) return null
@@ -48,12 +61,17 @@ function PendingActionCard({
   const changes: PendingChange[] = pending.changes?.length ? pending.changes : [{}]
   const change: PendingChange = changes[0]
 
-  const field = (label: string, value?: string | number | null) => (
-    <div className="flex justify-between gap-4 border-b border-slate-700/60 py-1.5 text-sm">
-      <span className="text-slate-400">{label}</span>
-      <span className="text-right font-medium">{value === undefined || value === null || value === '' ? '缺失' : value}</span>
-    </div>
-  )
+  const field = (label: string, value?: string | number | null) => {
+    const displayValue = typeof value === 'number'
+      ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 8 }).format(value)
+      : value
+    return (
+      <div className="flex justify-between gap-4 border-b border-slate-700/60 py-1.5 text-sm">
+        <span className="text-slate-400">{label}</span>
+        <span className="text-right font-medium">{displayValue === undefined || displayValue === null || displayValue === '' ? '缺失' : displayValue}</span>
+      </div>
+    )
+  }
 
   const run = async (fn: () => Promise<void>) => {
     setIsWorking(true)
@@ -528,6 +546,37 @@ export default function ChatPanel() {
             ...state.messages,
             userEntry,
             { role: 'assistant', content: `操作失败：${getApiErrorMessage(error)}` },
+          ],
+        }))
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    // A concise reply to the latest incomplete card is treated as a field revision.
+    if (
+      currentImages.length === 0
+      && latestPendingEntry?.pending?.pending_id
+      && looksLikePendingRevision(latestPendingEntry.pending, userMessage)
+    ) {
+      const originalPendingId = latestPendingEntry.pending.pending_id
+      setLoading(true)
+      try {
+        const updated = await portfolioService.aiRevise(originalPendingId, userMessage)
+        useAppStore.setState((state) => ({
+          messages: [
+            ...state.messages,
+            { role: 'user', content: userMessage },
+          ],
+        }))
+        appendRevisedPendingMessage(originalPendingId, updated)
+      } catch (error) {
+        useAppStore.setState((state) => ({
+          messages: [
+            ...state.messages,
+            { role: 'user', content: userMessage },
+            { role: 'assistant', content: `补充失败：${getApiErrorMessage(error)}` },
           ],
         }))
       } finally {
