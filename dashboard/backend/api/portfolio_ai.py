@@ -309,6 +309,8 @@ def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
         "operation_id": pending.get("operation_id"),
         "instrument_candidates": pending.get("instrument_candidates", []),
         "revision_options": pending.get("revision_options", []),
+        "revision_diffs": pending.get("revision_diffs", []),
+        "correction_context": pending.get("correction_context"),
         "revises_pending_id": pending.get("revises_pending_id"),
         "revised_to_pending_id": pending.get("revised_to_pending_id"),
     }
@@ -1544,7 +1546,11 @@ async def resolve_revision_with_llm(
         if not payload:
             return None
 
-        allowed_fields = {"account", "currency", "quantity", "cost_price", "fee", "amount", "note"}
+        action_type = str(pending.get("action_type") or "add_or_update")
+        if action_type in {"deposit", "withdraw", "set_cash"}:
+            allowed_fields = {"account", "currency", "amount", "note"}
+        else:
+            allowed_fields = {"account", "currency", "quantity", "cost_price", "fee", "note"}
         updates: Dict[str, Any] = {}
         raw_updates = payload.get("field_updates")
         if isinstance(raw_updates, dict):
@@ -1650,7 +1656,9 @@ async def apply_contextual_revision(
         else:
             warnings.append(f"未找到与“{instruction}”匹配的场内证券，请补充更完整的名称或代码")
 
-    change = PortfolioWriteService().normalize_position(change) if is_position_action else change
+    if is_position_action:
+        change.pop("amount", None)
+        change = PortfolioWriteService().normalize_position(change)
     changes[0] = change
     missing = build_missing(change, action_type)
     parsed = {
@@ -2241,6 +2249,8 @@ def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[
         "warnings": parsed.get("warnings", []),
         "instrument_candidates": parsed.get("instrument_candidates", []),
         "revision_options": parsed.get("revision_options", []),
+        "revision_diffs": parsed.get("revision_diffs", []),
+        "correction_context": parsed.get("correction_context"),
         "requires_confirmation": (
             parsed.get("intent") == "bookkeeping"
             and len(missing) == 0
@@ -2271,8 +2281,123 @@ async def ai_preview(request: PreviewRequest):
     return public_pending(pending)
 
 
+REVISION_DIFF_FIELDS: tuple[tuple[str, str], ...] = (
+    ("account", "账户"),
+    ("name", "标的"),
+    ("code", "代码"),
+    ("currency", "币种"),
+    ("quantity", "数量"),
+    ("cost_price", "成本价（均价）"),
+    ("fee", "手续费"),
+    ("amount", "现金金额"),
+)
+
+
+def is_revision_correction(message: str) -> bool:
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(message or "")))
+    return bool(re.search(
+        r"(?:不对|改错了|你改错了|系统改错了|上一步错了|刚才(?:你|系统)?改错了|撤销刚才|撤回刚才|不是(?:改|这个|刚才|上一步)|(?:^|[，,。；;])错了)",
+        text,
+    ))
+
+
+def correction_has_replacement_instruction(message: str) -> bool:
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if re.search(NUMBER_TOKEN_PATTERN, text, re.IGNORECASE):
+        return True
+    if re.search(
+        r"(?:账户|券商|分组|标的|名称|代码|币种|数量|成本价|均价|成交价|金额|余额|手续费)\s*(?:改成|改为|修改成|修改为|是|为|[:：])?\s*[A-Za-z0-9\u4e00-\u9fff]+",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        r"(?:而是|应该(?:改成|改为|是)|改成|改为|修改成|修改为|是)\s*(?!这个|不对|错了)([A-Za-z][A-Za-z0-9._-]*|[\u4e00-\u9fff]{2,})",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def stable_revision_warnings(warnings: List[str]) -> List[str]:
+    """Keep durable inference/safety warnings, drop stale per-step edit narration."""
+    transient_patterns = (
+        r"^已将.+修改为",
+        r"^已修改：",
+        r"^根据当前确认卡，我猜你想把",
+        r"^无法确定“.+”要修改哪个字段",
+        r"^已撤销上一步",
+        r"^本次改为",
+    )
+    return [
+        str(warning)
+        for warning in warnings
+        if not any(re.search(pattern, str(warning)) for pattern in transient_patterns)
+    ]
+
+
+def _display_revision_value(value: Any) -> str:
+    if value is None or value == "":
+        return "缺失"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return format_human_number(float(value))
+    return str(value)
+
+
+def build_revision_diffs(
+    before_changes: List[Dict[str, Any]],
+    after_changes: List[Dict[str, Any]],
+    *,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    if len(before_changes) != len(after_changes):
+        return []
+    diffs: List[Dict[str, Any]] = []
+    for index, (before, after) in enumerate(zip(before_changes, after_changes)):
+        for field, label in REVISION_DIFF_FIELDS:
+            old_value = before.get(field)
+            new_value = after.get(field)
+            old_number = to_float(old_value, None) if isinstance(old_value, (int, float)) else None
+            new_number = to_float(new_value, None) if isinstance(new_value, (int, float)) else None
+            if old_number is not None and new_number is not None:
+                if math.isclose(old_number, new_number, rel_tol=1e-12, abs_tol=1e-12):
+                    continue
+            elif old_value == new_value:
+                continue
+            diffs.append({
+                "kind": kind,
+                "change_index": index,
+                "field": field,
+                "label": label,
+                "before": old_value,
+                "after": new_value,
+                "before_text": _display_revision_value(old_value),
+                "after_text": _display_revision_value(new_value),
+            })
+    return diffs
+
+
+def restored_pending_parse(pending: Dict[str, Any]) -> Dict[str, Any]:
+    changes = [dict(change) for change in pending.get("changes", [])]
+    action_type = str(pending.get("action_type") or "add_or_update")
+    return {
+        "intent": "bookkeeping",
+        "summary": "已撤销上一步修改，请继续补充或确认",
+        "action_type": action_type,
+        "changes": changes,
+        "missing_fields": collect_missing_fields(changes, action_type),
+        "warnings": stable_revision_warnings(list(pending.get("warnings", []))) + [
+            "已恢复到上一步修改前的确认卡；尚未写入Portfolio"
+        ],
+        "instrument_candidates": pending.get("instrument_candidates", []),
+        "revision_options": [],
+    }
+
+
 @router.post("/ai-revise")
 async def ai_revise(request: ReviseRequest):
+    correction = is_revision_correction(request.message)
     with PORTFOLIO_MUTATION_LOCK:
         current = load_pending(request.pending_id)
         if current.get("status") == "superseded" and current.get("revised_to_pending_id"):
@@ -2282,23 +2407,71 @@ async def ai_revise(request: ReviseRequest):
                 return public_pending(successor)
             raise HTTPException(status_code=409, detail="该确认卡已被另一条修改替代")
         require_open_pending(current)
-        pending = deepcopy(current)
         revision_token = current.get("updated_at") or current.get("created_at")
 
-    parsed = apply_direct_field_revision(pending, request.message)
+        parse_base = deepcopy(current)
+        restored_from_pending_id: Optional[str] = None
+        if correction and current.get("revises_pending_id"):
+            predecessor = load_pending(str(current["revises_pending_id"]))
+            parse_base = deepcopy(predecessor)
+            restored_from_pending_id = str(predecessor.get("pending_id") or "")
+        parse_base["warnings"] = stable_revision_warnings(list(parse_base.get("warnings", [])))
+        if str(parse_base.get("action_type") or "add_or_update") not in {
+            "deposit", "withdraw", "set_cash", "multi_cash", "fx_exchange"
+        }:
+            for change in parse_base.get("changes", []):
+                change.pop("amount", None)
+
+    parsed = apply_direct_field_revision(parse_base, request.message)
     if parsed is None:
-        parsed = apply_bare_numeric_revision(pending, request.message)
+        parsed = apply_bare_numeric_revision(parse_base, request.message)
     if parsed is None:
-        parsed = apply_direct_code_revision(pending, request.message)
+        parsed = apply_direct_code_revision(parse_base, request.message)
+    if (
+        parsed is None
+        and correction
+        and restored_from_pending_id
+        and not correction_has_replacement_instruction(request.message)
+    ):
+        parsed = restored_pending_parse(parse_base)
     if parsed is None:
-        parsed = await apply_contextual_revision(pending, request.message)
+        parsed = await apply_contextual_revision(parse_base, request.message)
+    if parsed is None and correction and restored_from_pending_id:
+        parsed = restored_pending_parse(parse_base)
     if parsed is None:
-        parsed = parse_bookkeeping_message(request.message, previous=pending)
+        parsed = parse_bookkeeping_message(request.message, previous=parse_base)
         parsed = await enrich_with_online_instrument_search(parsed, request.message)
     parsed = enrich_cash_availability(parsed)
     parsed = enrich_sell_availability(parsed)
     if parsed.get("intent") == "chat_only":
         raise HTTPException(status_code=400, detail="未识别到可用于补充的记账信息")
+
+    before_current = [dict(change) for change in current.get("changes", [])]
+    before_base = [dict(change) for change in parse_base.get("changes", [])]
+    after_changes = [dict(change) for change in parsed.get("changes", [])]
+    revision_diffs: List[Dict[str, Any]] = []
+    if restored_from_pending_id:
+        revision_diffs.extend(build_revision_diffs(
+            before_current,
+            before_base,
+            kind="reverted",
+        ))
+    revision_diffs.extend(build_revision_diffs(
+        before_base,
+        after_changes,
+        kind="applied",
+    ))
+    parsed["revision_diffs"] = revision_diffs
+    if restored_from_pending_id:
+        parsed["correction_context"] = {
+            "corrects_pending_id": current.get("pending_id"),
+            "restored_from_pending_id": restored_from_pending_id,
+        }
+        parsed["warnings"] = list(dict.fromkeys(
+            stable_revision_warnings(list(parsed.get("warnings", []))) + [
+                "已先撤销上一张卡的修改，再按你这次的说明生成新卡；请核对后再确认写入"
+            ]
+        ))
 
     with PORTFOLIO_MUTATION_LOCK:
         latest = load_pending(request.pending_id)

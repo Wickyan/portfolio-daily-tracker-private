@@ -142,5 +142,141 @@ class NumericRevisionTest(unittest.IsolatedAsyncioTestCase):
                 pending_path(pending_id).unlink(missing_ok=True)
 
 
+    async def test_correction_reverts_wrong_previous_field_before_applying_new_field(self) -> None:
+        initial_data = base_pending()
+        initial_data["changes"][0]["quantity"] = 1270.0
+        initial_data["changes"][0]["available_qty"] = 1270.0
+        initial_data["changes"][0]["cost_price"] = 1.243
+        initial_data["changes"][0]["total_cost"] = 1578.61
+        initial = make_pending(initial_data, "text", "银河 纳斯达克 1.243元 1270个")
+        created: list[str] = []
+        try:
+            save_pending(initial)
+            created.append(initial["pending_id"])
+
+            wrong = await ai_revise(ReviseRequest(
+                pending_id=initial["pending_id"],
+                message="1.240",
+            ))
+            created.append(wrong["pending_id"])
+            self.assertEqual(wrong["changes"][0]["quantity"], 1270)
+            self.assertEqual(wrong["changes"][0]["cost_price"], 1.24)
+
+            corrected = await ai_revise(ReviseRequest(
+                pending_id=wrong["pending_id"],
+                message="不对 是数量修改成1.240",
+            ))
+            created.append(corrected["pending_id"])
+            change = corrected["changes"][0]
+            self.assertEqual(change["code"], "513100")
+            self.assertEqual(change["quantity"], 1.24)
+            self.assertEqual(change["available_qty"], 1.24)
+            self.assertEqual(change["cost_price"], 1.243)
+            self.assertAlmostEqual(change["total_cost"], 1.54132)
+            self.assertNotIn("amount", change)
+            self.assertTrue(corrected["requires_confirmation"])
+            self.assertIsNotNone(corrected["correction_context"])
+
+            reverted = [item for item in corrected["revision_diffs"] if item["kind"] == "reverted"]
+            applied = [item for item in corrected["revision_diffs"] if item["kind"] == "applied"]
+            self.assertTrue(any(
+                item["field"] == "cost_price" and item["before"] == 1.24 and item["after"] == 1.243
+                for item in reverted
+            ))
+            self.assertTrue(any(
+                item["field"] == "quantity" and item["before"] == 1270 and item["after"] == 1.24
+                for item in applied
+            ))
+            self.assertFalse(any("猜你想把成本价" in warning for warning in corrected["warnings"]))
+            self.assertTrue(any("先撤销上一张卡" in warning for warning in corrected["warnings"]))
+        finally:
+            for pending_id in created:
+                pending_path(pending_id).unlink(missing_ok=True)
+
+    async def test_bare_correction_restores_previous_card_without_guessing(self) -> None:
+        initial_data = base_pending()
+        initial_data["changes"][0]["quantity"] = 1270.0
+        initial_data["changes"][0]["available_qty"] = 1270.0
+        initial_data["changes"][0]["cost_price"] = 1.243
+        initial_data["changes"][0]["total_cost"] = 1578.61
+        initial = make_pending(initial_data, "text", "银河 纳斯达克 1.243元 1270个")
+        created: list[str] = []
+        try:
+            save_pending(initial)
+            created.append(initial["pending_id"])
+            wrong = await ai_revise(ReviseRequest(
+                pending_id=initial["pending_id"],
+                message="1.240",
+            ))
+            created.append(wrong["pending_id"])
+
+            restored = await ai_revise(ReviseRequest(
+                pending_id=wrong["pending_id"],
+                message="不对，你改的不是这个",
+            ))
+            created.append(restored["pending_id"])
+            change = restored["changes"][0]
+            self.assertEqual(change["quantity"], 1270)
+            self.assertEqual(change["cost_price"], 1.243)
+            self.assertTrue(restored["requires_confirmation"])
+            self.assertEqual(restored["summary"], "已撤销上一步修改，请继续补充或确认")
+            self.assertTrue(any(item["kind"] == "reverted" for item in restored["revision_diffs"]))
+            self.assertFalse(any(item["kind"] == "applied" for item in restored["revision_diffs"]))
+        finally:
+            for pending_id in created:
+                pending_path(pending_id).unlink(missing_ok=True)
+
+    async def test_correction_can_replace_wrong_quantity_with_cost_price(self) -> None:
+        initial = make_pending(base_pending(), "text", "银河 纳斯达克 1.243元 12700个")
+        created: list[str] = []
+        try:
+            save_pending(initial)
+            created.append(initial["pending_id"])
+            wrong = await ai_revise(ReviseRequest(
+                pending_id=initial["pending_id"],
+                message="数量12710",
+            ))
+            created.append(wrong["pending_id"])
+
+            corrected = await ai_revise(ReviseRequest(
+                pending_id=wrong["pending_id"],
+                message="不是改数量，是成本价1.244",
+            ))
+            created.append(corrected["pending_id"])
+            change = corrected["changes"][0]
+            self.assertEqual(change["quantity"], 12700)
+            self.assertEqual(change["cost_price"], 1.244)
+        finally:
+            for pending_id in created:
+                pending_path(pending_id).unlink(missing_ok=True)
+
+
+    async def test_plain_not_x_but_y_edits_current_card_without_undoing_unrelated_revision(self) -> None:
+        initial = make_pending(base_pending(), "text", "银河 纳斯达克 1.243元 12700个")
+        created: list[str] = []
+        try:
+            save_pending(initial)
+            created.append(initial["pending_id"])
+            quantity_card = await ai_revise(ReviseRequest(
+                pending_id=initial["pending_id"],
+                message="数量12710",
+            ))
+            created.append(quantity_card["pending_id"])
+
+            currency_card = await ai_revise(ReviseRequest(
+                pending_id=quantity_card["pending_id"],
+                message="不是人民币，而是美元",
+            ))
+            created.append(currency_card["pending_id"])
+            change = currency_card["changes"][0]
+            self.assertEqual(change["quantity"], 12710)
+            self.assertEqual(change["currency"], "USD")
+            self.assertIsNone(currency_card.get("correction_context"))
+            self.assertFalse(any(item["kind"] == "reverted" for item in currency_card["revision_diffs"]))
+        finally:
+            for pending_id in created:
+                pending_path(pending_id).unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

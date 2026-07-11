@@ -120,6 +120,22 @@ export interface PendingChange {
   amount?: number | null
 }
 
+export interface RevisionDiff {
+  kind: 'reverted' | 'applied' | string
+  change_index: number
+  field: string
+  label: string
+  before: string | number | null
+  after: string | number | null
+  before_text: string
+  after_text: string
+}
+
+export interface CorrectionContext {
+  corrects_pending_id?: string
+  restored_from_pending_id?: string
+}
+
 export interface RevisionOption {
   field: string
   value: string | number
@@ -150,6 +166,8 @@ export interface PendingAction {
   operation_id?: string
   instrument_candidates?: InstrumentCandidate[]
   revision_options?: RevisionOption[]
+  revision_diffs?: RevisionDiff[]
+  correction_context?: CorrectionContext | null
   revises_pending_id?: string
   revised_to_pending_id?: string
 }

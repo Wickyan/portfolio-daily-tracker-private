@@ -40,7 +40,8 @@ function looksLikePendingRevision(pending: PendingAction, text: string): boolean
   if (missing.has('currency') && /^(?:币种)?\s*(?:改成|改为|是|为|[:：])?\s*(?:人民币|人民币元|元|CNY|RMB|港币|港元|HKD|美元|美金|美刀|USD)$/i.test(value)) return true
   if (missing.has('quantity') && /^(?:数量)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+\s*(?:股|份|个)?$/i.test(value)) return true
   if ((missing.has('cost_price') || missing.has('cost_price_non_negative')) && /^(?:成本价|均价|成交价)?\s*(?:改成|改为|是|为|[:：])?\s*[+-]?[\d,.]+$/i.test(value)) return true
-  return /^(?:改成|改为|修改为|修改成|不是).+/.test(value)
+  if (/(?:不对|改错了|你改错了|系统改错了|上一步错了|刚才.*改错了|撤销刚才|撤回刚才|不是(?:改|这个|刚才|上一步))/.test(value)) return true
+  return /^(?:错了|改成|改为|修改为|修改成|不是).*/.test(value)
 }
 
 
@@ -139,6 +140,38 @@ function PendingActionCard({
           )
         })}
       </div>
+      {pending.revision_diffs && pending.revision_diffs.length > 0 && (
+        <div className="space-y-2 rounded border border-sky-500/30 bg-sky-500/5 p-3">
+          {pending.revision_diffs.some((item) => item.kind === 'reverted') && (
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-amber-200">已撤销上一步修改</div>
+              {pending.revision_diffs
+                .filter((item) => item.kind === 'reverted')
+                .map((item, index) => (
+                  <div key={`reverted-${item.field}-${index}`} className="text-sm text-slate-300">
+                    {item.label}：<span className="line-through text-slate-500">{item.before_text}</span>
+                    <span className="mx-1">→</span>
+                    <span className="font-medium text-amber-100">{item.after_text}</span>
+                  </div>
+                ))}
+            </div>
+          )}
+          {pending.revision_diffs.some((item) => item.kind === 'applied') && (
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-sky-200">本次修改</div>
+              {pending.revision_diffs
+                .filter((item) => item.kind === 'applied')
+                .map((item, index) => (
+                  <div key={`applied-${item.field}-${index}`} className="text-sm text-slate-300">
+                    {item.label}：<span className="text-slate-500">{item.before_text}</span>
+                    <span className="mx-1">→</span>
+                    <span className="font-medium text-sky-100">{item.after_text}</span>
+                  </div>
+                ))}
+            </div>
+          )}
+        </div>
+      )}
       {pending.missing_fields?.length > 0 && (
         <div className="text-sm text-amber-300">
           缺少/阻止写入：{pending.missing_fields.map((item) => ({
