@@ -120,6 +120,13 @@ export interface PendingChange {
   amount?: number | null
 }
 
+export interface RevisionOption {
+  field: string
+  value: string | number
+  label: string
+  message: string
+}
+
 export interface InstrumentCandidate {
   code: string
   name: string
@@ -142,6 +149,7 @@ export interface PendingAction {
   status?: string
   operation_id?: string
   instrument_candidates?: InstrumentCandidate[]
+  revision_options?: RevisionOption[]
   revises_pending_id?: string
   revised_to_pending_id?: string
 }

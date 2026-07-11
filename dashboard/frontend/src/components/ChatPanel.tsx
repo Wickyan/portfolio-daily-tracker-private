@@ -26,7 +26,9 @@ function parseChineseOrdinal(value: string): number | null {
 function looksLikePendingRevision(pending: PendingAction, text: string): boolean {
   const value = text.trim()
   const missing = new Set(pending.missing_fields || [])
-  if (!value || pending.requires_confirmation) return false
+  if (!value) return false
+  const isBareNumber = /^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[kKwW]|千|万)?$/.test(value)
+  if (isBareNumber && pending.changes?.length === 1) return true
   if (missing.has('account') && /^(?:账户|券商|分组)?\s*(?:改成|改为|是|为|[:：])?\s*(?:长桥|哈富|IBKR|IB|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)$/i.test(value)) return true
   if (missing.has('code') && /^(?:代码|code)?\s*[:：]?\s*(?:[A-Za-z]{1,8}|\d{4,6})$/i.test(value)) return true
   if (
@@ -166,6 +168,25 @@ function PendingActionCard({
           ))}
         </div>
       )}
+      {pending.revision_options && pending.revision_options.length > 0 && (
+        <div className="space-y-2 rounded border border-amber-500/30 bg-amber-500/5 p-3">
+          <div className="text-sm font-medium text-amber-200">这个数字可能表示不同字段，请选择：</div>
+          <div className="flex flex-wrap gap-2">
+            {pending.revision_options.map((option) => (
+              <button
+                key={`${option.field}-${option.message}`}
+                onClick={() => run(async () => {
+                  await onRevise(option.message)
+                })}
+                disabled={isWorking}
+                className="rounded border border-amber-500/40 bg-slate-700 px-3 py-1.5 text-left text-sm hover:border-amber-400 hover:bg-slate-600 disabled:opacity-50"
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {pending.instrument_candidates && pending.instrument_candidates.length > 0 && !change.code && (
         <div className="space-y-2">
           <div className="text-sm text-slate-300">搜索候选：</div>
@@ -275,6 +296,43 @@ export default function ChatPanel() {
     setLoading,
     clearMessages,
   } = useAppStore()
+
+  // Reconcile persisted cards with the backend on page load. This prevents
+  // stale localStorage cards from showing an old code/status after a server-side
+  // revision, expiry or rollback.
+  useEffect(() => {
+    const currentMessages = useAppStore.getState().messages
+    const pendingIds = Array.from(new Set(
+      currentMessages
+        .map((message) => message.pendingAction?.pending_id)
+        .filter((pendingId): pendingId is string => Boolean(pendingId)),
+    ))
+    if (pendingIds.length === 0) return
+
+    let cancelled = false
+    Promise.all(pendingIds.map(async (pendingId) => {
+      try {
+        return [pendingId, await portfolioService.getPending(pendingId)] as const
+      } catch {
+        return [pendingId, null] as const
+      }
+    })).then((rows) => {
+      if (cancelled) return
+      const refreshed = new Map(rows.filter((row) => row[1] !== null))
+      if (refreshed.size === 0) return
+      useAppStore.setState((state) => ({
+        messages: state.messages.map((message) => {
+          const pendingId = message.pendingAction?.pending_id
+          const pending = pendingId ? refreshed.get(pendingId) : null
+          return pending ? { ...message, pendingAction: pending } : message
+        }),
+      }))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // 自动滚动到底部
   useEffect(() => {

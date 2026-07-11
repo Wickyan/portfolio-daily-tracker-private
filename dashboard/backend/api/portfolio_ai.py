@@ -308,6 +308,7 @@ def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
         "status": pending.get("status", "pending"),
         "operation_id": pending.get("operation_id"),
         "instrument_candidates": pending.get("instrument_candidates", []),
+        "revision_options": pending.get("revision_options", []),
         "revises_pending_id": pending.get("revises_pending_id"),
         "revised_to_pending_id": pending.get("revised_to_pending_id"),
     }
@@ -1730,36 +1731,283 @@ async def enrich_with_online_instrument_search(
     return parsed
 
 
-def apply_direct_code_revision(
+def _numeric_revision_warning_filter(warnings: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    for warning in warnings:
+        text = str(warning or "")
+        if re.search(r"“[+-]?[\d,.]+”", text) and (
+            "场内证券" in text or "无法唯一确定标的" in text or "匹配" in text
+        ):
+            continue
+        cleaned.append(text)
+    return cleaned
+
+
+def _relative_numeric_change(new_value: float, old_value: Optional[float]) -> Optional[float]:
+    if old_value is None or not math.isfinite(old_value):
+        return None
+    scale = max(abs(old_value), 1e-9)
+    return abs(new_value - old_value) / scale
+
+
+def _numeric_change_score(
+    value: float,
+    current: Optional[float],
+    *,
+    field: str,
+    has_decimal: bool,
+) -> float:
+    base = 0.9 if field == "cost_price" and has_decimal else 0.0
+    if field == "quantity":
+        base = 0.8 if not has_decimal else 0.2
+    if field == "cost_price" and not has_decimal:
+        base = 0.25
+
+    relative = _relative_numeric_change(value, current)
+    if relative is None:
+        return base
+    if relative <= 1e-12:
+        return max(0.0, base - 0.8)
+    if relative <= 0.02:
+        return base + 1.2
+    if relative <= 0.10:
+        return base + 0.9
+    if relative <= 0.50:
+        return base + 0.4
+    return base
+
+
+def _apply_inferred_position_number(
+    pending: Dict[str, Any],
+    field: str,
+    value: float,
+) -> Dict[str, Any]:
+    changes = [dict(change) for change in pending.get("changes", [])]
+    change = changes[0]
+    warnings = _numeric_revision_warning_filter(list(pending.get("warnings", [])))
+    old_value = to_float(change.get(field), None)
+
+    if field == "quantity":
+        change["quantity"] = value
+        if str(pending.get("action_type") or "add_or_update") != "sell":
+            change["available_qty"] = value
+        label = "数量"
+    else:
+        change["cost_price"] = value
+        label = "成本价（均价）"
+
+    quantity = to_float(change.get("quantity"), None)
+    cost_price = to_float(change.get("cost_price"), None)
+    fee = to_float(change.get("fee"), 0.0) or 0.0
+    if quantity is not None and cost_price is not None:
+        change["total_cost"] = quantity * cost_price + fee
+    change.pop("amount", None)
+    change["updated_at"] = utc_now_iso()
+    change = PortfolioWriteService().normalize_position(change)
+    changes[0] = change
+
+    old_text = "缺失" if old_value is None else format_human_number(old_value)
+    new_text = format_human_number(value)
+    warnings.append(
+        f"根据当前确认卡，我猜你想把{label}从{old_text}改为{new_text}。这是推测，请核对新卡后再确认写入"
+    )
+    return enrich_instrument_currency_consistency({
+        "intent": "bookkeeping",
+        "summary": f"推测你要修改{label}，请确认",
+        "action_type": str(pending.get("action_type") or "add_or_update"),
+        "changes": changes,
+        "missing_fields": collect_missing_fields(changes, str(pending.get("action_type") or "add_or_update")),
+        "warnings": list(dict.fromkeys(warnings)),
+        "instrument_candidates": pending.get("instrument_candidates", []),
+        "revision_options": [],
+    })
+
+
+def apply_bare_numeric_revision(
     pending: Dict[str, Any],
     message: str,
-) -> Dict[str, Any] | None:
-    """Allow a bare code or '代码xxxx' to select an online-search candidate."""
-    if not pending.get("changes"):
+) -> Optional[Dict[str, Any]]:
+    """Interpret a bare numeric follow-up using the current card.
+
+    Bare numbers are never silently treated as security codes. A unique,
+    context-supported interpretation produces a tentative new confirmation
+    card; ambiguous values produce explicit field-choice buttons.
+    """
+    if not pending.get("changes") or len(pending.get("changes", [])) != 1:
         return None
-    match = re.search(
-        r"^(?:代码|code)?\s*[:：]?\s*([A-Za-z]{1,8}|[0-9]{4,6})\s*$",
-        message.strip(),
+    action_type = str(pending.get("action_type") or "add_or_update")
+    if action_type in {"deposit", "withdraw", "set_cash", "multi_cash", "fx_exchange"}:
+        return None
+
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    match = re.fullmatch(
+        rf"({NUMBER_TOKEN_PATTERN})\s*(?:(股|股票|份|个)|(人民币元|人民币|港币|港元|美元|美金|美刀|CNY|RMB|HKD|USD|元|刀))?\s*[。.]?",
+        text,
         re.IGNORECASE,
     )
     if not match:
         return None
-    code = match.group(1).upper()
-    candidates = pending.get("instrument_candidates", []) or []
-    selected = next((candidate for candidate in candidates if str(candidate.get("code") or "").upper() == code), None)
+    value = parse_human_number(match.group(1), None)
+    if value is None or not math.isfinite(value):
+        return None
+    quantity_unit = bool(match.group(2))
+    price_unit = bool(match.group(3))
+    has_decimal = "." in match.group(1)
 
-    updated = dict(pending["changes"][0])
+    change = dict(pending["changes"][0])
+    current_quantity = to_float(change.get("quantity"), None)
+    current_cost = to_float(change.get("cost_price"), None)
+
+    if quantity_unit:
+        return _apply_inferred_position_number(pending, "quantity", value)
+    if price_unit:
+        return _apply_inferred_position_number(pending, "cost_price", value)
+
+    scored: List[tuple[str, float]] = []
+    quantity_relative = _relative_numeric_change(value, current_quantity)
+    cost_relative = _relative_numeric_change(value, current_cost)
+    if current_quantity is None or quantity_relative is None or quantity_relative <= 0.50:
+        scored.append(("quantity", _numeric_change_score(
+            value, current_quantity, field="quantity", has_decimal=has_decimal,
+        )))
+    if current_cost is None or cost_relative is None or cost_relative <= 0.50:
+        scored.append(("cost_price", _numeric_change_score(
+            value, current_cost, field="cost_price", has_decimal=has_decimal,
+        )))
+
+    exact_code_candidate = None
+    if not str(change.get("code") or "").strip() and float(value).is_integer():
+        code = str(int(value))
+        exact_code_candidate = next((
+            candidate for candidate in pending.get("instrument_candidates", [])
+            if str(candidate.get("code") or "").upper() == code.upper()
+        ), None)
+        if exact_code_candidate:
+            scored.append(("code", 2.2))
+
+    if not scored:
+        scored = [
+            ("quantity", 0.8 if not has_decimal else 0.2),
+            ("cost_price", 0.9 if has_decimal else 0.25),
+        ]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    best_field, best_score = scored[0]
+    second_score = scored[1][1] if len(scored) > 1 else -1.0
+
+    if best_field in {"quantity", "cost_price"} and best_score >= 1.35 and best_score - second_score >= 0.45:
+        return _apply_inferred_position_number(pending, best_field, value)
+    if best_field == "code" and best_score - second_score >= 0.45 and exact_code_candidate:
+        return apply_direct_code_revision(pending, f"代码{exact_code_candidate['code']}")
+
+    options = []
+    seen_fields = set()
+    for field, _score in scored:
+        if field in seen_fields:
+            continue
+        seen_fields.add(field)
+        if field == "quantity":
+            options.append({
+                "field": "quantity",
+                "value": value,
+                "label": f"把数量改为{format_human_number(value)}",
+                "message": f"数量{format_human_number(value)}",
+            })
+        elif field == "cost_price":
+            options.append({
+                "field": "cost_price",
+                "value": value,
+                "label": f"把成本价改为{format_human_number(value)}",
+                "message": f"成本价{format_human_number(value)}",
+            })
+        elif field == "code" and exact_code_candidate:
+            options.append({
+                "field": "code",
+                "value": exact_code_candidate["code"],
+                "label": f"选择代码{exact_code_candidate['code']} {exact_code_candidate['name']}",
+                "message": f"代码{exact_code_candidate['code']}",
+            })
+
+    if len(options) < 2:
+        existing_fields = {str(option.get("field") or "") for option in options}
+        if "quantity" not in existing_fields:
+            options.append({
+                "field": "quantity",
+                "value": value,
+                "label": f"把数量改为{format_human_number(value)}",
+                "message": f"数量{format_human_number(value)}",
+            })
+        if "cost_price" not in existing_fields:
+            options.append({
+                "field": "cost_price",
+                "value": value,
+                "label": f"把成本价改为{format_human_number(value)}",
+                "message": f"成本价{format_human_number(value)}",
+            })
+
+    changes = [dict(item) for item in pending.get("changes", [])]
+    warnings = _numeric_revision_warning_filter(list(pending.get("warnings", [])))
+    option_names = "、".join(str(option.get("label") or "") for option in options)
+    warnings.append(
+        f"无法确定“{format_human_number(value)}”要修改哪个字段，系统没有自动修改。请在下方选择：{option_names}"
+    )
+    return {
+        "intent": "bookkeeping",
+        "summary": "这个数字的修改目标不明确，请选择",
+        "action_type": action_type,
+        "changes": changes,
+        "missing_fields": collect_missing_fields(changes, action_type),
+        "warnings": list(dict.fromkeys(warnings)),
+        "instrument_candidates": pending.get("instrument_candidates", []),
+        "revision_options": options,
+    }
+
+
+def apply_direct_code_revision(
+    pending: Dict[str, Any],
+    message: str,
+) -> Dict[str, Any] | None:
+    """Apply an explicit code, or a bare exact candidate while code is missing."""
+    if not pending.get("changes"):
+        return None
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    explicit = re.fullmatch(
+        r"(?:代码|股票代码|证券代码|code)\s*[:：]?\s*([A-Za-z]{1,8}|[0-9]{4,6})",
+        text,
+        re.IGNORECASE,
+    )
+    bare = re.fullmatch(r"([A-Za-z]{1,8}|[0-9]{4,6})", text, re.IGNORECASE)
+    if not explicit and not bare:
+        return None
+
+    code = (explicit or bare).group(1).upper()
+    candidates = pending.get("instrument_candidates", []) or []
+    selected = next((
+        candidate for candidate in candidates
+        if str(candidate.get("code") or "").upper() == code
+    ), None)
+    current_change = dict(pending["changes"][0])
+    if not explicit:
+        if str(current_change.get("code") or "").strip() or selected is None:
+            return None
+
+    updated = current_change
     updated["code"] = code
     if selected:
         updated["name"] = selected.get("name") or updated.get("name")
-        updated["currency"] = updated.get("currency") or selected.get("currency")
+        updated["currency"] = selected.get("currency") or updated.get("currency")
         updated["asset_type"] = selected.get("asset_type") or updated.get("asset_type")
+    updated.pop("amount", None)
     updated = PortfolioWriteService().normalize_position(updated)
     action_type = str(pending.get("action_type") or "add_or_update")
     missing = build_missing(updated, action_type)
-    warnings = [warning for warning in pending.get("warnings", []) if "联网找到多个候选" not in warning]
+    warnings = [
+        warning for warning in pending.get("warnings", [])
+        if "联网找到多个候选" not in warning and "未能唯一确定标的" not in warning
+    ]
     if selected:
         warnings.append(f"已选择联网候选：{selected['code']} {selected['name']}")
+    elif explicit:
+        warnings.append(f"已按你明确输入的代码{code}修改，请核对标的名称和币种")
     return enrich_instrument_currency_consistency({
         "intent": "bookkeeping",
         "summary": "已补充标的代码",
@@ -1768,6 +2016,7 @@ def apply_direct_code_revision(
         "missing_fields": missing,
         "warnings": list(dict.fromkeys(warnings)),
         "instrument_candidates": candidates,
+        "revision_options": [],
     })
 
 
@@ -1935,6 +2184,8 @@ def apply_direct_field_revision(
     if quantity is not None and action_type not in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
         change = original_changes[0]
         change["quantity"] = quantity
+        if action_type != "sell":
+            change["available_qty"] = quantity
         cost_price = to_float(change.get("cost_price"), None)
         if cost_price is not None:
             change["total_cost"] = quantity * cost_price
@@ -1989,7 +2240,12 @@ def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[
         "missing_fields": missing,
         "warnings": parsed.get("warnings", []),
         "instrument_candidates": parsed.get("instrument_candidates", []),
-        "requires_confirmation": parsed.get("intent") == "bookkeeping" and len(missing) == 0,
+        "revision_options": parsed.get("revision_options", []),
+        "requires_confirmation": (
+            parsed.get("intent") == "bookkeeping"
+            and len(missing) == 0
+            and not parsed.get("revision_options")
+        ),
     }
     return pending
 
@@ -2030,6 +2286,8 @@ async def ai_revise(request: ReviseRequest):
         revision_token = current.get("updated_at") or current.get("created_at")
 
     parsed = apply_direct_field_revision(pending, request.message)
+    if parsed is None:
+        parsed = apply_bare_numeric_revision(pending, request.message)
     if parsed is None:
         parsed = apply_direct_code_revision(pending, request.message)
     if parsed is None:
