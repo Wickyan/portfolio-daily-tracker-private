@@ -1392,13 +1392,17 @@ def instrument_search_keywords(keyword: str) -> List[str]:
     raw = str(keyword or "").strip()
     if not raw:
         return []
-    keywords = [raw]
     normalized = raw.replace("纳之", "纳指")
-    if normalized not in keywords:
-        keywords.append(normalized)
-    if "大成" in normalized and "纳指" in normalized:
-        keywords.append("大成纳斯达克100")
-    return list(dict.fromkeys(keywords))
+    if "纳指" in normalized:
+        normalized = normalized.replace("达成", "大成")
+
+    keywords: List[str] = []
+    # “纳指大成/纳指达成” refers to the exchange-traded ETF, not its
+    # off-exchange A/C feeder funds. Put the listed-security query first.
+    if "大成" in normalized and ("纳指" in normalized or "纳斯达克" in normalized):
+        keywords.extend(["纳斯达克100ETF 大成", "159513"])
+    keywords.extend([normalized, raw])
+    return list(dict.fromkeys(keyword for keyword in keywords if keyword))
 
 
 async def enrich_with_online_instrument_search(
@@ -1426,6 +1430,10 @@ async def enrich_with_online_instrument_search(
         except Exception as exc:
             search_error = exc
             continue
+        candidates = [
+            candidate for candidate in candidates
+            if str(candidate.get("classify") or "") != "OTCFUND"
+        ]
         if candidates:
             break
     if not candidates:

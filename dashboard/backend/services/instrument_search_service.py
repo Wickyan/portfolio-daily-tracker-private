@@ -109,7 +109,13 @@ class InstrumentSearchService:
         raw_items = payload.get("QuotationCodeTable", {}).get("Data", []) or []
         candidates: List[Dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
+        listed_classifies = {"Fund", "AStock", "UsStock", "HKStock", "HK"}
         for item in raw_items:
+            classify = str(item.get("Classify") or "")
+            # The bookkeeping system only accepts securities that can be traded
+            # directly on an exchange. OTC mutual-fund shares are never candidates.
+            if classify not in listed_classifies:
+                continue
             code = str(item.get("Code") or "").strip().upper()
             name = str(item.get("Name") or "").strip()
             if not code or not name:

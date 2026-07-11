@@ -156,7 +156,7 @@ function PendingActionCard({
           ))}
         </div>
       )}
-      {pending.instrument_candidates && pending.instrument_candidates.length > 1 && !change.code && (
+      {pending.instrument_candidates && pending.instrument_candidates.length > 0 && !change.code && (
         <div className="space-y-2">
           <div className="text-sm text-slate-300">搜索候选：</div>
           <div className="flex flex-wrap gap-2">
