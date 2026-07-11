@@ -681,17 +681,31 @@ class PortfolioWriteService:
 
     def _load_all_operations(self) -> List[Dict[str, Any]]:
         ensure_data_dirs()
-        operations: List[Dict[str, Any]] = []
-        for path in sorted(OPERATIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        loaded: List[tuple[Dict[str, Any], int]] = []
+        for path in OPERATIONS_DIR.glob("*.json"):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     operation = json.load(f)
+                mtime_ns = path.stat().st_mtime_ns
             except (OSError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"operation日志损坏：{path.name}") from exc
             if not isinstance(operation, dict) or not operation.get("operation_id"):
                 raise RuntimeError(f"operation日志格式错误：{path.name}")
-            operations.append(operation)
-        return operations
+            loaded.append((operation, mtime_ns))
+
+        # Some filesystems assign the same mtime to several operation files
+        # created in one atomic batch. created_at carries microseconds and is
+        # therefore the primary ordering key; mtime/id are deterministic
+        # fallbacks for legacy logs.
+        loaded.sort(
+            key=lambda entry: (
+                str(entry[0].get("created_at") or ""),
+                entry[1],
+                str(entry[0].get("operation_id") or ""),
+            ),
+            reverse=True,
+        )
+        return [operation for operation, _mtime_ns in loaded]
 
     def _rolled_back_operation_ids(self, operations: Optional[List[Dict[str, Any]]] = None) -> set[str]:
         all_operations = operations if operations is not None else self._load_all_operations()
@@ -805,6 +819,235 @@ class PortfolioWriteService:
         if not isinstance(operation, dict):
             raise RuntimeError(f"operation日志格式错误：{path.name}")
         return operation
+
+    def _semantic_changes(self, operation: Dict[str, Any]) -> List[Dict[str, Any]]:
+        pending_action = operation.get("pending_action") or {}
+        changes = pending_action.get("changes")
+        if not isinstance(changes, list):
+            return []
+        return [dict(change) for change in changes if isinstance(change, dict)]
+
+    def _snapshot_position_map(self, snapshot: Dict[str, Any]) -> Dict[PositionIdentity, Dict[str, Any]]:
+        return {
+            position_identity(position): self.normalize_position(position, for_storage=True)
+            for position in snapshot.get("positions", [])
+        }
+
+    def _snapshot_cash_map(self, snapshot: Dict[str, Any]) -> Dict[tuple[str, str], float]:
+        return {
+            (
+                str(item.get("account") or "").strip(),
+                str(item.get("currency") or "").upper().strip(),
+            ): to_float(item.get("amount"), 0.0) or 0.0
+            for item in snapshot.get("cash_accounts", [])
+            if str(item.get("account") or "").strip()
+            and str(item.get("currency") or "").strip()
+        }
+
+    def _change_identity(
+        self,
+        change: Dict[str, Any],
+    ) -> tuple[str, tuple[str, ...]]:
+        action_type = str(change.get("action_type") or change.get("action") or "add_or_update")
+        if action_type in {"deposit", "withdraw", "set_cash"}:
+            return (
+                "cash",
+                (
+                    str(change.get("account") or "").strip(),
+                    str(change.get("currency") or "").upper().strip(),
+                ),
+            )
+        return ("position", position_identity(change))
+
+    def _affected_identities(
+        self,
+        operation: Dict[str, Any],
+    ) -> tuple[set[PositionIdentity], set[tuple[str, str]]]:
+        position_ids: set[PositionIdentity] = set()
+        cash_ids: set[tuple[str, str]] = set()
+        for change in self._semantic_changes(operation):
+            kind, identity = self._change_identity(change)
+            if kind == "cash":
+                account, currency = identity
+                if account and currency:
+                    cash_ids.add((account, currency))
+            else:
+                account, code, currency = identity
+                if account and code and currency:
+                    position_ids.add((account, code, currency))
+
+        before = operation.get("before_snapshot") or {}
+        after = operation.get("after_snapshot") or {}
+        before_positions = self._snapshot_position_map(before)
+        after_positions = self._snapshot_position_map(after)
+        for identity in set(before_positions) | set(after_positions):
+            if before_positions.get(identity) != after_positions.get(identity):
+                position_ids.add(identity)
+        before_cash = self._snapshot_cash_map(before)
+        after_cash = self._snapshot_cash_map(after)
+        for identity in set(before_cash) | set(after_cash):
+            if abs(before_cash.get(identity, 0.0) - after_cash.get(identity, 0.0)) > 1e-8:
+                cash_ids.add(identity)
+        return position_ids, cash_ids
+
+    def _operation_touches_identities(
+        self,
+        operation: Dict[str, Any],
+        position_ids: set[PositionIdentity],
+        cash_ids: set[tuple[str, str]],
+    ) -> bool:
+        op_positions, op_cash = self._affected_identities(operation)
+        return bool(op_positions & position_ids or op_cash & cash_ids)
+
+    def _replace_affected_from_snapshot(
+        self,
+        state: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        position_ids: set[PositionIdentity],
+        cash_ids: set[tuple[str, str]],
+    ) -> Dict[str, Any]:
+        result = deepcopy(state)
+        state_positions = self._snapshot_position_map(result)
+        snapshot_positions = self._snapshot_position_map(snapshot)
+        for identity in position_ids:
+            if identity in snapshot_positions:
+                state_positions[identity] = snapshot_positions[identity]
+            else:
+                state_positions.pop(identity, None)
+        result["positions"] = list(state_positions.values())
+
+        state_cash = self._snapshot_cash_map(result)
+        snapshot_cash = self._snapshot_cash_map(snapshot)
+        for identity in cash_ids:
+            if identity in snapshot_cash:
+                state_cash[identity] = snapshot_cash[identity]
+            else:
+                state_cash.pop(identity, None)
+        result["cash_accounts"] = [
+            {
+                "account": account,
+                "currency": currency,
+                "amount": amount,
+                "updated_at": utc_now_iso(),
+            }
+            for (account, currency), amount in state_cash.items()
+        ]
+        return result
+
+    def _replay_without_operation(
+        self,
+        current: Dict[str, Any],
+        target: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Rebuild identities touched by one operation with that operation removed.
+
+        Delta inversion is wrong when either the removed operation or a later
+        operation is absolute (set_position/set_cash). New operation logs carry
+        semantic changes, allowing the affected identities to be replayed in
+        chronological order while preserving unrelated current data.
+        """
+        target_id = str(target.get("operation_id") or "")
+        position_ids, cash_ids = self._affected_identities(target)
+        if not target_id or not position_ids and not cash_ids:
+            return None
+
+        operations_desc = self._load_all_operations()
+        operations = list(reversed(operations_desc))
+        index_by_id = {
+            str(operation.get("operation_id") or ""): index
+            for index, operation in enumerate(operations)
+        }
+        if target_id not in index_by_id:
+            return None
+        target_index = index_by_id[target_id]
+        rolled_back_ids = self._rolled_back_operation_ids(operations_desc)
+
+        relevant_indexes = [
+            index
+            for index, operation in enumerate(operations)
+            if operation.get("type") != "rollback"
+            and self._operation_touches_identities(operation, position_ids, cash_ids)
+        ]
+        if not relevant_indexes:
+            return None
+        first_index = min(relevant_indexes)
+        first_before = operations[first_index].get("before_snapshot")
+        if not isinstance(first_before, dict):
+            return None
+        replay = deepcopy(first_before)
+
+        for index in range(first_index, len(operations)):
+            operation = operations[index]
+            operation_id = str(operation.get("operation_id") or "")
+            if operation.get("type") == "rollback":
+                continue
+            if not self._operation_touches_identities(operation, position_ids, cash_ids):
+                continue
+            if operation_id == target_id or operation_id in rolled_back_ids:
+                continue
+
+            changes = self._semantic_changes(operation)
+            relevant_changes: List[Dict[str, Any]] = []
+            for change in changes:
+                kind, identity = self._change_identity(change)
+                if kind == "cash" and tuple(identity) in cash_ids:
+                    relevant_changes.append(change)
+                elif kind == "position" and tuple(identity) in position_ids:
+                    relevant_changes.append(change)
+
+            if relevant_changes:
+                replay, _ = self.apply_changes(replay, relevant_changes)
+                continue
+
+            # Historical logs created before semantic operation metadata can be
+            # replayed exactly only when they occur before the removed action.
+            # A later unknown transformation is safer to leave to legacy delta
+            # inversion than to guess whether it was incremental or absolute.
+            if index > target_index:
+                return None
+            after_snapshot = operation.get("after_snapshot")
+            if not isinstance(after_snapshot, dict):
+                return None
+            replay = self._replace_affected_from_snapshot(
+                replay,
+                after_snapshot,
+                position_ids,
+                cash_ids,
+            )
+
+        result = deepcopy(current)
+        current_positions = self._snapshot_position_map(result)
+        replay_positions = self._snapshot_position_map(replay)
+        for identity in position_ids:
+            if identity not in replay_positions:
+                current_positions.pop(identity, None)
+                continue
+            restored = dict(replay_positions[identity])
+            current_position = current_positions.get(identity)
+            if current_position and to_float(current_position.get("current_price"), None) is not None:
+                restored["current_price"] = current_position.get("current_price")
+            restored["updated_at"] = utc_now_iso()
+            current_positions[identity] = self.normalize_position(restored, for_storage=True)
+        result["positions"] = list(current_positions.values())
+
+        current_cash = self._snapshot_cash_map(result)
+        replay_cash = self._snapshot_cash_map(replay)
+        for identity in cash_ids:
+            if identity in replay_cash:
+                current_cash[identity] = replay_cash[identity]
+            else:
+                current_cash.pop(identity, None)
+        result["cash_accounts"] = [
+            {
+                "account": account,
+                "currency": currency,
+                "amount": amount,
+                "updated_at": utc_now_iso(),
+            }
+            for (account, currency), amount in current_cash.items()
+        ]
+        result["updated_at"] = utc_now_iso()
+        return result
 
     def _apply_selective_inverse(
         self,
@@ -940,7 +1183,9 @@ class PortfolioWriteService:
             if not before_snapshot:
                 raise ValueError("operation does not have before_snapshot")
             current = self.load_portfolio()
-            restored = self._apply_selective_inverse(current, operation)
+            restored = self._replay_without_operation(current, operation)
+            if restored is None:
+                restored = self._apply_selective_inverse(current, operation)
             rollback, backup_path = self._commit_portfolio_change(
                 before=current,
                 after=restored,
@@ -1070,7 +1315,7 @@ class PortfolioWriteService:
                 after=after,
                 operation_type="manual_add" if not pending_action else "ai_confirm",
                 summary=summary,
-                pending_action=pending_action,
+                pending_action=pending_action or {"changes": deepcopy(changes)},
                 imported_positions=imported,
             )
             return {
@@ -1234,6 +1479,12 @@ class PortfolioWriteService:
                 after=after,
                 operation_type="manual_update",
                 summary=f"手动更新持仓 {account}/{code}/{currency}",
+                pending_action={
+                    "changes": [{
+                        **deepcopy(updated),
+                        "action_type": "set_position",
+                    }],
+                },
                 imported_positions=1,
             )
             return {
@@ -1264,6 +1515,16 @@ class PortfolioWriteService:
                 after=after,
                 operation_type="manual_delete",
                 summary=f"删除持仓 {account}/{code}/{currency}",
+                pending_action={
+                    "changes": [{
+                        "action_type": "delete",
+                        "account": account,
+                        "code": code,
+                        "currency": currency,
+                        "name": matches[0].get("name"),
+                        "asset_type": matches[0].get("asset_type", "stock"),
+                    }],
+                },
                 imported_positions=1,
             )
             return {

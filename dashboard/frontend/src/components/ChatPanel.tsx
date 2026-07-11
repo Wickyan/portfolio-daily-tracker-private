@@ -9,7 +9,7 @@ import { getApiErrorMessage } from '@/services/chat'
 import ConversationHistory from './ConversationHistory'
 import type { ChatMessage, PendingAction, PendingItem } from '@/types'
 
-const TERMINAL_PENDING_STATUSES = new Set(['confirmed', 'cancelled', 'rolled_back', 'expired', 'superseded'])
+const TERMINAL_PENDING_STATUSES = new Set(['confirmed', 'cancelled', 'rolled_back', 'expired', 'superseded', 'partially_rolled_back', 'partially_expired', 'partially_cancelled', 'partially_closed'])
 
 function parseChineseOrdinal(value: string): number | null {
   if (/^\d+$/.test(value)) return Number(value)
@@ -265,6 +265,7 @@ function PendingItemCard({
     confirmed: '已写入',
     rolled_back: '已撤回',
     expired: '已过期',
+    cancelled: '已取消',
     superseded: '已替代',
   }
 
@@ -475,6 +476,7 @@ function PendingItemCard({
       )}
       {status === 'rolled_back' && <div className="text-sm text-amber-300">这一条写入已经撤回，其他子项不受影响。</div>}
       {status === 'expired' && <div className="text-sm text-amber-300">这一条已经过期，请复制后重新提交。</div>}
+      {status === 'cancelled' && <div className="text-sm text-slate-400">这一条已经取消。</div>}
     </div>
   )
 }

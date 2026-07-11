@@ -115,15 +115,50 @@ def format_human_number(value: float) -> str:
     return f"{number:.12f}".rstrip("0").rstrip(".")
 
 
+def normalize_action_number_punctuation(message: str) -> str:
+    """Remove optional punctuation between an action/field label and its number."""
+    text = unicodedata.normalize("NFKC", str(message or ""))
+    labels = (
+        "买入|买了|买|加仓|补仓|卖出|卖了|卖|减持|现在持有|目前持有|当前持有|"
+        "增加|加上|入金|转入|存入|减少|提现|出金|转出|"
+        "余额改为|余额改成|余额设置为|余额设为|现金改为|现金设置为|现金设为|"
+        "数量|成本价|均价|成交价|金额|余额|现金"
+    )
+    return re.sub(
+        rf"((?:{labels}))\s*[，,、]\s*(?=[+-]?(?:\d|\.))",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def malformed_number_reason(message: str) -> Optional[str]:
     """Detect numeric text that would otherwise be partially parsed."""
-    text = str(message or "")
+    text = unicodedata.normalize("NFKC", str(message or ""))
     if re.search(r"(?<![A-Za-z0-9])[+-]?(?:\d+(?:\.\d+)?)[eE][+-]?\d+", text):
         return "暂不支持科学计数法，请输入完整数字"
-    if re.search(r"\d+\.\d+\.\d+", text):
+    if re.search(r"(?i)(?<![A-Za-z0-9])0x[0-9a-f]+", text):
+        return "暂不支持十六进制数字，请输入十进制数字"
+    if re.search(r"\d_+\d", text):
+        return "数字中不能使用下划线分隔"
+    if re.search(r"\d\s*/\s*\d", text):
+        return "暂不支持分数写法，请输入小数"
+    if re.search(r"(?:\d+\.\d+\.\d+|\.\.\d|\d\.\.)", text):
         return "数字中包含多个小数点"
     if re.search(r"\d+(?:\.\d+)?\s*(?:万|千|[kKwW])\s*\d", text):
         return "暂不支持“1万2千”这类复合金额，请换算成完整数字"
+    if re.search(r"\d\s*,\s+\d", text):
+        return "千分位逗号后不能有空格"
+    if re.search(r"\d,,+\d", text):
+        return "千分位逗号格式不正确"
+    numeric_unit = r"(?:股|股票|份|个|元|人民币|港币|港元|美元|美金|刀|CNY|RMB|HKD|USD)"
+    for match in re.finditer(rf"(?<!\d),\d+(?:\.\d+)?\s*{numeric_unit}", text, re.IGNORECASE):
+        prefix = text[:match.start() + 1]
+        if re.search(r"(?:换成了?|换为了?|换为|换到|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换)\s*,$", prefix):
+            continue
+        return "数字不能以逗号开头"
+    if re.search(rf"\d+,(?=\s*{numeric_unit})", text, re.IGNORECASE):
+        return "数字不能以逗号结尾"
     for token in re.findall(r"\d+(?:,\d+)+", text):
         if not re.fullmatch(r"\d{1,3}(?:,\d{3})+", token):
             return "千分位逗号格式不正确"
@@ -256,7 +291,8 @@ def load_pending(pending_id: str) -> Dict[str, Any]:
 
 
 ITEM_OPEN_STATUSES = {"pending"}
-ITEM_TERMINAL_STATUSES = {"confirmed", "rolled_back", "expired", "superseded"}
+ITEM_TERMINAL_STATUSES = {"confirmed", "rolled_back", "expired", "cancelled", "superseded"}
+ITEM_ALLOWED_STATUSES = ITEM_OPEN_STATUSES | ITEM_TERMINAL_STATUSES
 
 
 def _normalize_public_change(raw_change: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,8 +419,31 @@ def build_pending_items(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
     return items
 
 
+def validate_pending_items_structure(pending: Dict[str, Any]) -> None:
+    items = pending.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("pending子项结构损坏：items必须是列表")
+    item_ids: List[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"pending子项结构损坏：第{index + 1}条不是对象")
+        item_id = str(item.get("item_id") or "").strip()
+        if not item_id:
+            raise RuntimeError(f"pending子项结构损坏：第{index + 1}条缺少item_id")
+        item_ids.append(item_id)
+        status = str(item.get("status") or "pending")
+        if status not in ITEM_ALLOWED_STATUSES:
+            raise RuntimeError(f"pending子项结构损坏：第{index + 1}条状态无效：{status}")
+        changes = item.get("changes")
+        if not isinstance(changes, list) or not changes:
+            raise RuntimeError(f"pending子项结构损坏：第{index + 1}条缺少changes")
+    if len(item_ids) != len(set(item_ids)):
+        raise RuntimeError("pending子项结构损坏：item_id重复")
+
+
 def ensure_pending_items(pending: Dict[str, Any]) -> bool:
     if isinstance(pending.get("items"), list) and pending.get("items"):
+        validate_pending_items_structure(pending)
         return False
     parsed = {
         "action_type": pending.get("action_type"),
@@ -458,18 +517,18 @@ def sync_pending_from_items(pending: Dict[str, Any]) -> Dict[str, Any]:
     statuses = [str(item.get("status") or "pending") for item in items]
     if not statuses:
         status = pending.get("status", "pending")
-    elif all(value == "pending" for value in statuses):
-        status = "pending"
-    elif all(value == "confirmed" for value in statuses):
-        status = "confirmed"
-    elif all(value == "rolled_back" for value in statuses):
-        status = "rolled_back"
-    elif all(value == "expired" for value in statuses):
-        status = "expired"
+    elif len(set(statuses)) == 1:
+        status = statuses[0]
     elif any(value == "pending" for value in statuses):
         status = "partially_confirmed"
-    else:
+    elif any(value == "expired" for value in statuses):
+        status = "partially_expired"
+    elif any(value == "cancelled" for value in statuses):
+        status = "partially_cancelled"
+    elif any(value == "rolled_back" for value in statuses):
         status = "partially_rolled_back"
+    else:
+        status = "partially_closed"
     pending["status"] = status
 
     all_structurally_ready = bool(open_items) and all(
@@ -507,6 +566,14 @@ def get_pending_item(pending: Dict[str, Any], item_id: str) -> Dict[str, Any]:
 def validate_item_group(item: Dict[str, Any]) -> None:
     changes = list(item.get("changes", []))
     action_type = str(item.get("action_type") or "")
+    if action_type != "fx_exchange":
+        mismatched = [
+            str(change.get("action_type") or action_type)
+            for change in changes
+            if str(change.get("action_type") or action_type) != action_type
+        ]
+        if mismatched:
+            raise HTTPException(status_code=400, detail="子项操作类型与实际changes不一致")
     if action_type == "fx_exchange":
         if len(changes) != 2:
             raise HTTPException(status_code=400, detail="换汇必须包含且仅包含一笔换出和一笔换入")
@@ -574,6 +641,14 @@ def reconcile_pending_with_operations(pending: Dict[str, Any]) -> Dict[str, Any]
         item_id = str(item.get("item_id") or "")
         operation = by_item.get(item_id)
         if not operation:
+            if item.get("status") == "confirmed":
+                item["status"] = "pending"
+                item["operation_id"] = None
+                item["requires_confirmation"] = not item.get("missing_fields") and not item.get("revision_options")
+                item["warnings"] = list(dict.fromkeys(list(item.get("warnings", [])) + [
+                    "检测到子项标记为已写入但没有对应operation，已安全恢复为待确认"
+                ]))
+                changed = True
             continue
         operation_id = str(operation.get("operation_id") or "")
         target_status = "rolled_back" if operation.get("is_rolled_back") else "confirmed"
@@ -783,6 +858,12 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
     known_account_tokens = COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES)
     account_action = r"(?:买|买了|买入|新增|添加|卖|卖了|卖出|入金|出金|提现|增加|减少|转入|转出|现金|余额|人民币|港币|美元|CNY|HKD|USD|换|兑换|改|变)"
     for account in sorted(known_account_tokens, key=len, reverse=True):
+        if account.isascii() and re.search(
+            rf"(?:^|在|从|给|往|向|到){re.escape(account)}\s*(?={NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN})",
+            text,
+            re.IGNORECASE,
+        ):
+            return normalize_account(account), "explicit"
         account_boundary = (
             r"(?=(?:CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF)|[^A-Za-z0-9]|$)"
             if account.isascii() else ""
@@ -1104,7 +1185,15 @@ def infer_action(message: str) -> str:
         return "deposit"
     if (
         any(token in message for token in ["现金余额", "账户现金", "现金有", "有现金"])
-        or (account is not None and not has_security_unit and re.search(rf"(?:余额|现金)\s*(?:是|为|有|:|：)?\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE))
+        or (
+            account is not None
+            and not has_security_unit
+            and re.search(
+                rf"(?:现金余额|账户现金|余额|现金)\s*(?:是|为|有|:|：|变为|变成|改为|改成|调整为|调整成|设置为|设置成|设为|设成)?\s*{NUMBER_TOKEN_PATTERN}",
+                message,
+                re.IGNORECASE,
+            )
+        )
         or (account is not None and re.search(rf"(?:有\s*{CURRENCY_TOKEN_PATTERN}\s*{NUMBER_TOKEN_PATTERN}|有\s*{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}|{CURRENCY_TOKEN_PATTERN}\s*有\s*{NUMBER_TOKEN_PATTERN})", message, re.IGNORECASE))
         or (account is not None and re.search(rf"(?:{CURRENCY_TOKEN_PATTERN}\s*(?:还)?剩(?:下)?\s*{NUMBER_TOKEN_PATTERN}|(?:还)?剩(?:下)?\s*{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}|{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}\s*现金)", message, re.IGNORECASE))
         or re.search(r"有\s*[+-]?[0-9]+(?:\.[0-9]+)?.*现金", message)
@@ -1213,11 +1302,12 @@ def parse_fx_exchange(message: str, account: Optional[str]) -> Optional[Dict[str
     exchange_word = r"(?:换成了?|换为了?|换为|换到|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换)"
     amount_currency = rf"({NUMBER_TOKEN_PATTERN})\s*({CURRENCY_TOKEN_PATTERN})"
     currency_amount = rf"({CURRENCY_TOKEN_PATTERN})\s*({NUMBER_TOKEN_PATTERN})"
+    separator = r"\s*[，,、]?\s*"
     patterns = [
-        (rf"{amount_currency}\s*{exchange_word}\s*{amount_currency}", (1, 2, 3, 4), False, False),
-        (rf"{currency_amount}\s*{exchange_word}\s*{currency_amount}", (2, 1, 4, 3), True, True),
-        (rf"{amount_currency}\s*{exchange_word}\s*{currency_amount}", (1, 2, 4, 3), False, True),
-        (rf"{currency_amount}\s*{exchange_word}\s*{amount_currency}", (2, 1, 3, 4), True, False),
+        (rf"{amount_currency}{separator}{exchange_word}{separator}{amount_currency}", (1, 2, 3, 4), False, False),
+        (rf"{currency_amount}{separator}{exchange_word}{separator}{currency_amount}", (2, 1, 4, 3), True, True),
+        (rf"{amount_currency}{separator}{exchange_word}{separator}{currency_amount}", (1, 2, 4, 3), False, True),
+        (rf"{currency_amount}{separator}{exchange_word}{separator}{amount_currency}", (2, 1, 3, 4), True, False),
     ]
 
     match = None
@@ -1599,7 +1689,7 @@ def parse_bookkeeping_message(
 ) -> Dict[str, Any]:
     service = PortfolioWriteService()
     existing_positions = compact_positions()
-    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    text = normalize_action_number_punctuation(message).strip()
 
     copied = parse_canonical_copy_text(text)
     if copied is not None:
@@ -1711,6 +1801,33 @@ def parse_bookkeeping_message(
                 parse_bookkeeping_message(clause, _allow_multi=False)
                 for clause in clauses
             ]
+            inherited_action_hint: Optional[str] = None
+            action_prefix = {
+                "add_or_update": "买入",
+                "sell": "卖出",
+                "set_position": "现在持有",
+            }
+            for index, clause in enumerate(clauses):
+                explicit_action = explicit_position_action(clause)
+                if explicit_action:
+                    inherited_action_hint = explicit_action
+                parsed = parsed_clauses[index]
+                if (
+                    parsed.get("intent") != "bookkeeping"
+                    and inherited_action_hint in action_prefix
+                    and re.search(rf"{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", clause, re.IGNORECASE)
+                ):
+                    reparsed = parse_bookkeeping_message(
+                        f"{action_prefix[inherited_action_hint]}{clause}",
+                        _allow_multi=False,
+                    )
+                    if reparsed.get("intent") == "bookkeeping":
+                        reparsed["warnings"] = list(dict.fromkeys(
+                            list(reparsed.get("warnings", [])) + [
+                                f"该条未重复动作词，已沿用上一条{action_prefix[inherited_action_hint]}语义；请核对"
+                            ]
+                        ))
+                        parsed_clauses[index] = reparsed
             actionable = [parsed for parsed in parsed_clauses if parsed.get("intent") == "bookkeeping"]
             record_like_unparsed = [
                 index + 1
@@ -3693,7 +3810,13 @@ async def ai_confirm(request: ConfirmRequest):
             raise HTTPException(status_code=409, detail="pending_action已过期")
         open_items = _confirmable_open_items(pending)
         if not open_items:
-            return _already_confirmed_result(pending)
+            statuses = [str(item.get("status") or "pending") for item in pending.get("items", [])]
+            if statuses and all(status == "confirmed" for status in statuses):
+                return _already_confirmed_result(pending)
+            raise HTTPException(
+                status_code=409,
+                detail=f"没有可确认的待处理子项：{pending.get('status')}",
+            )
 
         for item in open_items:
             validate_item_group(item)
@@ -3765,19 +3888,35 @@ async def ai_confirm(request: ConfirmRequest):
 async def ai_cancel(request: CancelRequest):
     with PORTFOLIO_MUTATION_LOCK:
         pending = load_pending(request.pending_id)
-        if pending.get("status") == "cancelled":
+        ensure_pending_items(pending)
+        if pending.get("status") in {"cancelled", "partially_cancelled"}:
             return {
                 "ok": True,
                 "pending_id": request.pending_id,
-                "status": "cancelled",
+                "status": pending.get("status"),
                 "already_cancelled": True,
+                "pending": public_pending(pending),
             }
-        require_open_pending(pending)
-        pending["status"] = "cancelled"
-        pending["requires_confirmation"] = False
-        pending["cancelled_at"] = utc_now_iso()
+        if expire_pending_if_needed(pending):
+            raise HTTPException(status_code=409, detail="pending_action已过期")
+        open_items = [item for item in pending.get("items", []) if item.get("status", "pending") == "pending"]
+        if not open_items:
+            raise HTTPException(status_code=409, detail=f"pending_action已结束：{pending.get('status')}")
+        cancelled_at = utc_now_iso()
+        for item in open_items:
+            item["status"] = "cancelled"
+            item["requires_confirmation"] = False
+            item["cancelled_at"] = cancelled_at
+        sync_pending_from_items(pending)
+        pending["cancelled_at"] = cancelled_at
+        pending["updated_at"] = cancelled_at
         save_pending(pending)
-        return {"ok": True, "pending_id": request.pending_id, "status": "cancelled"}
+        return {
+            "ok": True,
+            "pending_id": request.pending_id,
+            "status": pending.get("status"),
+            "pending": public_pending(pending),
+        }
 
 
 @router.get("/pending/{pending_id}")
