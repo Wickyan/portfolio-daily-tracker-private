@@ -259,6 +259,7 @@ function PendingActionCard({
             currency_conflict: '代码与币种不匹配',
             invalid_number: '数字格式无效',
             multiple_operations: '请拆分不同类型的操作',
+            unparsed_record: '有记录未完整识别',
             existing_position: '未找到对应持仓',
             available_quantity: '卖出数量超过现有持仓',
             available_cash: '可用现金不足',
@@ -294,22 +295,31 @@ function PendingActionCard({
           </div>
         </div>
       )}
-      {pending.instrument_candidates && pending.instrument_candidates.length > 0 && !change.code && (
+      {pending.instrument_candidates && pending.instrument_candidates.length > 0 && (
         <div className="space-y-2">
           <div className="text-sm text-slate-300">搜索候选：</div>
           <div className="flex flex-wrap gap-2">
-            {pending.instrument_candidates.slice(0, 5).map((candidate) => (
-              <button
-                key={`${candidate.code}-${candidate.currency}`}
-                onClick={() => run(async () => {
-                  await onRevise(`代码${candidate.code}`)
-                })}
-                disabled={isWorking}
-                className="rounded border border-slate-600 bg-slate-700 px-2.5 py-1.5 text-left text-xs hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
-              >
-                <span className="font-semibold">{candidate.code}</span> {candidate.name}
-              </button>
-            ))}
+            {pending.instrument_candidates.slice(0, 12).map((candidate) => {
+              const candidateIndex = candidate.change_index ?? 0
+              const targetChange = changes[candidateIndex]
+              if (targetChange?.code) return null
+              const prefix = changes.length > 1 ? `第${candidateIndex + 1}条 ` : ''
+              return (
+                <button
+                  key={`${candidateIndex}-${candidate.code}-${candidate.currency}`}
+                  onClick={() => run(async () => {
+                    await onRevise(changes.length > 1
+                      ? `第${candidateIndex + 1}条代码${candidate.code}`
+                      : `代码${candidate.code}`)
+                  })}
+                  disabled={isWorking}
+                  className="rounded border border-slate-600 bg-slate-700 px-2.5 py-1.5 text-left text-xs hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
+                >
+                  <span className="text-slate-400">{prefix}</span>
+                  <span className="font-semibold">{candidate.code}</span> {candidate.name}
+                </button>
+              )
+            })}
           </div>
         </div>
       )}
@@ -321,7 +331,9 @@ function PendingActionCard({
               onClick={() => run(async () => {
                 const target = pending.action_type === 'fx_exchange'
                   ? '这笔换汇'
-                  : (change.name || change.code || '这条记录')
+                  : (changes.length > 1
+                    ? `这${changes.length}条记录`
+                    : (change.name || change.code || '这条记录'))
                 if (!window.confirm(`确定撤回${target}的这次写入吗？后续其他记录会保留。`)) return
                 await onRollback()
               })}
@@ -352,7 +364,10 @@ function PendingActionCard({
           {workError && (
             <div className="text-sm text-red-300">操作失败：{workError}</div>
           )}
-          {reviseText.trim() && (
+          {changes.length > 1 && (
+            <div className="text-xs text-slate-400">这张卡包含多条记录。修改时请注明序号，例如“第2条数量100”；也可以复制后直接编辑完整文本。</div>
+          )}
+          {reviseText.trim() && changes.length === 1 && (
             <div className="text-xs text-slate-400">系统会结合当前确认卡理解这条补充，并生成一张新的确认卡。</div>
           )}
           <div className="flex flex-wrap gap-2">

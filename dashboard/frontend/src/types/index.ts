@@ -150,6 +150,7 @@ export interface InstrumentCandidate {
   asset_type: string
   score?: number
   match_score?: number
+  change_index?: number
 }
 
 export interface PendingAction {

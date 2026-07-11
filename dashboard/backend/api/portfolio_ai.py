@@ -148,20 +148,41 @@ def non_actionable_statement(message: str) -> bool:
 
 def split_user_clauses(message: str) -> List[str]:
     broker = r"(?:长桥|哈富|IBKR|IB|盈透证券|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)"
-    action = r"(?:入金|出金|提现|取出|增加|减少|转入|转出|存入|充值|买入|卖出|清仓)"
+    action = r"(?:入金|出金|提现|取出|增加|减少|转入|转出|存入|充值|买了|买入|买|卖了|卖出|卖|清仓)"
+    asset_start = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff]{1,29}"
+    broker_record_start = (
+        rf"{broker}(?:账户)?(?:"
+        rf"\s*{action}"
+        rf"|\s*[，,\s]+\s*{asset_start}[^，,；;\n]{{0,30}}?{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)"
+        rf")"
+    )
     splitter = (
         rf"[；;\n]+"
-        rf"|[，,](?=\s*(?:(?:再|然后|接着)\s*)?(?:(?:给|往|向|从|在)\s*)?{broker})"
+        rf"|[，,](?=\s*(?:(?:再|然后|接着)\s*)?(?:(?:给|往|向|从|在)\s*)?{broker_record_start})"
         rf"|[，,](?=\s*(?:再|然后|接着)\s*{action})"
         rf"|(?:然后|接着|再)(?=\s*(?:(?:给|往|向|从|在)\s*)?(?:{broker}\s*)?{action})"
         rf"|和(?=\s*(?:(?:给|往|向|从|在)\s*)?{broker}\s*{action})"
         rf"|(?<=[。！？!?])"
     )
-    return [
-        re.sub(r"^(?:再|然后|接着)\s*", "", part.strip())
-        for part in re.split(splitter, unicodedata.normalize("NFKC", str(message or "")), flags=re.IGNORECASE)
-        if part.strip()
-    ]
+    clauses: List[str] = []
+    for part in re.split(splitter, unicodedata.normalize("NFKC", str(message or "")), flags=re.IGNORECASE):
+        text = part.strip()
+        if not text:
+            continue
+        text = re.sub(r"^(?:再|然后|接着)\s*", "", text)
+        text = re.sub(
+            r"^(?:第?[一二三四五六七八九十\d]+条)\s*[：:、.．)]?\s*",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"^(?:[A-Za-z]|[一二三四五六七八九十\d]+)\s*[：:、.．)]\s*",
+            "",
+            text,
+        )
+        if text:
+            clauses.append(text)
+    return clauses
 
 
 def normalize_currency_token(value: Optional[str]) -> Optional[str]:
@@ -471,12 +492,20 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
             return normalize_account(account), "explicit"
 
     account_match = re.search(
-        r"(?:账户|券商|分组)\s*(?:改为|改成|修改为|修改成|调整为|调整成|还是|为|是|:|：)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
+        r"(?:账户|券商|分组)\s*(?:改为|改成|修改为|修改成|调整为|调整成|还是|为|是|=|:|：)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
         text,
         re.IGNORECASE,
     )
     if account_match:
         return normalize_account(account_match.group(1)), "explicit"
+
+    broker_label_match = re.search(
+        r"(?:券商|分组)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
+        text,
+        re.IGNORECASE,
+    )
+    if broker_label_match:
+        return normalize_account(broker_label_match.group(1)), "explicit"
 
     same_match = re.search(
         r"(?:还是|同上账户|这个账户)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
@@ -1324,6 +1353,27 @@ def parse_bookkeeping_message(
                 for clause in clauses
             ]
             actionable = [parsed for parsed in parsed_clauses if parsed.get("intent") == "bookkeeping"]
+            record_like_unparsed = [
+                index + 1
+                for index, (clause, parsed) in enumerate(zip(clauses, parsed_clauses))
+                if parsed.get("intent") != "bookkeeping"
+                and re.search(NUMBER_TOKEN_PATTERN, clause, re.IGNORECASE)
+                and re.search(
+                    r"(?:股|股票|份|个|买|卖|新增|持仓|入金|出金|提现|现金|余额|换|兑换|账户|券商|CNY|RMB|HKD|USD|人民币|港币|美元)",
+                    clause,
+                    re.IGNORECASE,
+                )
+            ]
+            if record_like_unparsed:
+                labels = "、".join(f"第{index}条" for index in record_like_unparsed)
+                return {
+                    "intent": "bookkeeping",
+                    "summary": "一条消息中有记录未能完整识别",
+                    "action_type": "multiple_records_incomplete",
+                    "changes": [],
+                    "missing_fields": ["unparsed_record"],
+                    "warnings": [f"{labels}看起来像记账记录，但未完整识别。为避免漏记，本次不会只写入其他条目；请补充后重新发送"],
+                }
             if len(actionable) == 1:
                 return actionable[0]
             if len(actionable) > 1:
@@ -1348,6 +1398,40 @@ def parse_bookkeeping_message(
                         "missing_fields": collect_missing_fields(combined_changes, "multi_cash"),
                         "warnings": list(dict.fromkeys(combined_warnings + ["多条现金变化将作为同一个原子操作一起写入或一起失败"])),
                     }
+
+                position_actions = {"add_or_update", "sell"}
+                action_types = {str(parsed.get("action_type") or "") for parsed in actionable}
+                if (
+                    len(action_types) == 1
+                    and action_types.issubset(position_actions)
+                    and all(len(parsed.get("changes", [])) == 1 for parsed in actionable)
+                ):
+                    combined_action = next(iter(action_types))
+                    combined_changes = []
+                    combined_warnings = []
+                    inherited_account = None
+                    for index, parsed in enumerate(actionable):
+                        change = dict(parsed["changes"][0])
+                        if not change.get("account") and inherited_account:
+                            change["account"] = inherited_account
+                            combined_warnings.append(
+                                f"第{index + 1}条未单独填写账户，沿用上一条账户{inherited_account}；请核对"
+                            )
+                        if change.get("account"):
+                            inherited_account = str(change["account"])
+                        combined_changes.append(change)
+                        combined_warnings.extend(parsed.get("warnings", []))
+                    action_label = "买入/新增" if combined_action == "add_or_update" else "卖出"
+                    return enrich_instrument_currency_consistency({
+                        "intent": "bookkeeping",
+                        "summary": f"识别到{len(combined_changes)}条待确认{action_label}记录",
+                        "action_type": combined_action,
+                        "changes": combined_changes,
+                        "missing_fields": collect_missing_fields(combined_changes, combined_action),
+                        "warnings": list(dict.fromkeys(combined_warnings + [
+                            f"已分别解析为{len(combined_changes)}条记录；确认后将作为一个原子操作一起写入或一起失败"
+                        ])),
+                    })
                 return {
                     "intent": "bookkeeping",
                     "summary": "一条消息中识别到多笔不同类型的操作",
@@ -1527,11 +1611,11 @@ def enrich_cash_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def enrich_sell_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """Revalidate sell revisions against the latest portfolio state."""
+    """Revalidate one or more sell records against the latest portfolio state."""
     if parsed.get("action_type") != "sell" or not parsed.get("changes"):
         return parsed
 
-    change = dict(parsed["changes"][0])
+    changes = [dict(change) for change in parsed.get("changes", [])]
     positions = compact_positions()
     warnings = [
         warning for warning in parsed.get("warnings", [])
@@ -1540,48 +1624,75 @@ def enrich_sell_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
         and "检测到多个账户持有" not in warning
         and "自动选择账户" not in warning
     ]
-    missing = [
-        item for item in build_missing(change, "sell")
-        if item not in {"existing_position", "available_quantity"}
-    ]
-    matches = find_position_matches(change, positions)
-    account = str(change.get("account") or "").strip()
+    missing: List[str] = []
+    remaining: Dict[tuple[str, str, str], float] = {}
+    for position in positions:
+        identity = (
+            str(position.get("account") or "").strip(),
+            str(position.get("code") or "").upper().strip(),
+            str(position.get("currency") or "").upper().strip(),
+        )
+        remaining[identity] = remaining.get(identity, 0.0) + (to_float(position.get("quantity"), 0.0) or 0.0)
 
-    if not account:
-        accounts = sorted({
-            str(position.get("account") or "").strip()
-            for position in matches
-            if str(position.get("account") or "").strip()
-        })
-        if len(accounts) == 1:
-            account = accounts[0]
-            change["account"] = account
-            missing = [item for item in missing if item != "account"]
-            warnings.append(f"根据现有持仓自动选择账户：{account}")
-        elif len(accounts) > 1:
-            if "account" not in missing:
+    for index, change in enumerate(changes):
+        prefix = f"第{index + 1}条" if len(changes) > 1 else ""
+        missing.extend(
+            item for item in build_missing(change, "sell")
+            if item not in {"existing_position", "available_quantity", "account"}
+        )
+        matches = find_position_matches(change, positions)
+        account = str(change.get("account") or "").strip()
+
+        if not account:
+            accounts = sorted({
+                str(position.get("account") or "").strip()
+                for position in matches
+                if str(position.get("account") or "").strip()
+            })
+            if len(accounts) == 1:
+                account = accounts[0]
+                change["account"] = account
+                warnings.append(f"{prefix}根据现有持仓自动选择账户：{account}")
+            elif len(accounts) > 1:
                 missing.append("account")
-            warnings.append(f"检测到多个账户持有该标的：{'、'.join(accounts)}，请选择卖出账户")
-        else:
-            missing.append("existing_position")
-            warnings.append("当前账户中未找到该持仓，暂不支持卖空")
-    else:
+                warnings.append(f"{prefix}检测到多个账户持有该标的：{'、'.join(accounts)}，请选择卖出账户")
+                changes[index] = change
+                continue
+            else:
+                missing.append("existing_position")
+                warnings.append(f"{prefix}当前账户中未找到该持仓，暂不支持卖空")
+                changes[index] = change
+                continue
+
         selected = [
             position for position in matches
             if str(position.get("account") or "").strip() == account
         ]
         if not selected:
             missing.append("existing_position")
-            warnings.append(f"账户{account}中未找到该持仓，暂不支持卖空")
-        else:
-            available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
-            quantity = to_float(change.get("quantity"), None)
-            if quantity is not None and quantity > available + 1e-8:
+            warnings.append(f"{prefix}账户{account}中未找到该持仓，暂不支持卖空")
+            changes[index] = change
+            continue
+
+        code = str(change.get("code") or selected[0].get("code") or "").upper().strip()
+        currency = str(change.get("currency") or selected[0].get("currency") or "").upper().strip()
+        identity = (account, code, currency)
+        available = remaining.get(identity, sum(
+            to_float(position.get("quantity"), 0.0) or 0.0 for position in selected
+        ))
+        quantity = to_float(change.get("quantity"), None)
+        if quantity is not None:
+            if quantity > available + 1e-8:
                 missing.append("available_quantity")
-                warnings.append(f"卖出数量{quantity:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
+                warnings.append(
+                    f"{prefix}卖出数量{quantity:g}超过账户{account}剩余可卖持仓{available:g}，暂不支持卖空"
+                )
+            else:
+                remaining[identity] = available - quantity
+        changes[index] = change
 
     result = dict(parsed)
-    result["changes"] = [change]
+    result["changes"] = changes
     result["missing_fields"] = list(dict.fromkeys(missing))
     result["warnings"] = list(dict.fromkeys(warnings))
     return result
@@ -1876,62 +1987,71 @@ async def enrich_with_online_instrument_search(
     parsed: Dict[str, Any],
     message: str,
 ) -> Dict[str, Any]:
-    """Resolve a missing code from an instrument name before asking the user."""
+    """Resolve missing codes for one or more position records.
+
+    Each child record is searched independently. Ambiguous candidates carry a
+    change_index so the UI can apply a selected code to the correct record.
+    """
     if parsed.get("intent") != "bookkeeping" or not parsed.get("changes"):
         return parsed
-    if parsed.get("action_type") in {"deposit", "withdraw", "set_cash", "fx_exchange"}:
+    if parsed.get("action_type") in {"deposit", "withdraw", "set_cash", "fx_exchange", "multi_cash"}:
         return parsed
 
-    change = dict(parsed["changes"][0])
-    if change.get("code"):
-        return parsed
-    keyword = str(change.get("name") or "").strip()
-    if not keyword:
-        return parsed
-
-    candidates, search_errors = await search_ranked_listed_candidates(keyword)
-    if not candidates:
-        if search_errors:
-            warnings = list(parsed.get("warnings", []))
-            warnings.append(f"标的在线搜索暂时失败：{search_errors[0]}")
-            parsed["warnings"] = list(dict.fromkeys(warnings))
-        return parsed
-
-    chosen = InstrumentSearchService.choose_confident(candidates)
+    action_type = str(parsed.get("action_type") or "add_or_update")
+    changes = [dict(change) for change in parsed.get("changes", [])]
     warnings = [
         warning for warning in parsed.get("warnings", [])
         if "需要确认具体代码" not in warning
         and "需要确认具体代码或基金名称" not in warning
         and "像是基金简称或自定义标的" not in warning
     ]
+    all_candidates: List[Dict[str, Any]] = []
 
-    if chosen:
-        change["code"] = chosen["code"]
-        change["name"] = chosen["name"]
-        change["currency"] = change.get("currency") or chosen["currency"]
-        change["asset_type"] = chosen["asset_type"]
-        change = PortfolioWriteService().normalize_position(change)
-        parsed["changes"] = [change]
-        parsed["missing_fields"] = build_missing(change, str(parsed.get("action_type") or "add_or_update"))
-        query_match = InstrumentSearchService._fuzzy_text(keyword)
-        chosen_match = InstrumentSearchService._fuzzy_text(str(chosen.get("name") or ""))
-        if query_match != chosen_match:
-            warnings.append(
-                f"输入“{keyword}”可能包含简称或错别字，系统推测为“{chosen['name']}”（{chosen['code']}）；请在确认写入前核对"
-            )
-        else:
-            warnings.append(
-                f"已联网匹配：{chosen['code']} {chosen['name']}；请在确认写入前核对"
-            )
-        parsed["warnings"] = list(dict.fromkeys(warnings))
-        parsed["instrument_candidates"] = candidates[:5]
-        return enrich_instrument_currency_consistency(parsed)
+    for index, change in enumerate(changes):
+        if change.get("code"):
+            continue
+        keyword = str(change.get("name") or "").strip()
+        if not keyword:
+            continue
 
-    parsed["instrument_candidates"] = candidates[:5]
-    preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
-    warnings.append(f"未能唯一确定标的，找到以下场内候选：{preview}。请选择正确代码")
-    parsed["warnings"] = list(dict.fromkeys(warnings))
-    return parsed
+        candidates, search_errors = await search_ranked_listed_candidates(keyword)
+        if not candidates:
+            if search_errors:
+                warnings.append(f"第{index + 1}条标的在线搜索暂时失败：{search_errors[0]}")
+            continue
+
+        chosen = InstrumentSearchService.choose_confident(candidates)
+        if chosen:
+            change["code"] = chosen["code"]
+            change["name"] = chosen["name"]
+            change["currency"] = change.get("currency") or chosen["currency"]
+            change["asset_type"] = chosen["asset_type"]
+            changes[index] = PortfolioWriteService().normalize_position(change)
+            query_match = InstrumentSearchService._fuzzy_text(keyword)
+            chosen_match = InstrumentSearchService._fuzzy_text(str(chosen.get("name") or ""))
+            prefix = f"第{index + 1}条" if len(changes) > 1 else ""
+            if query_match != chosen_match:
+                warnings.append(
+                    f"{prefix}输入“{keyword}”可能包含简称或错别字，系统推测为“{chosen['name']}”（{chosen['code']}）；请在确认写入前核对"
+                )
+            else:
+                warnings.append(
+                    f"{prefix}已联网匹配：{chosen['code']} {chosen['name']}；请在确认写入前核对"
+                )
+            continue
+
+        indexed_candidates = [dict(candidate, change_index=index) for candidate in candidates[:5]]
+        all_candidates.extend(indexed_candidates)
+        preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
+        prefix = f"第{index + 1}条" if len(changes) > 1 else ""
+        warnings.append(f"{prefix}未能唯一确定标的，找到以下场内候选：{preview}。请选择正确代码")
+
+    result = dict(parsed)
+    result["changes"] = changes
+    result["missing_fields"] = collect_missing_fields(changes, action_type)
+    result["warnings"] = list(dict.fromkeys(warnings))
+    result["instrument_candidates"] = all_candidates
+    return enrich_instrument_currency_consistency(result)
 
 
 def _numeric_revision_warning_filter(warnings: List[str]) -> List[str]:
@@ -2170,7 +2290,7 @@ def apply_direct_code_revision(
     message: str,
 ) -> Dict[str, Any] | None:
     """Apply an explicit code, or a bare exact candidate while code is missing."""
-    if not pending.get("changes"):
+    if not pending.get("changes") or len(pending.get("changes", [])) != 1:
         return None
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
     explicit = re.fullmatch(
@@ -2254,6 +2374,8 @@ def apply_direct_field_revision(
     The result is still a new pending action and must be confirmed separately.
     """
     if not pending.get("changes"):
+        return None
+    if len(pending.get("changes", [])) > 1:
         return None
 
     action_type = str(pending.get("action_type") or "add_or_update")
@@ -2422,6 +2544,110 @@ def apply_direct_field_revision(
         }
 
     return None
+
+
+def parse_record_number(value: str) -> Optional[int]:
+    token = str(value or "").strip()
+    if token.isdigit():
+        number = int(token)
+        return number if number > 0 else None
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if token == "十":
+        return 10
+    if "十" in token:
+        left, right = token.split("十", 1)
+        tens = digits.get(left, 1) if left else 1
+        ones = digits.get(right, 0) if right else 0
+        number = tens * 10 + ones
+        return number if number > 0 else None
+    return digits.get(token)
+
+
+async def apply_indexed_multi_revision(
+    pending: Dict[str, Any],
+    message: str,
+) -> Optional[Dict[str, Any]]:
+    """Apply an explicit `第N条...` revision to one child record."""
+    changes = [dict(change) for change in pending.get("changes", [])]
+    if len(changes) <= 1:
+        return None
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    text = re.sub(
+        r"^(?:不对|错了|改错了|你改错了|系统改错了)\s*[，,；;：:]*\s*(?:应该)?\s*(?:是|改为|改成)?\s*",
+        "",
+        text,
+    )
+    match = re.fullmatch(
+        r"(?:第\s*)?([一二三四五六七八九十\d]+)\s*条\s*(?:的)?\s*[：:]?\s*(.+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    record_number = parse_record_number(match.group(1))
+    if record_number is None:
+        return None
+    index = record_number - 1
+    instruction = match.group(2).strip()
+    if index < 0 or index >= len(changes):
+        raise HTTPException(status_code=400, detail=f"当前只有{len(changes)}条记录，没有第{index + 1}条")
+
+    child_action = str(changes[index].get("action_type") or pending.get("action_type") or "add_or_update")
+    child_candidates = [
+        {key: value for key, value in candidate.items() if key != "change_index"}
+        for candidate in pending.get("instrument_candidates", [])
+        if int(candidate.get("change_index", index)) == index
+    ]
+    child_pending = {
+        **pending,
+        "action_type": child_action,
+        "changes": [changes[index]],
+        "missing_fields": build_missing(changes[index], child_action),
+        "warnings": [],
+        "instrument_candidates": child_candidates,
+    }
+
+    revised = apply_direct_field_revision(child_pending, instruction)
+    if revised is None:
+        revised = apply_bare_numeric_revision(child_pending, instruction)
+    if revised is None:
+        revised = apply_direct_code_revision(child_pending, instruction)
+    if revised is None:
+        revised = await apply_contextual_revision(child_pending, instruction)
+    if revised is None:
+        return None
+
+    changes[index] = dict(revised["changes"][0])
+    target_prefix = f"第{index + 1}条"
+    warnings = [
+        warning for warning in stable_revision_warnings(list(pending.get("warnings", [])))
+        if not (
+            str(warning).startswith(target_prefix)
+            and any(token in str(warning) for token in (
+                "未能唯一确定标的", "找到以下场内候选", "在线搜索暂时失败", "请选择正确代码"
+            ))
+        )
+    ]
+    warnings.extend(f"第{index + 1}条：{warning}" for warning in revised.get("warnings", []))
+
+    retained_candidates = [
+        candidate for candidate in pending.get("instrument_candidates", [])
+        if int(candidate.get("change_index", index)) != index
+    ]
+    revised_candidates = [] if changes[index].get("code") else [
+        dict(candidate, change_index=index) for candidate in revised.get("instrument_candidates", [])
+    ]
+    result = {
+        "intent": "bookkeeping",
+        "summary": f"已修改第{index + 1}条记录，请重新确认",
+        "action_type": str(pending.get("action_type") or child_action),
+        "changes": changes,
+        "missing_fields": collect_missing_fields(changes, str(pending.get("action_type") or child_action)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "instrument_candidates": retained_candidates + revised_candidates,
+        "revision_options": [],
+    }
+    return enrich_instrument_currency_consistency(result)
 
 
 def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[str, Any]:
@@ -2617,7 +2843,14 @@ async def ai_revise(request: ReviseRequest):
             for change in parse_base.get("changes", []):
                 change.pop("amount", None)
 
-    parsed = apply_direct_field_revision(parse_base, request.message)
+    parsed = await apply_indexed_multi_revision(parse_base, request.message)
+    if parsed is None and len(parse_base.get("changes", [])) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="这张卡包含多条记录，请注明要修改第几条，例如“第2条数量100”或使用复制后编辑",
+        )
+    if parsed is None:
+        parsed = apply_direct_field_revision(parse_base, request.message)
     if parsed is None:
         parsed = apply_bare_numeric_revision(parse_base, request.message)
     if parsed is None:
