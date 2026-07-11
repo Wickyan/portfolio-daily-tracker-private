@@ -9,10 +9,12 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
+import math
 import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Literal, Optional
+import unicodedata
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -44,16 +46,19 @@ ACCOUNT_ALIASES = {
 COMMON_ASSET_WORDS = {"苹果", "微软", "英伟达", "特斯拉", "比亚迪", "腾讯", "腾讯控股", "小米", "海外科技", "纳指ETF"}
 NEW_ACCOUNT_HINTS = {"富途", "老虎", "雪盈", "中信证券", "银河2号"}
 
-NUMBER_TOKEN_PATTERN = r"[0-9]+(?:\.[0-9]+)?\s*(?:[kKwW]|千|万)?"
-CURRENCY_TOKEN_PATTERN = r"(?:人民币|港币|美元|欧元|日元|英镑|新加坡元|新币|澳元|加元|瑞郎|CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF|元|刀)"
+NUMBER_TOKEN_PATTERN = r"[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?\s*(?:[kKwW]|千|万)?"
+CURRENCY_TOKEN_PATTERN = r"(?:HK\$|US\$|人民币元|人民币|港币|港元|美元|美金|美刀|欧元|日元|英镑|新加坡元|新币|澳元|加元|瑞郎|CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF|[¥￥$]|元|刀)"
 CURRENCY_ALIASES = {
     "人民币": "CNY",
     "元": "CNY",
     "CNY": "CNY",
     "RMB": "CNY",
     "港币": "HKD",
+    "港元": "HKD",
     "HKD": "HKD",
     "美元": "USD",
+    "美金": "USD",
+    "美刀": "USD",
     "USD": "USD",
     "刀": "USD",
     "欧元": "EUR",
@@ -71,24 +76,91 @@ CURRENCY_ALIASES = {
     "CAD": "CAD",
     "瑞郎": "CHF",
     "CHF": "CHF",
+    "¥": "CNY",
+    "￥": "CNY",
+    "$": "USD",
+    "US$": "USD",
+    "HK$": "HKD",
 }
 
 
 def parse_human_number(value: Any, default: Optional[float] = None) -> Optional[float]:
     if value is None:
         return default
-    text = str(value).replace(",", "").strip()
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kKwW]|千|万)?", text)
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    match = re.fullmatch(
+        r"([+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?)\s*([kKwW]|千|万)?",
+        text,
+    )
     if not match:
-        return to_float(text, default)
-    number = float(match.group(1))
+        return default
+    number = float(match.group(1).replace(",", ""))
+    if not math.isfinite(number):
+        return default
     suffix = (match.group(2) or "").lower()
     multiplier = 1.0
     if suffix in {"k", "千"}:
         multiplier = 1000.0
     elif suffix in {"w", "万"}:
         multiplier = 10000.0
-    return number * multiplier
+    result = number * multiplier
+    return result if math.isfinite(result) else default
+
+
+def format_human_number(value: float) -> str:
+    number = float(value)
+    if number.is_integer():
+        return f"{number:.0f}"
+    return f"{number:.12f}".rstrip("0").rstrip(".")
+
+
+def malformed_number_reason(message: str) -> Optional[str]:
+    """Detect numeric text that would otherwise be partially parsed."""
+    text = str(message or "")
+    if re.search(r"(?<![A-Za-z0-9])[+-]?(?:\d+(?:\.\d+)?)[eE][+-]?\d+", text):
+        return "暂不支持科学计数法，请输入完整数字"
+    if re.search(r"\d+\.\d+\.\d+", text):
+        return "数字中包含多个小数点"
+    if re.search(r"\d+(?:\.\d+)?\s*(?:万|千|[kKwW])\s*\d", text):
+        return "暂不支持“1万2千”这类复合金额，请换算成完整数字"
+    for token in re.findall(r"\d+(?:,\d+)+", text):
+        if not re.fullmatch(r"\d{1,3}(?:,\d{3})+", token):
+            return "千分位逗号格式不正确"
+    return None
+
+
+def non_actionable_statement(message: str) -> bool:
+    """Avoid creating bookkeeping cards from negations, plans or how-to questions."""
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(message or "")))
+    if not compact:
+        return False
+    if re.search(r"(?:不要|别|没有|并未|未曾|还没|尚未|不是|取消)", compact):
+        return True
+    if re.match(r"^(?:请问|怎么|如何|如果|假如|是否|要不要|能不能|能否|能给|可不可以|为什么|我想知道|我想|你觉得|可能|也许|帮我看看|查询)", compact):
+        return True
+    if re.match(r"^(?:我)?(?:计划|打算|准备|考虑|预计|明天|后天|下周|下个月|以后)", compact):
+        return True
+    if re.search(r"(?:会怎样|会怎么样|怎么办|怎么操作|如何操作|多少人民币|折合多少|等于多少|手续费是多少|合适吗|可以吗|行吗|好吗|是多少|吗)[？?]?$", compact):
+        return True
+    return False
+
+
+def split_user_clauses(message: str) -> List[str]:
+    broker = r"(?:长桥|哈富|IBKR|IB|盈透证券|盈透|尊嘉|华盛通|银河|富途|老虎|雪盈|中信证券)"
+    action = r"(?:入金|出金|提现|取出|增加|减少|转入|转出|存入|充值|买入|卖出|清仓)"
+    splitter = (
+        rf"[；;\n]+"
+        rf"|[，,](?=\s*(?:(?:再|然后|接着)\s*)?(?:(?:给|往|向|从|在)\s*)?{broker})"
+        rf"|[，,](?=\s*(?:再|然后|接着)\s*{action})"
+        rf"|(?:然后|接着|再)(?=\s*(?:(?:给|往|向|从|在)\s*)?(?:{broker}\s*)?{action})"
+        rf"|和(?=\s*(?:(?:给|往|向|从|在)\s*)?{broker}\s*{action})"
+        rf"|(?<=[。！？!?])"
+    )
+    return [
+        re.sub(r"^(?:再|然后|接着)\s*", "", part.strip())
+        for part in re.split(splitter, unicodedata.normalize("NFKC", str(message or "")), flags=re.IGNORECASE)
+        if part.strip()
+    ]
 
 
 def normalize_currency_token(value: Optional[str]) -> Optional[str]:
@@ -298,7 +370,7 @@ def looks_like_structured_bookkeeping(message: str) -> bool:
 def parse_number_after(message: str, labels: tuple[str, ...]) -> Optional[float]:
     label_pattern = "|".join(re.escape(label) for label in labels)
     match = re.search(
-        rf"(?:{label_pattern})\s*[:：]?\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:{label_pattern})\s*(?:[:：=]|改为|改成|修改为|修改成|调整为|调整成|设置为|设为|是|为)?\s*({NUMBER_TOKEN_PATTERN})",
         message,
         re.IGNORECASE,
     )
@@ -310,7 +382,9 @@ def parse_number_after(message: str, labels: tuple[str, ...]) -> Optional[float]
 def infer_currency(message: str) -> Optional[str]:
     lower = message.lower()
     named_tokens = (
-        ("人民币", "CNY"), ("港币", "HKD"), ("美元", "USD"),
+        ("人民币元", "CNY"), ("人民币", "CNY"),
+        ("港币", "HKD"), ("港元", "HKD"),
+        ("美元", "USD"), ("美金", "USD"), ("美刀", "USD"),
         ("欧元", "EUR"), ("日元", "JPY"), ("英镑", "GBP"),
         ("新加坡元", "SGD"), ("新币", "SGD"), ("澳元", "AUD"),
         ("加元", "CAD"), ("瑞郎", "CHF"),
@@ -318,7 +392,24 @@ def infer_currency(message: str) -> Optional[str]:
     for token, currency in named_tokens:
         if token in message:
             return currency
+    upper_message = message.upper()
+    if "HK$" in upper_message:
+        return "HKD"
+    if "US$" in upper_message or "$" in message:
+        return "USD"
+    if "¥" in message or "￥" in message:
+        return "CNY"
+    compact_currency = re.search(
+        r"(?:IBKR|IB|长桥|银河|尊嘉|华盛通|哈富)(CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF)",
+        message,
+        re.IGNORECASE,
+    )
+    if compact_currency:
+        token = compact_currency.group(1).lower()
+        return "CNY" if token == "rmb" else token.upper()
     for token in ("cny", "rmb", "hkd", "usd", "eur", "jpy", "gbp", "sgd", "aud", "cad", "chf"):
+        if re.search(rf"{NUMBER_TOKEN_PATTERN}\s*{token}(?![a-z])", lower, re.IGNORECASE):
+            return "CNY" if token == "rmb" else token.upper()
         if re.search(rf"(?<![a-z]){token}(?![a-z])", lower):
             return "CNY" if token == "rmb" else token.upper()
     if re.search(rf"{NUMBER_TOKEN_PATTERN}\s*元", message, re.IGNORECASE):
@@ -334,46 +425,80 @@ def normalize_account(value: Optional[str]) -> Optional[str]:
     account = str(value).strip()
     if not account:
         return None
-    return ACCOUNT_ALIASES.get(account.upper(), ACCOUNT_ALIASES.get(account, account))
+    upper = account.upper()
+    for alias, canonical in ACCOUNT_ALIASES.items():
+        if upper == alias.upper():
+            return canonical
+    for canonical in COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS:
+        if upper == canonical.upper():
+            return canonical
+    return account
 
 
 def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[str], Optional[str]]:
     text = message.strip()
-    if allow_single and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff]{2,12}", text):
-        return normalize_account(text), "single"
 
-    # Prefer known broker names before generic "账户:" parsing so phrases
-    # like "长桥账户现金5000港币" do not treat "现金5000港币" as the account.
+    # Prefer known broker names before generic account parsing. This also
+    # handles natural prepositions such as “给IBKR入金” and “向银河转出”.
     known_account_tokens = COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES)
     account_action = r"(?:买|买了|买入|新增|添加|卖|卖了|卖出|入金|出金|提现|增加|减少|转入|转出|现金|余额|人民币|港币|美元|CNY|HKD|USD|换|兑换|改|变)"
     for account in sorted(known_account_tokens, key=len, reverse=True):
-        # Original leading/preposition form: 长桥..., 在IB..., 从银河...
-        if re.search(rf"(?:^|在|从|转入|转出){re.escape(account)}(?:账户)?", text, re.IGNORECASE):
-            return normalize_account(account), "explicit"
-        # Also allow a broker after an asset/noise phrase: 小米... 尊嘉买入...
+        account_boundary = (
+            r"(?=(?:CNY|RMB|HKD|USD|EUR|JPY|GBP|SGD|AUD|CAD|CHF)|[^A-Za-z0-9]|$)"
+            if account.isascii() else ""
+        )
         if re.search(
-            rf"[\s，,。；;]{re.escape(account)}(?:账户)?(?=\s*{account_action}|$)",
+            rf"(?:^|在|从|给|往|向|到|转入|转出){re.escape(account)}{account_boundary}(?:账户)?",
+            text,
+            re.IGNORECASE,
+        ):
+            return normalize_account(account), "explicit"
+        if re.search(
+            rf"[\s，,。；;]{re.escape(account)}{account_boundary}(?:账户)?",
+            text,
+            re.IGNORECASE,
+        ):
+            return normalize_account(account), "explicit"
+        if re.search(
+            rf"{re.escape(account)}{account_boundary}(?:账户)?(?=\s*{account_action})",
             text,
             re.IGNORECASE,
         ):
             return normalize_account(account), "explicit"
 
     account_match = re.search(
-        r"(?:账户|券商|分组)(?:还是|为|是|:|：)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
+        r"(?:账户|券商|分组)\s*(?:改为|改成|修改为|修改成|调整为|调整成|还是|为|是|:|：)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
         text,
+        re.IGNORECASE,
     )
     if account_match:
         return normalize_account(account_match.group(1)), "explicit"
 
-    same_match = re.search(r"(?:还是|同上账户|这个账户)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})", text)
+    same_match = re.search(
+        r"(?:还是|同上账户|这个账户)\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})",
+        text,
+    )
     if same_match:
         return normalize_account(same_match.group(1)), "explicit"
 
-    prefix_match = re.match(r"^([A-Za-z0-9\u4e00-\u9fff]{2,12})(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入|出金|现金减少|转出|提现|现金余额|账户现金)", text, re.IGNORECASE)
+    if (
+        allow_single
+        and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff]{2,12}", text)
+        and not re.search(r"账户|券商|分组|改成|改为|修改|调整|金额|数量|成本|币种", text)
+    ):
+        return normalize_account(text), "single"
+
+    prefix_match = re.match(
+        r"^([A-Za-z0-9\u4e00-\u9fff]{2,12})(?:买了|买入|新增|卖了|卖出|入金|现金增加|转入|出金|现金减少|转出|提现|现金余额|账户现金)",
+        text,
+        re.IGNORECASE,
+    )
     if prefix_match:
         prefix = prefix_match.group(1)
         looks_like_asset = bool(re.search(r"ETF|LOF|基金|股票|科技|互联|指数|债|黄金|原油", prefix, re.IGNORECASE))
-        looks_like_broker = bool(re.search(r"证券|银行|资本|投资|券商", prefix))
+        looks_like_broker = bool(re.search(r"证券|银行|资本|投资|券商", prefix)) or bool(
+            re.fullmatch(r"(?:IBKR|IB|长桥|银河|尊嘉|华盛通|哈富)\d+号?", prefix, re.IGNORECASE)
+        )
         if prefix not in COMMON_ASSET_WORDS and not looks_like_asset and looks_like_broker:
             return normalize_account(prefix), "candidate"
     return None, None
@@ -590,23 +715,23 @@ def infer_action(message: str) -> str:
     has_security_unit = bool(re.search(r"(?:股|股票|份|个)", message))
     if (
         len(currency_mentions) >= 2
-        and re.search(r"换成了?|换为了?|换为|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换", message)
+        and re.search(r"换成了?|换为了?|换为|换到|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换", message)
     ):
         return "fx_exchange"
-    if any(token in message for token in ["卖了", "卖出", "清仓", "减持"]) or re.search(r"卖(?:掉)?\s*[0-9]", message):
+    if any(token in message for token in ["卖了", "卖出", "清仓", "减持", "全卖", "卖光"]) or re.search(rf"卖(?:掉)?\s*{NUMBER_TOKEN_PATTERN}", message):
         return "sell"
     if (
-        any(token in message for token in ["出金", "现金减少", "转出", "提现", "取出"])
-        or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|扣除了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+        any(token in message for token in ["出金", "现金减少", "转出", "提现", "取出", "提了", "取了", "转走", "划出"])
+        or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|减去|扣除了?|扣了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
         or (
             account is not None
             and not has_security_unit
-            and re.search(rf"(?:减少了?|减了?|减掉了?|扣除了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
+            and re.search(rf"(?:减少了?|减了?|减掉了?|减去|扣除了?|扣了?|少了)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
         )
     ):
         return "withdraw"
     if (
-        any(token in message for token in ["入金", "现金增加", "转入", "存入", "充值"])
+        any(token in message for token in ["入金", "现金增加", "转入", "存入", "充值", "存了", "存进", "转进", "打入", "划入"])
         or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:增加了?|加了?|加上了?)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
         or (
             account is not None
@@ -617,14 +742,15 @@ def infer_action(message: str) -> str:
         return "deposit"
     if (
         any(token in message for token in ["现金余额", "账户现金", "现金有", "有现金"])
-        or re.search(r"有\s*[0-9]+(?:\.[0-9]+)?.*现金", message)
+        or (account is not None and not has_security_unit and re.search(rf"(?:余额|现金)\s*(?:是|为|有|:|：)?\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE))
+        or (account is not None and re.search(rf"(?:有\s*{CURRENCY_TOKEN_PATTERN}\s*{NUMBER_TOKEN_PATTERN}|有\s*{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}|{CURRENCY_TOKEN_PATTERN}\s*有\s*{NUMBER_TOKEN_PATTERN})", message, re.IGNORECASE))
+        or (account is not None and re.search(rf"(?:{CURRENCY_TOKEN_PATTERN}\s*(?:还)?剩(?:下)?\s*{NUMBER_TOKEN_PATTERN}|(?:还)?剩(?:下)?\s*{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}|{NUMBER_TOKEN_PATTERN}\s*{CURRENCY_TOKEN_PATTERN}\s*现金)", message, re.IGNORECASE))
+        or re.search(r"有\s*[+-]?[0-9]+(?:\.[0-9]+)?.*现金", message)
         or re.search(rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:变为|变成|改为|改成|调整为|调整成|设置为|设为)\s*{NUMBER_TOKEN_PATTERN}", message, re.IGNORECASE)
     ):
         return "set_cash"
-    if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "录入"]):
+    if any(token in message for token in ["买了", "买入", "新增", "添加", "持仓", "写入数据库", "帮我记上", "帮我记一下", "记一笔", "录入"]) or re.search(rf"买\s*{NUMBER_TOKEN_PATTERN}\s*(?:股|股票|份|个)", message):
         return "add_or_update"
-    # Accept concise bookkeeping such as "海外科技100股，一共花了9000元"
-    # even when the user omits an explicit buy/add verb.
     has_quantity = bool(re.search(r"[0-9]+(?:\.[0-9]+)?\s*(?:股|股票|份|个)", message))
     has_total_amount = any(token in message for token in ["一共", "总共", "总计", "花了", "总金额", "总成本"])
     if has_quantity and has_total_amount:
@@ -638,8 +764,8 @@ def parse_quantity(message: str) -> Optional[float]:
     value = parse_number_after(message, ("quantity", "数量"))
     if value is not None:
         return value
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:股|份|个)", message)
-    return to_float(match.group(1)) if match else None
+    match = re.search(rf"({NUMBER_TOKEN_PATTERN})\s*(?:股|份|个)", message, re.IGNORECASE)
+    return parse_human_number(match.group(1), None) if match else None
 
 
 def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -650,16 +776,16 @@ def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[flo
     if total_cost is None:
         total_match = re.search(
             r"(?:(?:一共|总共|总计)\s*(?:花了|金额)?|(?:花了|总金额)\s*)"
-            r"([0-9]+(?:\.[0-9]+)?)\s*(?:美元|港币|人民币|元|刀|USD|HKD|CNY)?",
+            rf"({NUMBER_TOKEN_PATTERN})\s*(?:美元|美金|港币|港元|人民币|元|刀|USD|HKD|CNY)?",
             message,
             re.IGNORECASE,
         )
         if total_match:
-            total_cost = to_float(total_match.group(1))
+            total_cost = parse_human_number(total_match.group(1), None)
     if cost_price is None and total_cost is None:
-        price_match = re.search(r"(?:均价|成本价|成交价)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:一股|每股|/股|美元|港币|元|刀)?\s*$", message, re.IGNORECASE)
+        price_match = re.search(rf"(?:均价|成本价|成交价)?\s*({NUMBER_TOKEN_PATTERN})\s*(?:一股|每股|/股|美元|美金|港币|港元|元|刀)?\s*$", message, re.IGNORECASE)
         if price_match and "花了" not in message and "总" not in message and "一共" not in message:
-            cost_price = to_float(price_match.group(1))
+            cost_price = parse_human_number(price_match.group(1), None)
     if cost_price is None and quantity and total_cost is not None:
         cost_price = total_cost / quantity
     if total_cost is None and quantity is not None and cost_price is not None:
@@ -668,14 +794,17 @@ def parse_amounts(message: str, quantity: Optional[float]) -> tuple[Optional[flo
 
 
 def parse_cash_amount(message: str) -> Optional[float]:
-    explicit = parse_number_after(message, ("amount", "金额", "现金余额", "账户现金"))
+    explicit = parse_number_after(message, ("amount", "金额", "现金余额", "账户现金", "余额", "现金"))
     if explicit is not None:
         return explicit
     patterns = [
-        rf"(?:入金|出金|转入|转出|存入|提现|取出|充值|现金增加|现金减少)了?\s*({NUMBER_TOKEN_PATTERN})",
-        rf"(?:增加了?|加了?|加上了?|减少了?|减了?|减掉了?|扣除了?|少了)\s*({NUMBER_TOKEN_PATTERN})",
-        rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|扣除了?|少了|增加了?|加了?|加上了?|变为|变成|改为|改成|调整为|调整成|设置为|设为)\s*({NUMBER_TOKEN_PATTERN})",
-        rf"(?:现金余额|账户现金|现金有|有现金)\s*(?:是|为|:|：)?\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:入金|出金|转入|转出|存入|提现|取出|充值|现金增加|现金减少|存了|存进|提了|取了|转进|转走|打入|划入|划出)了?\s*{CURRENCY_TOKEN_PATTERN}\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:入金|出金|转入|转出|存入|提现|取出|充值|现金增加|现金减少|存了|存进|提了|取了|转进|转走|打入|划入|划出)了?\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:增加了?|加了?|加上了?|减少了?|减了?|减掉了?|减去|扣除了?|扣了?|少了)\s*({NUMBER_TOKEN_PATTERN})",
+        rf"{CURRENCY_TOKEN_PATTERN}\s*(?:余额)?\s*(?:减少了?|减了?|减掉了?|减去|扣除了?|扣了?|少了|增加了?|加了?|加上了?|变为|变成|改为|改成|调整为|调整成|设置为|设为|有|(?:还)?剩(?:下)?)\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:现金余额|账户现金|现金有|有现金|余额|现金)\s*(?:是|为|有|:|：)?\s*({NUMBER_TOKEN_PATTERN})",
+        rf"有\s*{CURRENCY_TOKEN_PATTERN}\s*({NUMBER_TOKEN_PATTERN})",
+        rf"(?:还)?剩(?:下)?\s*({NUMBER_TOKEN_PATTERN})\s*{CURRENCY_TOKEN_PATTERN}",
         rf"({NUMBER_TOKEN_PATTERN})\s*{CURRENCY_TOKEN_PATTERN}\s*(?:现金)?",
     ]
     for pattern in patterns:
@@ -686,7 +815,7 @@ def parse_cash_amount(message: str) -> Optional[float]:
 
 
 def parse_fx_exchange(message: str, account: Optional[str]) -> Optional[Dict[str, Any]]:
-    exchange_word = r"(?:换成了?|换为了?|换为|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换)"
+    exchange_word = r"(?:换成了?|换为了?|换为|换到|兑换成了?|兑换为了?|兑换为|兑成了?|换了|换)"
     amount_currency = rf"({NUMBER_TOKEN_PATTERN})\s*({CURRENCY_TOKEN_PATTERN})"
     currency_amount = rf"({CURRENCY_TOKEN_PATTERN})\s*({NUMBER_TOKEN_PATTERN})"
     patterns = [
@@ -812,15 +941,59 @@ def build_missing(change: Dict[str, Any], action_type: str) -> List[str]:
         total_cost = to_float(change.get("total_cost"), None)
         if cost_price is None and total_cost is None:
             missing.append("cost_price")
-        elif (cost_price is not None and cost_price < 0) or (total_cost is not None and total_cost < 0):
+        elif cost_price is not None and cost_price < 0:
+            missing.append("cost_price_non_negative")
+        elif cost_price is None and total_cost is not None and total_cost < 0:
             missing.append("cost_price_non_negative")
     return missing
 
 
-def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def expected_currency_for_code(code: Any) -> Optional[str]:
+    clean_code, inferred_currency, _ = strip_code_prefix(code)
+    if inferred_currency:
+        return inferred_currency
+    if clean_code.isdigit() and len(clean_code) == 4:
+        return "HKD"
+    if clean_code.isdigit() and len(clean_code) == 6:
+        return "CNY"
+    if clean_code and clean_code.isascii() and not clean_code.isdigit():
+        return "USD"
+    return None
+
+
+def enrich_instrument_currency_consistency(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Block code/currency combinations that cannot be quoted consistently."""
+    if parsed.get("action_type") in {"deposit", "withdraw", "set_cash", "fx_exchange", "multi_cash"}:
+        return parsed
+    if not parsed.get("changes"):
+        return parsed
+
+    warnings = [warning for warning in parsed.get("warnings", []) if "代码通常使用" not in warning]
+    missing = [item for item in parsed.get("missing_fields", []) if item != "currency_conflict"]
+    for change in parsed.get("changes", []):
+        code = str(change.get("code") or "").strip()
+        currency = str(change.get("currency") or "").upper().strip()
+        expected = expected_currency_for_code(code)
+        if expected and currency and currency != expected:
+            missing.append("currency_conflict")
+            warnings.append(
+                f"代码{code}通常使用{expected}，但当前币种是{currency}；请修改币种或代码"
+            )
+
+    result = dict(parsed)
+    result["missing_fields"] = list(dict.fromkeys(missing))
+    result["warnings"] = list(dict.fromkeys(warnings))
+    return result
+
+
+def parse_bookkeeping_message(
+    message: str,
+    previous: Optional[Dict[str, Any]] = None,
+    _allow_multi: bool = True,
+) -> Dict[str, Any]:
     service = PortfolioWriteService()
     existing_positions = compact_positions()
-    text = message.strip()
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
 
     if previous and previous.get("changes") and previous.get("missing_fields") in (["account"], ["account/group"]):
         account, _ = infer_account(text, allow_single=True)
@@ -858,12 +1031,20 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
                     warnings.append(f"账户{account}中未找到该持仓，暂不支持卖空")
                 else:
                     available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
-                    sell_qty = to_float(updated.get("quantity"), 0.0) or 0.0
-                    if sell_qty > available:
-                        missing.append("available_quantity")
-                        warnings.append(f"卖出数量{sell_qty:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
+                    original_message = str(previous.get("message") or "")
+                    if re.search(r"清仓|全部|全卖|卖光", original_message):
+                        updated["quantity"] = available
+                        updated["available_qty"] = available
+                        updated_changes[0] = service.normalize_position(updated)
+                        missing = collect_missing_fields(updated_changes, action_type)
+                        warnings.append(f"已按账户{account}现有持仓数量{available:g}执行全部卖出")
                     else:
-                        warnings.append(f"已选择卖出账户：{account}")
+                        sell_qty = to_float(updated.get("quantity"), 0.0) or 0.0
+                        if sell_qty > available:
+                            missing.append("available_quantity")
+                            warnings.append(f"卖出数量{sell_qty:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
+                        else:
+                            warnings.append(f"已选择卖出账户：{account}")
                 missing = list(dict.fromkeys(missing))
             return {
                 "intent": "bookkeeping",
@@ -874,7 +1055,87 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
                 "warnings": warnings,
             }
 
-    action_type = infer_action(text)
+    if non_actionable_statement(text):
+        return {
+            "intent": "chat_only",
+            "summary": "检测到否定、假设或操作咨询，不创建记账确认卡",
+            "action_type": "chat_only",
+            "changes": [],
+            "missing_fields": [],
+            "warnings": [],
+        }
+
+    action_probe = infer_action(text)
+    invalid_number = malformed_number_reason(text)
+    if action_probe != "chat_only" and invalid_number:
+        changes: List[Dict[str, Any]] = []
+        missing = ["invalid_number"]
+        if action_probe in {"deposit", "withdraw", "set_cash"}:
+            account, _ = infer_account(text)
+            currency = (parse_first_key_value(text, ("currency", "币种")) or infer_currency(text) or "").upper() or None
+            if currency is None and account == "银河":
+                currency = "CNY"
+            change = {
+                "action_type": action_probe,
+                "account": account,
+                "currency": currency,
+                "note": "",
+                "source": "ai",
+            }
+            change = {key: value for key, value in change.items() if value is not None}
+            changes = [change]
+            missing = list(dict.fromkeys(build_missing(change, action_probe) + ["invalid_number"]))
+        return {
+            "intent": "bookkeeping",
+            "summary": "识别到记账意图，但数字格式无效",
+            "action_type": action_probe,
+            "changes": changes,
+            "missing_fields": missing,
+            "warnings": [invalid_number],
+        }
+
+    if previous is None and _allow_multi:
+        clauses = split_user_clauses(text)
+        if len(clauses) > 1:
+            parsed_clauses = [
+                parse_bookkeeping_message(clause, _allow_multi=False)
+                for clause in clauses
+            ]
+            actionable = [parsed for parsed in parsed_clauses if parsed.get("intent") == "bookkeeping"]
+            if len(actionable) == 1:
+                return actionable[0]
+            if len(actionable) > 1:
+                cash_actions = {"deposit", "withdraw", "set_cash"}
+                if all(parsed.get("action_type") in cash_actions and len(parsed.get("changes", [])) == 1 for parsed in actionable):
+                    combined_changes: List[Dict[str, Any]] = []
+                    combined_warnings: List[str] = []
+                    inherited_account: Optional[str] = None
+                    for parsed in actionable:
+                        change = dict(parsed["changes"][0])
+                        if not change.get("account") and inherited_account:
+                            change["account"] = inherited_account
+                        if change.get("account"):
+                            inherited_account = str(change["account"])
+                        combined_changes.append(change)
+                        combined_warnings.extend(parsed.get("warnings", []))
+                    return {
+                        "intent": "bookkeeping",
+                        "summary": f"识别到{len(combined_changes)}条待确认账户现金信息",
+                        "action_type": "multi_cash",
+                        "changes": combined_changes,
+                        "missing_fields": collect_missing_fields(combined_changes, "multi_cash"),
+                        "warnings": list(dict.fromkeys(combined_warnings + ["多条现金变化将作为同一个原子操作一起写入或一起失败"])),
+                    }
+                return {
+                    "intent": "bookkeeping",
+                    "summary": "一条消息中识别到多笔不同类型的操作",
+                    "action_type": "multiple_operations",
+                    "changes": [],
+                    "missing_fields": ["multiple_operations"],
+                    "warnings": ["为避免漏记或错配，请将不同类型的交易拆成多条消息提交"],
+                }
+
+    action_type = action_probe
     if action_type == "chat_only":
         return {
             "intent": "chat_only",
@@ -938,6 +1199,14 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
         account, sell_matches = resolve_sell_account(
             account, asset, existing_positions, warnings
         )
+        if account and sell_matches and re.search(r"清仓|全部|全卖|卖光", text):
+            selected = [
+                position for position in sell_matches
+                if str(position.get("account") or "").strip() == account
+            ]
+            if selected:
+                quantity = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
+                warnings.append(f"已按账户{account}现有持仓数量{quantity:g}执行全部卖出")
 
     if account and account not in COMMON_ACCOUNTS and account_source in {"candidate", "single", "explicit"}:
         warnings.append(f"{account} 是新账户分组，后续确认写入时可创建/使用")
@@ -978,19 +1247,19 @@ def parse_bookkeeping_message(message: str, previous: Optional[Dict[str, Any]] =
         missing.remove("market")
     missing = list(dict.fromkeys(missing))
 
-    return {
+    return enrich_instrument_currency_consistency({
         "intent": "bookkeeping",
         "summary": "识别到1条待确认记账信息",
         "action_type": action_type,
         "changes": [change],
         "missing_fields": missing,
         "warnings": sorted(set(warnings)),
-    }
+    })
 
 
 def enrich_cash_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """Block cash reductions/exchanges that would make a balance negative."""
-    if parsed.get("action_type") not in {"withdraw", "fx_exchange"}:
+    if parsed.get("action_type") not in {"withdraw", "fx_exchange", "multi_cash"}:
         return parsed
     if not parsed.get("changes"):
         return parsed
@@ -1001,8 +1270,11 @@ def enrich_cash_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
         to_float(item.get("amount"), 0.0) or 0.0
         for item in portfolio.get("cash_accounts", [])
     }
-    warnings = list(parsed.get("warnings", []))
-    missing = list(parsed.get("missing_fields", []))
+    warnings = [
+        warning for warning in parsed.get("warnings", [])
+        if "现金不足" not in warning
+    ]
+    missing = [item for item in parsed.get("missing_fields", []) if item != "available_cash"]
 
     for change in parsed.get("changes", []):
         action = str(change.get("action_type") or parsed.get("action_type") or "")
@@ -1027,6 +1299,67 @@ def enrich_cash_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
                 balances[identity] = current - amount
 
     result = dict(parsed)
+    result["missing_fields"] = list(dict.fromkeys(missing))
+    result["warnings"] = list(dict.fromkeys(warnings))
+    return result
+
+
+def enrich_sell_availability(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Revalidate sell revisions against the latest portfolio state."""
+    if parsed.get("action_type") != "sell" or not parsed.get("changes"):
+        return parsed
+
+    change = dict(parsed["changes"][0])
+    positions = compact_positions()
+    warnings = [
+        warning for warning in parsed.get("warnings", [])
+        if "暂不支持卖空" not in warning
+        and "超过账户" not in warning
+        and "检测到多个账户持有" not in warning
+        and "自动选择账户" not in warning
+    ]
+    missing = [
+        item for item in build_missing(change, "sell")
+        if item not in {"existing_position", "available_quantity"}
+    ]
+    matches = find_position_matches(change, positions)
+    account = str(change.get("account") or "").strip()
+
+    if not account:
+        accounts = sorted({
+            str(position.get("account") or "").strip()
+            for position in matches
+            if str(position.get("account") or "").strip()
+        })
+        if len(accounts) == 1:
+            account = accounts[0]
+            change["account"] = account
+            missing = [item for item in missing if item != "account"]
+            warnings.append(f"根据现有持仓自动选择账户：{account}")
+        elif len(accounts) > 1:
+            if "account" not in missing:
+                missing.append("account")
+            warnings.append(f"检测到多个账户持有该标的：{'、'.join(accounts)}，请选择卖出账户")
+        else:
+            missing.append("existing_position")
+            warnings.append("当前账户中未找到该持仓，暂不支持卖空")
+    else:
+        selected = [
+            position for position in matches
+            if str(position.get("account") or "").strip() == account
+        ]
+        if not selected:
+            missing.append("existing_position")
+            warnings.append(f"账户{account}中未找到该持仓，暂不支持卖空")
+        else:
+            available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
+            quantity = to_float(change.get("quantity"), None)
+            if quantity is not None and quantity > available + 1e-8:
+                missing.append("available_quantity")
+                warnings.append(f"卖出数量{quantity:g}超过账户{account}现有持仓{available:g}，暂不支持卖空")
+
+    result = dict(parsed)
+    result["changes"] = [change]
     result["missing_fields"] = list(dict.fromkeys(missing))
     result["warnings"] = list(dict.fromkeys(warnings))
     return result
@@ -1081,7 +1414,7 @@ async def enrich_with_online_instrument_search(
         )
         parsed["warnings"] = list(dict.fromkeys(warnings))
         parsed["instrument_candidates"] = candidates[:5]
-        return parsed
+        return enrich_instrument_currency_consistency(parsed)
 
     parsed["instrument_candidates"] = candidates[:5]
     preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
@@ -1120,7 +1453,7 @@ def apply_direct_code_revision(
     warnings = [warning for warning in pending.get("warnings", []) if "联网找到多个候选" not in warning]
     if selected:
         warnings.append(f"已选择联网候选：{selected['code']} {selected['name']}")
-    return {
+    return enrich_instrument_currency_consistency({
         "intent": "bookkeeping",
         "summary": "已补充标的代码",
         "action_type": action_type,
@@ -1128,28 +1461,27 @@ def apply_direct_code_revision(
         "missing_fields": missing,
         "warnings": list(dict.fromkeys(warnings)),
         "instrument_candidates": candidates,
-    }
+    })
 
 
 def parse_currency_revision(message: str) -> Optional[str]:
     text = re.sub(r"[\s，,。；;:：]", "", str(message or "")).upper()
     aliases = {
-        "人民币": "CNY",
-        "人民币元": "CNY",
-        "元": "CNY",
-        "RMB": "CNY",
-        "CNY": "CNY",
-        "港币": "HKD",
-        "港元": "HKD",
-        "HKD": "HKD",
-        "美元": "USD",
-        "美金": "USD",
-        "刀": "USD",
-        "USD": "USD",
+        "人民币": "CNY", "人民币元": "CNY", "元": "CNY", "RMB": "CNY", "CNY": "CNY",
+        "港币": "HKD", "港元": "HKD", "HKD": "HKD",
+        "美元": "USD", "美金": "USD", "美刀": "USD", "刀": "USD", "USD": "USD",
+        "欧元": "EUR", "EUR": "EUR", "日元": "JPY", "JPY": "JPY",
+        "英镑": "GBP", "GBP": "GBP", "新加坡元": "SGD", "新币": "SGD", "SGD": "SGD",
+        "澳元": "AUD", "AUD": "AUD", "加元": "CAD", "CAD": "CAD", "瑞郎": "CHF", "CHF": "CHF",
     }
-    for prefix in ("币种", "改成", "改为", "修改为", "变成", "变为", "设置为", "设为"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("币种", "改成", "改为", "修改为", "修改成", "变成", "变为", "设置为", "设为", "调整为", "调整成"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                changed = True
+                break
     return aliases.get(text)
 
 
@@ -1168,7 +1500,70 @@ def apply_direct_field_revision(
     action_type = str(pending.get("action_type") or "add_or_update")
     original_changes = [dict(change) for change in pending.get("changes", [])]
     warnings = list(pending.get("warnings", []))
-    text = str(message or "").strip()
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if "不是" in text:
+        correction = re.search(r"(?:而是|[,，]\s*是|;\s*是|；\s*是)\s*(.+?)\s*$", text)
+        if correction:
+            text = correction.group(1).strip()
+
+    if action_type == "multi_cash":
+        return None
+
+    if action_type in {"deposit", "withdraw", "set_cash"}:
+        invalid_number = malformed_number_reason(text)
+        if invalid_number:
+            parsed = {
+                "intent": "bookkeeping",
+                "summary": "修改内容中的数字格式无效",
+                "action_type": action_type,
+                "changes": original_changes,
+                "missing_fields": list(dict.fromkeys(collect_missing_fields(original_changes, action_type) + ["invalid_number"])),
+                "warnings": list(dict.fromkeys(warnings + [invalid_number])),
+                "instrument_candidates": pending.get("instrument_candidates", []),
+            }
+            return parsed
+
+        currency = parse_currency_revision(text)
+        amount = parse_number_after(text, ("amount", "金额", "余额", "现金"))
+        compact_match = re.fullmatch(
+            rf"\s*(?:(?:金额|余额|现金)\s*)?(?:(?:改成|改为|修改为|修改成|调整为|调整成|设置为|设为|变成|变为)\s*)?({NUMBER_TOKEN_PATTERN})\s*(?:({CURRENCY_TOKEN_PATTERN}))?\s*[。.]?\s*",
+            text,
+            re.IGNORECASE,
+        )
+        if compact_match:
+            amount = parse_human_number(compact_match.group(1), amount)
+            currency = normalize_currency_token(compact_match.group(2)) or currency
+        elif amount is not None:
+            currency = infer_currency(text) or currency
+
+        if amount is not None or currency is not None:
+            change = original_changes[0]
+            if amount is not None:
+                warnings = [
+                    warning for warning in warnings
+                    if "科学计数法" not in warning
+                    and "数字中包含多个小数点" not in warning
+                    and "千分位逗号格式不正确" not in warning
+                    and "复合金额" not in warning
+                ]
+            changes_summary: List[str] = []
+            if amount is not None:
+                change["amount"] = amount
+                changes_summary.append(f"金额{format_human_number(amount)}")
+            if currency is not None:
+                change["currency"] = currency
+                changes_summary.append(f"币种{currency}")
+            change["updated_at"] = utc_now_iso()
+            parsed = {
+                "intent": "bookkeeping",
+                "summary": "已修改现金信息，请重新确认",
+                "action_type": action_type,
+                "changes": original_changes,
+                "missing_fields": collect_missing_fields(original_changes, action_type),
+                "warnings": list(dict.fromkeys(warnings + [f"已修改：{'、'.join(changes_summary)}"])),
+                "instrument_candidates": pending.get("instrument_candidates", []),
+            }
+            return enrich_cash_availability(parsed)
 
     currency = parse_currency_revision(text)
     if currency:
@@ -1189,6 +1584,13 @@ def apply_direct_field_revision(
         }
 
     account, account_source = infer_account(text, allow_single=True)
+    if account is None:
+        known_accounts = sorted(COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES), key=len, reverse=True)
+        for candidate in known_accounts:
+            if re.fullmatch(rf"(?:改成|改为|修改为|修改成|调整为|调整成)?\s*{re.escape(candidate)}", text, re.IGNORECASE):
+                account = normalize_account(candidate)
+                account_source = "explicit"
+                break
     if account and (
         account in COMMON_ACCOUNTS
         or account in NEW_ACCOUNT_HINTS
@@ -1201,6 +1603,16 @@ def apply_direct_field_revision(
         warnings = [warning for warning in warnings if "新账户分组" not in warning]
         if account not in COMMON_ACCOUNTS:
             warnings.append(f"{account}是新账户分组，请在确认写入前核对")
+        if action_type == "sell" and re.search(r"清仓|全部|全卖|卖光", str(pending.get("message") or "")):
+            selected = [
+                position for position in find_position_matches(original_changes[0], compact_positions())
+                if str(position.get("account") or "").strip() == account
+            ]
+            if selected:
+                available = sum(to_float(position.get("quantity"), 0.0) or 0.0 for position in selected)
+                original_changes[0]["quantity"] = available
+                original_changes[0]["available_qty"] = available
+                warnings.append(f"已按账户{account}现有持仓数量{available:g}执行全部卖出")
         parsed = {
             "intent": "bookkeeping",
             "summary": "已修改账户，请重新确认",
@@ -1208,23 +1620,6 @@ def apply_direct_field_revision(
             "changes": original_changes,
             "missing_fields": collect_missing_fields(original_changes, action_type),
             "warnings": list(dict.fromkeys(warnings)),
-            "instrument_candidates": pending.get("instrument_candidates", []),
-        }
-        return enrich_cash_availability(parsed)
-
-    amount = parse_number_after(text, ("amount", "金额", "余额"))
-    if amount is None and re.fullmatch(NUMBER_TOKEN_PATTERN, text, re.IGNORECASE):
-        amount = parse_human_number(text, None)
-    if amount is not None and action_type in {"deposit", "withdraw", "set_cash"}:
-        original_changes[0]["amount"] = amount
-        original_changes[0]["updated_at"] = utc_now_iso()
-        parsed = {
-            "intent": "bookkeeping",
-            "summary": "已修改金额，请重新确认",
-            "action_type": action_type,
-            "changes": original_changes,
-            "missing_fields": collect_missing_fields(original_changes, action_type),
-            "warnings": list(dict.fromkeys(warnings + [f"已将金额修改为{amount:g}"])),
             "instrument_candidates": pending.get("instrument_candidates", []),
         }
         return enrich_cash_availability(parsed)
@@ -1297,6 +1692,7 @@ async def ai_preview(request: PreviewRequest):
     parsed = parse_bookkeeping_message(request.message)
     parsed = await enrich_with_online_instrument_search(parsed, request.message)
     parsed = enrich_cash_availability(parsed)
+    parsed = enrich_sell_availability(parsed)
     if parsed.get("intent") == "chat_only":
         return {
             "ok": True,
@@ -1326,13 +1722,14 @@ async def ai_revise(request: ReviseRequest):
         pending = deepcopy(current)
         revision_token = current.get("updated_at") or current.get("created_at")
 
-    parsed = apply_direct_code_revision(pending, request.message)
+    parsed = apply_direct_field_revision(pending, request.message)
     if parsed is None:
-        parsed = apply_direct_field_revision(pending, request.message)
+        parsed = apply_direct_code_revision(pending, request.message)
     if parsed is None:
         parsed = parse_bookkeeping_message(request.message, previous=pending)
         parsed = await enrich_with_online_instrument_search(parsed, request.message)
     parsed = enrich_cash_availability(parsed)
+    parsed = enrich_sell_availability(parsed)
     if parsed.get("intent") == "chat_only":
         raise HTTPException(status_code=400, detail="未识别到可用于补充的记账信息")
 

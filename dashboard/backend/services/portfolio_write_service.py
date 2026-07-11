@@ -57,6 +57,12 @@ POSITION_STORAGE_FIELDS = {
 
 PositionIdentity = Tuple[str, str, str]
 SUPPORTED_CURRENCIES = {"CNY", "USD", "HKD"}
+ACCOUNT_CANONICAL_ALIASES = {
+    "IB": "IBKR",
+    "IBKR": "IBKR",
+    "盈透": "IBKR",
+    "盈透证券": "IBKR",
+}
 PORTFOLIO_MUTATION_LOCK = RLock()
 
 
@@ -81,6 +87,17 @@ def to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     return number if math.isfinite(number) else default
 
 
+def normalize_account_name(value: Any) -> str:
+    account = str(value or "").strip()
+    if not account:
+        return ""
+    upper = account.upper()
+    for alias, canonical in ACCOUNT_CANONICAL_ALIASES.items():
+        if upper == alias.upper():
+            return canonical
+    return account
+
+
 def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]:
     """Return user-friendly code plus inferred currency and asset type."""
     code = str(raw_code or "").strip()
@@ -97,6 +114,19 @@ def strip_code_prefix(raw_code: Any) -> tuple[str, Optional[str], Optional[str]]
         if prefix in {"NASDAQ", "NYSE", "AMEX"}:
             return rest, "USD", "stock"
     return code.upper() if code.isascii() else code, None, None
+
+
+def expected_currency_for_code(raw_code: Any) -> Optional[str]:
+    code, inferred_currency, _ = strip_code_prefix(raw_code)
+    if inferred_currency:
+        return inferred_currency
+    if code.isdigit() and len(code) == 4:
+        return "HKD"
+    if code.isdigit() and len(code) == 6:
+        return "CNY"
+    if code and code.isascii() and not code.isdigit():
+        return "USD"
+    return None
 
 
 def infer_position_defaults(position: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,7 +159,7 @@ def infer_position_defaults(position: Dict[str, Any]) -> Dict[str, Any]:
 
 def position_identity(position: Dict[str, Any]) -> PositionIdentity:
     """Return the canonical identity: account + code + currency."""
-    account = str(position.get("account") or position.get("group") or "").strip()
+    account = normalize_account_name(position.get("account") or position.get("group"))
     code, inferred_currency, _ = strip_code_prefix(position.get("code") or position.get("symbol"))
     currency = str(position.get("currency") or inferred_currency or "").upper().strip()
     return account, code, currency
@@ -194,6 +224,11 @@ class PortfolioWriteService:
                 raise RuntimeError(f"portfolio账本存在不完整持仓身份：{identity}")
             if identity[2] not in SUPPORTED_CURRENCIES:
                 raise RuntimeError(f"portfolio账本包含暂不支持的币种：{identity[2]}")
+            expected_currency = expected_currency_for_code(identity[1])
+            if expected_currency and identity[2] != expected_currency:
+                raise RuntimeError(
+                    f"portfolio账本代码与币种不匹配：{identity[1]}通常使用{expected_currency}，当前为{identity[2]}"
+                )
             quantity = to_float(position.get("quantity"), None)
             cost_price = to_float(position.get("cost_price"), None)
             if quantity is None or quantity <= 0:
@@ -285,7 +320,7 @@ class PortfolioWriteService:
         }
         position: Dict[str, Any] = {}
 
-        account = str(raw_position.get("account") or raw_position.get("group") or "").strip()
+        account = normalize_account_name(raw_position.get("account") or raw_position.get("group"))
         if account:
             position["account"] = account
 
@@ -357,7 +392,7 @@ class PortfolioWriteService:
         return position
 
     def normalize_cash_account(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        account = str((raw or {}).get("account") or "").strip()
+        account = normalize_account_name((raw or {}).get("account"))
         currency = str((raw or {}).get("currency") or "").upper().strip()
         amount = to_float((raw or {}).get("amount"), 0.0) or 0.0
         return {
@@ -397,6 +432,9 @@ class PortfolioWriteService:
             missing.append("currency")
         elif currency not in SUPPORTED_CURRENCIES:
             missing.append("unsupported_currency")
+        expected_currency = expected_currency_for_code(normalized.get("code"))
+        if expected_currency and currency and currency != expected_currency:
+            missing.append("currency_conflict")
         quantity = to_float(normalized.get("quantity"), None)
         if action_type != "delete":
             if quantity is None:
@@ -421,7 +459,7 @@ class PortfolioWriteService:
             action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
 
             if action_type in {"deposit", "withdraw", "set_cash"}:
-                account = str(raw_change.get("account") or "").strip()
+                account = normalize_account_name(raw_change.get("account"))
                 currency = str(raw_change.get("currency") or "").upper().strip()
                 amount = to_float(raw_change.get("amount"), None)
                 invalid_amount = (
@@ -488,6 +526,15 @@ class PortfolioWriteService:
                 existing["source"] = change.get("source") or existing.get("source") or "ai"
                 existing["updated_at"] = utc_now_iso()
             else:
+                buy_qty = to_float(change.get("quantity"), 0.0) or 0.0
+                buy_cost = to_float(change.get("cost_price"), 0.0) or 0.0
+                fee = to_float(change.get("fee"), 0.0) or 0.0
+                if buy_qty > 0 and fee:
+                    total_cost_with_fee = (buy_qty * buy_cost) + fee
+                    if total_cost_with_fee < 0:
+                        raise ValueError("手续费导致总成本小于0")
+                    change["total_cost"] = total_cost_with_fee
+                    change["cost_price"] = total_cost_with_fee / buy_qty
                 positions.append(change)
 
             imported += 1
