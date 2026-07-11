@@ -43,7 +43,7 @@ export default function Header() {
           <div className="flex items-baseline gap-2 text-lg font-semibold">
             <span>{portfolio ? formatMoney(portfolio.total_market_value) : '--'}</span>
             {portfolio && (
-              <span className="text-xs font-normal text-slate-400">{holdingPercent.toFixed(2)}%</span>
+              <span className="text-sm font-normal text-slate-400">({holdingPercent.toFixed(2)}%)</span>
             )}
           </div>
         </div>
@@ -52,7 +52,7 @@ export default function Header() {
           <div className="flex items-baseline gap-2 text-lg font-semibold">
             <span>{portfolio ? formatMoney(portfolio.cash) : '--'}</span>
             {portfolio && (
-              <span className="text-xs font-normal text-slate-400">{cashPercent.toFixed(2)}%</span>
+              <span className="text-sm font-normal text-slate-400">({cashPercent.toFixed(2)}%)</span>
             )}
           </div>
         </div>

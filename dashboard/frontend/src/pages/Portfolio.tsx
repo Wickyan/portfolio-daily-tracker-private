@@ -316,6 +316,14 @@ export default function Portfolio() {
     }).format(num)
   }
 
+  const formatAllocationPercent = (num: number) => {
+    return new Intl.NumberFormat('zh-CN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+      signDisplay: 'never'
+    }).format(num)
+  }
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -345,15 +353,15 @@ export default function Portfolio() {
           <div className="text-sm text-slate-400 mb-2">持仓市值(CNY)</div>
           <div className="flex items-baseline gap-2">
             <div className="text-2xl font-bold">¥{formatNumber(totalMarketValue)}</div>
-            <div className="text-sm text-slate-400">{formatPercent(holdingPercent)}%</div>
+            <div className="text-sm text-slate-400">({formatAllocationPercent(holdingPercent)}%)</div>
           </div>
           <div className="mt-1 text-xs text-slate-500">占总资产</div>
         </div>
         <div className="bg-slate-800 rounded-lg p-6">
           <div className="text-sm text-slate-400 mb-2">账户现金(CNY)</div>
           <div className="flex items-baseline gap-2">
-            <div className="text-2xl font-bold text-green-400">¥{formatNumber(cash)}</div>
-            <div className="text-sm text-slate-400">{formatPercent(cashPercent)}%</div>
+            <div className="text-2xl font-bold text-white">¥{formatNumber(cash)}</div>
+            <div className="text-sm text-slate-400">({formatAllocationPercent(cashPercent)}%)</div>
           </div>
           <div className="mt-1 text-xs text-slate-500">占总资产</div>
         </div>
