@@ -1013,6 +1013,171 @@ def enrich_instrument_currency_consistency(parsed: Dict[str, Any]) -> Dict[str, 
     return result
 
 
+def _parse_copy_field_map(payload: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for part in re.split(r"[；;]", payload):
+        item = part.strip()
+        if not item:
+            continue
+        match = re.match(r"^([^=：:]+?)\s*[=：:]\s*(.*?)\s*$", item)
+        if not match:
+            continue
+        fields[match.group(1).strip()] = match.group(2).strip()
+    return fields
+
+
+def _parse_amount_currency_pair(value: str) -> tuple[Optional[float], Optional[str]]:
+    match = re.fullmatch(
+        rf"\s*({NUMBER_TOKEN_PATTERN})\s*({CURRENCY_TOKEN_PATTERN})\s*",
+        unicodedata.normalize("NFKC", str(value or "")),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None, None
+    return parse_human_number(match.group(1), None), normalize_currency_token(match.group(2))
+
+
+def parse_canonical_copy_text(message: str) -> Optional[Dict[str, Any]]:
+    """Parse the compact editable text copied from a confirmation card.
+
+    Canonical examples:
+    记账：账户=银河；操作=买入；标的=纳指ETF国泰；代码=513100；币种=CNY；数量=1.24；成本价=1.243
+    记账：账户=银河；操作=增加现金；币种=CNY；金额=20000
+    记账：账户=长桥；操作=换汇；换出=500HKD；换入=20USD
+    """
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    canonical_lines: List[str] = []
+    for line in raw_lines:
+        match = re.match(r"^记账(?:\d+)?\s*[：:]\s*(.+)$", line, re.IGNORECASE)
+        if not match:
+            return None
+        canonical_lines.append(match.group(1).strip())
+    if not canonical_lines:
+        return None
+
+    service = PortfolioWriteService()
+    changes: List[Dict[str, Any]] = []
+    action_types: List[str] = []
+    warnings: List[str] = ["已按可编辑复制格式重新生成确认卡；请核对后再写入"]
+
+    action_aliases = {
+        "买入": "add_or_update",
+        "新增": "add_or_update",
+        "买入/新增": "add_or_update",
+        "卖出": "sell",
+        "减持": "sell",
+        "增加现金": "deposit",
+        "入金": "deposit",
+        "减少现金": "withdraw",
+        "出金": "withdraw",
+        "设置现金余额": "set_cash",
+        "现金余额": "set_cash",
+        "换汇": "fx_exchange",
+    }
+
+    for payload in canonical_lines:
+        fields = _parse_copy_field_map(payload)
+        action_label = str(fields.get("操作") or "").strip()
+        action_type = action_aliases.get(action_label)
+        if action_type is None:
+            return None
+        action_types.append(action_type)
+        account = normalize_account(fields.get("账户")) if fields.get("账户") else None
+
+        if action_type == "fx_exchange":
+            source_amount, source_currency = _parse_amount_currency_pair(fields.get("换出", ""))
+            target_amount, target_currency = _parse_amount_currency_pair(fields.get("换入", ""))
+            fx_changes = [
+                {
+                    "action_type": "withdraw",
+                    "account": account,
+                    "currency": source_currency,
+                    "amount": source_amount,
+                    "note": "fx_exchange_out",
+                    "source": "copy",
+                },
+                {
+                    "action_type": "deposit",
+                    "account": account,
+                    "currency": target_currency,
+                    "amount": target_amount,
+                    "note": "fx_exchange_in",
+                    "source": "copy",
+                },
+            ]
+            changes.extend([
+                {key: value for key, value in change.items() if value is not None}
+                for change in fx_changes
+            ])
+            continue
+
+        if action_type in {"deposit", "withdraw", "set_cash"}:
+            currency = normalize_currency_token(fields.get("币种", ""))
+            amount = parse_human_number(fields.get("金额", ""), None)
+            change = {
+                "action_type": action_type,
+                "account": account,
+                "currency": currency,
+                "amount": amount,
+                "note": "",
+                "source": "copy",
+            }
+            changes.append({key: value for key, value in change.items() if value is not None})
+            continue
+
+        raw_code = fields.get("代码", "")
+        code, inferred_currency, _ = strip_code_prefix(raw_code)
+        currency = normalize_currency_token(fields.get("币种", "")) or inferred_currency
+        quantity = parse_human_number(fields.get("数量", ""), None)
+        price_key = "成交价" if action_type == "sell" else "成本价"
+        cost_price = parse_human_number(fields.get(price_key, fields.get("成本价", "")), None)
+        fee = parse_human_number(fields.get("手续费", ""), None)
+        raw_change = {
+            "action_type": action_type,
+            "account": account,
+            "name": str(fields.get("标的") or "").strip(),
+            "code": code,
+            "currency": currency,
+            "asset_type": "stock" if code else "custom",
+            "quantity": quantity,
+            "cost_price": cost_price,
+            "fee": fee,
+            "note": "",
+            "source": "copy",
+            "side": "long",
+        }
+        raw_change = {key: value for key, value in raw_change.items() if value not in (None, "")}
+        changes.append(service.normalize_position(raw_change))
+
+    if action_types == ["fx_exchange"]:
+        action_type = "fx_exchange"
+    elif len(action_types) > 1 and all(item in {"deposit", "withdraw", "set_cash"} for item in action_types):
+        action_type = "multi_cash"
+        warnings.append("多条现金记录将作为同一个原子操作一起写入或一起失败")
+    elif len(set(action_types)) == 1:
+        action_type = action_types[0]
+    else:
+        return {
+            "intent": "bookkeeping",
+            "summary": "复制文本中包含多种不同操作，请拆成多条提交",
+            "action_type": "multiple_operations",
+            "changes": [],
+            "missing_fields": ["multiple_operations"],
+            "warnings": ["为避免错配，请将不同类型的记录拆开提交"],
+        }
+
+    missing = collect_missing_fields(changes, action_type)
+    return enrich_instrument_currency_consistency({
+        "intent": "bookkeeping",
+        "summary": "已识别复制的可编辑记账文本",
+        "action_type": action_type,
+        "changes": changes,
+        "missing_fields": missing,
+        "warnings": warnings,
+    })
+
+
 def parse_bookkeeping_message(
     message: str,
     previous: Optional[Dict[str, Any]] = None,
@@ -1021,6 +1186,10 @@ def parse_bookkeeping_message(
     service = PortfolioWriteService()
     existing_positions = compact_positions()
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
+
+    copied = parse_canonical_copy_text(text)
+    if copied is not None:
+        return copied
 
     if previous and previous.get("changes") and previous.get("missing_fields") in (["account"], ["account/group"]):
         account, _ = infer_account(text, allow_single=True)

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Image, Loader2, X, Upload, MessageSquare, PlusCircle, History, RotateCcw } from 'lucide-react'
+import { Send, Image, Loader2, X, Upload, MessageSquare, PlusCircle, History, RotateCcw, Copy, Check } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useQueryClient } from '@tanstack/react-query'
@@ -52,22 +52,80 @@ function parseTargetedConfirmOrdinal(command: string): number | null {
   return ordinal && ordinal > 0 ? ordinal : null
 }
 
+function compactCopyNumber(value?: number | null): string {
+  if (value === undefined || value === null || !Number.isFinite(value)) return ''
+  return String(value)
+}
+
+function formatPendingForClipboard(pending: PendingAction): string {
+  const changes = pending.changes || []
+  const actionLabels: Record<string, string> = {
+    add_or_update: '买入',
+    sell: '卖出',
+    deposit: '增加现金',
+    withdraw: '减少现金',
+    set_cash: '设置现金余额',
+  }
+
+  if (pending.action_type === 'fx_exchange' && changes.length >= 2) {
+    const source = changes.find((item) => item.action_type === 'withdraw') || changes[0]
+    const target = changes.find((item) => item.action_type === 'deposit') || changes[1]
+    const account = source.account || target.account || ''
+    return `记账：账户=${account}；操作=换汇；换出=${compactCopyNumber(source.amount)}${source.currency || ''}；换入=${compactCopyNumber(target.amount)}${target.currency || ''}`
+  }
+
+  return changes.map((item, index) => {
+    const action = item.action_type || pending.action_type || 'add_or_update'
+    const prefix = changes.length > 1 ? `记账${index + 1}：` : '记账：'
+    const fields = [`账户=${item.account || ''}`, `操作=${actionLabels[action] || action}`]
+    if (['deposit', 'withdraw', 'set_cash'].includes(action)) {
+      fields.push(`币种=${item.currency || ''}`, `金额=${compactCopyNumber(item.amount)}`)
+    } else {
+      fields.push(
+        `标的=${item.name || ''}`,
+        `代码=${item.code || ''}`,
+        `币种=${item.currency || ''}`,
+        `数量=${compactCopyNumber(item.quantity)}`,
+        `${action === 'sell' ? '成交价' : '成本价'}=${compactCopyNumber(item.cost_price)}`,
+      )
+      if (item.fee !== undefined && item.fee !== null) fields.push(`手续费=${compactCopyNumber(item.fee)}`)
+    }
+    return `${prefix}${fields.join('；')}`
+  }).join('\n')
+}
+
+async function copyTextWithFallback(text: string): Promise<void> {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!copied) throw new Error('浏览器未允许复制，请长按文本手动复制')
+}
+
 function PendingActionCard({
   pending,
   onRevise,
   onConfirm,
-  onCancel,
   onRollback,
 }: {
   pending: PendingAction
   onRevise: (message: string) => Promise<void>
   onConfirm: () => Promise<void>
-  onCancel: () => Promise<void>
   onRollback?: () => Promise<void>
 }) {
   const [reviseText, setReviseText] = useState('')
   const [isWorking, setIsWorking] = useState(false)
   const [workError, setWorkError] = useState('')
+  const [copied, setCopied] = useState(false)
   const changes: PendingChange[] = pending.changes?.length ? pending.changes : [{}]
   const change: PendingChange = changes[0]
 
@@ -97,7 +155,23 @@ function PendingActionCard({
 
   return (
     <div className="space-y-3 rounded-lg border border-primary-500/40 bg-slate-800 p-4">
-      <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
+      <div className="flex items-start justify-between gap-3">
+        <div className="font-semibold text-primary-300">{pending.summary || '待确认记账信息'}</div>
+        <button
+          type="button"
+          onClick={() => run(async () => {
+            await copyTextWithFallback(formatPendingForClipboard(pending))
+            setCopied(true)
+            window.setTimeout(() => setCopied(false), 1600)
+          })}
+          disabled={isWorking}
+          className="flex shrink-0 items-center gap-1 rounded border border-slate-600 bg-slate-700 px-2 py-1 text-xs text-slate-200 hover:border-primary-500 hover:bg-slate-600 disabled:opacity-50"
+          title="复制为可编辑记账文本"
+        >
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copied ? '已复制' : '复制'}
+        </button>
+      </div>
       <div className="space-y-2">
         {changes.map((item, index) => {
           const childAction = item.action_type || pending.action_type || ''
@@ -296,13 +370,6 @@ function PendingActionCard({
               className="rounded bg-primary-600 px-3 py-1.5 text-sm hover:bg-primary-500 disabled:opacity-50"
             >
               {isWorking ? '处理中…' : (reviseText.trim() ? '应用修改并生成新卡' : '确认写入')}
-            </button>
-            <button
-              onClick={() => run(onCancel)}
-              disabled={isWorking}
-              className="rounded bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600 disabled:opacity-50"
-            >
-              取消
             </button>
           </div>
         </div>
@@ -504,7 +571,6 @@ export default function ChatPanel() {
     const userMessage = input.trim()
     const normalizedCommand = userMessage.replace(/\s+/g, '')
     const confirmCommands = new Set(['确认', '确定', '确认写入', '写入', '保存', '录入', '提交'])
-    const cancelCommands = new Set(['取消', '取消写入', '不写了'])
     const targetedConfirmOrdinal = parseTargetedConfirmOrdinal(normalizedCommand)
     const isRollbackCommand = /撤回|撤销|回滚|undo/i.test(normalizedCommand)
 
@@ -575,7 +641,7 @@ export default function ChatPanel() {
 
     // “确认第二条/再确认第一条”可精确选择未确认卡片；普通“确认”仍操作最新一条。
     const isConfirmCommand = confirmCommands.has(normalizedCommand) || targetedConfirmOrdinal !== null
-    if (currentImages.length === 0 && (isConfirmCommand || cancelCommands.has(normalizedCommand))) {
+    if (currentImages.length === 0 && isConfirmCommand) {
       const userEntry: ChatMessage = { role: 'user', content: userMessage }
       let targetEntry = latestPendingEntry
       if (targetedConfirmOrdinal !== null) {
@@ -608,16 +674,11 @@ export default function ChatPanel() {
 
       setLoading(true)
       try {
-        let operationId = targetPending.operation_id
-        if (cancelCommands.has(normalizedCommand)) {
-          await portfolioService.aiCancel(targetPendingId)
-        } else {
-          const result = await portfolioService.aiConfirm(targetPendingId)
-          operationId = result.operation_id
-          queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-          queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
-          await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
-        }
+        const result = await portfolioService.aiConfirm(targetPendingId)
+        const operationId = result.operation_id
+        queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+        queryClient.invalidateQueries({ queryKey: ['portfolio', 'operations'] })
+        await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
 
         useAppStore.setState((state) => ({
           messages: [
@@ -628,7 +689,7 @@ export default function ChatPanel() {
                 ...message,
                 pendingAction: {
                   ...currentPending,
-                  status: cancelCommands.has(normalizedCommand) ? 'cancelled' : 'confirmed',
+                  status: 'confirmed',
                   requires_confirmation: false,
                   operation_id: operationId,
                 },
@@ -856,11 +917,6 @@ export default function ChatPanel() {
                   requires_confirmation: false,
                   operation_id: result.operation_id,
                 })
-              }}
-              onCancel={async () => {
-                if (!message.pendingAction?.pending_id) return
-                await portfolioService.aiCancel(message.pendingAction.pending_id)
-                updatePendingMessage(message.pendingAction.pending_id, { ...message.pendingAction, status: 'cancelled', requires_confirmation: false })
               }}
               onRollback={message.pendingAction?.operation_id ? async () => {
                 const operationId = message.pendingAction!.operation_id!
