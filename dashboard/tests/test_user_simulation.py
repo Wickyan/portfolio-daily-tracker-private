@@ -130,7 +130,8 @@ class UserSimulationTest(unittest.TestCase):
         result = asyncio.run(ai_confirm(ConfirmRequest(pending_id=pending["pending_id"])))
         self.assertEqual(self.cash_map(), {("银河", "CNY"): 100, ("长桥", "USD"): 200})
 
-        self.service.rollback_operation(result["operation_id"])
+        for operation_id in reversed(result["operation_ids"]):
+            self.service.rollback_operation(operation_id)
         self.assertEqual(self.cash_map(), {})
 
     def test_multi_cash_applies_in_user_order(self) -> None:

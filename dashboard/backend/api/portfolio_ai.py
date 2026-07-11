@@ -206,6 +206,15 @@ class ConfirmRequest(BaseModel):
     pending_id: str
 
 
+class ItemRequest(BaseModel):
+    pending_id: str
+    item_id: str
+
+
+class ItemReviseRequest(ItemRequest):
+    message: str
+
+
 class CancelRequest(BaseModel):
     pending_id: str
 
@@ -246,6 +255,264 @@ def load_pending(pending_id: str) -> Dict[str, Any]:
     return pending
 
 
+ITEM_OPEN_STATUSES = {"pending"}
+ITEM_TERMINAL_STATUSES = {"confirmed", "rolled_back", "expired", "superseded"}
+
+
+def _normalize_public_change(raw_change: Dict[str, Any]) -> Dict[str, Any]:
+    action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
+    if action_type in {"deposit", "withdraw", "set_cash"}:
+        return {
+            "action_type": action_type,
+            "account": str(raw_change.get("account") or "").strip(),
+            "currency": str(raw_change.get("currency") or "").upper().strip(),
+            "amount": to_float(raw_change.get("amount"), None),
+            "note": str(raw_change.get("note") or ""),
+            "source": str(raw_change.get("source") or "ai"),
+        }
+    return PortfolioWriteService().normalize_position(raw_change)
+
+
+def _warning_item_index(warning: str) -> Optional[int]:
+    match = re.match(r"^第(\d+)条", str(warning or ""))
+    return int(match.group(1)) - 1 if match else None
+
+
+def _item_summary(action_type: str, changes: List[Dict[str, Any]], index: int) -> str:
+    label = {
+        "add_or_update": "买入",
+        "sell": "卖出",
+        "set_position": "更新持仓",
+        "deposit": "增加现金",
+        "withdraw": "减少现金",
+        "set_cash": "设置现金余额",
+        "fx_exchange": "换汇",
+    }.get(action_type, "记录")
+    change = changes[0] if changes else {}
+    target = str(change.get("name") or change.get("code") or change.get("currency") or "").strip()
+    return f"第{index + 1}条 · {label}" + (f" · {target}" if target else "")
+
+
+def _evaluate_item(
+    action_type: str,
+    changes: List[Dict[str, Any]],
+    warnings: Optional[List[str]] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    parsed = {
+        "intent": "bookkeeping",
+        "summary": "子项校验",
+        "action_type": action_type,
+        "changes": [dict(change) for change in changes],
+        "missing_fields": collect_missing_fields(changes, action_type),
+        "warnings": list(warnings or []),
+        "instrument_candidates": list(candidates or []),
+    }
+    parsed = enrich_instrument_currency_consistency(parsed)
+    parsed = enrich_cash_availability(parsed)
+    parsed = enrich_sell_availability(parsed)
+    return parsed
+
+
+def build_pending_items(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    changes = [dict(change) for change in parsed.get("changes", [])]
+    if not changes:
+        return []
+    parent_action = str(parsed.get("action_type") or "add_or_update")
+    groups: List[tuple[str, List[Dict[str, Any]], List[int]]] = []
+    if parent_action == "fx_exchange":
+        groups.append(("fx_exchange", changes, list(range(len(changes)))))
+    else:
+        for index, change in enumerate(changes):
+            action_type = str(change.get("action_type") or parent_action or "add_or_update")
+            groups.append((action_type, [change], [index]))
+
+    parent_warnings = list(parsed.get("warnings", []))
+    parent_candidates = list(parsed.get("instrument_candidates", []))
+    items: List[Dict[str, Any]] = []
+    for item_index, (action_type, item_changes, source_indexes) in enumerate(groups):
+        item_warnings = [
+            warning for warning in parent_warnings
+            if _warning_item_index(warning) in source_indexes
+        ]
+        # Single-card warnings without a record prefix belong to the only item.
+        if len(groups) == 1:
+            item_warnings.extend(
+                warning for warning in parent_warnings
+                if _warning_item_index(warning) is None
+            )
+        item_candidates = [
+            {key: value for key, value in candidate.items() if key != "change_index"}
+            for candidate in parent_candidates
+            if int(candidate.get("change_index", source_indexes[0])) in source_indexes
+        ]
+        evaluated = _evaluate_item(action_type, item_changes, item_warnings, item_candidates)
+        missing = list(evaluated.get("missing_fields", []))
+        # Preserve parser-level blockers for a single grouped item (FX, incomplete single record).
+        if len(groups) == 1:
+            missing = list(dict.fromkeys(missing + list(parsed.get("missing_fields", []))))
+        item_id = str(uuid4())
+        items.append({
+            "item_id": item_id,
+            "index": item_index,
+            "source_indexes": source_indexes,
+            "action_type": action_type,
+            "summary": _item_summary(action_type, item_changes, item_index),
+            "changes": evaluated.get("changes", item_changes),
+            "missing_fields": missing,
+            "warnings": list(dict.fromkeys(evaluated.get("warnings", item_warnings))),
+            "instrument_candidates": item_candidates,
+            "revision_options": list(parsed.get("revision_options", [])) if len(groups) == 1 else [],
+            "revision_diffs": [],
+            "revision_history": [],
+            "status": "pending",
+            "requires_confirmation": len(missing) == 0,
+            "operation_id": None,
+        })
+    return items
+
+
+def ensure_pending_items(pending: Dict[str, Any]) -> bool:
+    if isinstance(pending.get("items"), list) and pending.get("items"):
+        return False
+    parsed = {
+        "action_type": pending.get("action_type"),
+        "changes": pending.get("changes", []),
+        "missing_fields": pending.get("missing_fields", []),
+        "warnings": pending.get("warnings", []),
+        "instrument_candidates": pending.get("instrument_candidates", []),
+    }
+    pending["items"] = build_pending_items(parsed)
+    sync_pending_from_items(pending)
+    return True
+
+
+def _simulate_item_sequence(items: List[Dict[str, Any]]) -> tuple[bool, Optional[str]]:
+    service = PortfolioWriteService()
+    try:
+        state = service.load_portfolio()
+        for item in items:
+            for change in item.get("changes", []):
+                missing = service.validate_confirmable_change(change)
+                if missing:
+                    return False, ",".join(missing)
+            state, _ = service.apply_changes(state, [dict(change) for change in item.get("changes", [])])
+        return True, None
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        return False, str(exc)
+
+
+def _runtime_missing_for_item(item: Dict[str, Any], reason: Optional[str]) -> Optional[str]:
+    action_type = str(item.get("action_type") or "")
+    if action_type in {"withdraw", "fx_exchange"}:
+        return "available_cash"
+    if action_type == "sell":
+        text = str(reason or "")
+        return "existing_position" if "未找到" in text else "available_quantity"
+    return None
+
+
+def sync_pending_from_items(pending: Dict[str, Any]) -> Dict[str, Any]:
+    items = list(pending.get("items") or [])
+    runtime_fields = {"available_cash", "available_quantity", "existing_position"}
+    for index, item in enumerate(items):
+        item["index"] = index
+        if item.get("status", "pending") != "pending":
+            item["requires_confirmation"] = False
+            continue
+        item["missing_fields"] = [
+            field for field in item.get("missing_fields", [])
+            if field not in runtime_fields
+        ]
+        structurally_ready = not item.get("missing_fields") and not item.get("revision_options")
+        can_apply = False
+        reason: Optional[str] = None
+        if structurally_ready:
+            can_apply, reason = _simulate_item_sequence([item])
+        item["requires_confirmation"] = structurally_ready and can_apply
+        if structurally_ready and not can_apply:
+            runtime_missing = _runtime_missing_for_item(item, reason)
+            if runtime_missing:
+                item["missing_fields"] = list(dict.fromkeys(item.get("missing_fields", []) + [runtime_missing]))
+
+    pending["changes"] = [
+        dict(change)
+        for item in items
+        for change in item.get("changes", [])
+    ]
+    open_items = [item for item in items if item.get("status", "pending") == "pending"]
+    pending["missing_fields"] = list(dict.fromkeys(
+        field for item in open_items for field in item.get("missing_fields", [])
+    ))
+    statuses = [str(item.get("status") or "pending") for item in items]
+    if not statuses:
+        status = pending.get("status", "pending")
+    elif all(value == "pending" for value in statuses):
+        status = "pending"
+    elif all(value == "confirmed" for value in statuses):
+        status = "confirmed"
+    elif all(value == "rolled_back" for value in statuses):
+        status = "rolled_back"
+    elif all(value == "expired" for value in statuses):
+        status = "expired"
+    elif any(value == "pending" for value in statuses):
+        status = "partially_confirmed"
+    else:
+        status = "partially_rolled_back"
+    pending["status"] = status
+
+    all_structurally_ready = bool(open_items) and all(
+        not [
+            field for field in item.get("missing_fields", [])
+            if field not in runtime_fields
+        ]
+        and not item.get("revision_options")
+        for item in open_items
+    )
+    can_apply_all = False
+    if all_structurally_ready:
+        can_apply_all, _ = _simulate_item_sequence(open_items)
+    pending["can_confirm_all"] = all_structurally_ready and can_apply_all
+    pending["requires_confirmation"] = pending["can_confirm_all"]
+    pending["pending_item_count"] = sum(value == "pending" for value in statuses)
+    pending["confirmed_item_count"] = sum(value == "confirmed" for value in statuses)
+    pending["rolled_back_item_count"] = sum(value == "rolled_back" for value in statuses)
+    operation_ids = [
+        str(item.get("operation_id")) for item in items if item.get("operation_id")
+    ]
+    pending["operation_ids"] = operation_ids
+    pending["operation_id"] = operation_ids[0] if len(operation_ids) == 1 else None
+    return pending
+
+
+def get_pending_item(pending: Dict[str, Any], item_id: str) -> Dict[str, Any]:
+    target = str(item_id or "").strip()
+    for item in pending.get("items", []):
+        if str(item.get("item_id") or "") == target:
+            return item
+    raise HTTPException(status_code=404, detail="未找到该子项")
+
+
+def validate_item_group(item: Dict[str, Any]) -> None:
+    changes = list(item.get("changes", []))
+    action_type = str(item.get("action_type") or "")
+    if action_type == "fx_exchange":
+        if len(changes) != 2:
+            raise HTTPException(status_code=400, detail="换汇必须包含且仅包含一笔换出和一笔换入")
+        source, target = changes
+        if str(source.get("action_type") or "") != "withdraw" or str(target.get("action_type") or "") != "deposit":
+            raise HTTPException(status_code=400, detail="换汇顺序必须是先换出、后换入")
+        if str(source.get("account") or "").strip() != str(target.get("account") or "").strip():
+            raise HTTPException(status_code=400, detail="同一笔换汇的换出和换入必须属于同一账户")
+        if str(source.get("currency") or "").upper().strip() == str(target.get("currency") or "").upper().strip():
+            raise HTTPException(status_code=400, detail="换出币种和换入币种不能相同")
+    service = PortfolioWriteService()
+    for change in changes:
+        missing = service.validate_confirmable_change(change)
+        if missing:
+            raise HTTPException(status_code=400, detail=f"无法确认，字段无效: {', '.join(missing)}")
+
+
 def expire_pending_if_needed(pending: Dict[str, Any]) -> bool:
     expires_at_raw = pending.get("expires_at")
     if not expires_at_raw:
@@ -254,12 +521,21 @@ def expire_pending_if_needed(pending: Dict[str, Any]) -> bool:
         expired = datetime.fromisoformat(str(expires_at_raw)) < datetime.now()
     except ValueError:
         expired = True
-    if expired and pending.get("status") == "pending":
-        pending["status"] = "expired"
-        pending["requires_confirmation"] = False
+    if not expired:
+        return False
+    ensure_pending_items(pending)
+    changed = False
+    for item in pending.get("items", []):
+        if item.get("status", "pending") == "pending":
+            item["status"] = "expired"
+            item["requires_confirmation"] = False
+            item["expired_at"] = utc_now_iso()
+            changed = True
+    if changed:
+        sync_pending_from_items(pending)
         pending["expired_at"] = utc_now_iso()
         save_pending(pending)
-    return expired
+    return changed
 
 
 def require_open_pending(pending: Dict[str, Any]) -> None:
@@ -270,64 +546,92 @@ def require_open_pending(pending: Dict[str, Any]) -> None:
 
 
 def reconcile_pending_with_operations(pending: Dict[str, Any]) -> Dict[str, Any]:
-    """Repair pending status from durable operation history when possible."""
+    """Repair parent and child statuses from durable operation history."""
     pending_id = str(pending.get("pending_id") or "").strip()
     if not pending_id:
         return pending
-    operation = PortfolioWriteService().find_confirm_operation_by_pending_id(pending_id)
-    if not operation:
-        return pending
+    service = PortfolioWriteService()
+    migrated = ensure_pending_items(pending)
+    changed = migrated
+    item_operations = service.find_confirm_operations_by_pending_id(pending_id)
+    by_item = {
+        str((operation.get("pending_action") or {}).get("item_id") or ""): operation
+        for operation in item_operations
+        if str((operation.get("pending_action") or {}).get("item_id") or "")
+    }
+    for item in pending.get("items", []):
+        item_id = str(item.get("item_id") or "")
+        operation = by_item.get(item_id)
+        if not operation:
+            continue
+        operation_id = str(operation.get("operation_id") or "")
+        target_status = "rolled_back" if operation.get("is_rolled_back") else "confirmed"
+        if item.get("status") != target_status or item.get("operation_id") != operation_id:
+            item["status"] = target_status
+            item["requires_confirmation"] = False
+            item["operation_id"] = operation_id
+            item["reconciled_at"] = utc_now_iso()
+            changed = True
 
-    changed = False
-    operation_id = str(operation.get("operation_id") or "")
-    if operation.get("is_rolled_back"):
-        if pending.get("status") != "rolled_back" or pending.get("operation_id") != operation_id:
-            pending["status"] = "rolled_back"
-            pending["requires_confirmation"] = False
-            pending["operation_id"] = operation_id
-            pending["reconciled_at"] = utc_now_iso()
-            changed = True
-    elif pending.get("status") in {"pending", "confirmed"}:
-        if pending.get("status") != "confirmed" or pending.get("operation_id") != operation_id:
-            pending["status"] = "confirmed"
-            pending["requires_confirmation"] = False
-            pending["operation_id"] = operation_id
-            pending["confirmed_at"] = pending.get("confirmed_at") or operation.get("created_at") or utc_now_iso()
-            pending["reconciled_at"] = utc_now_iso()
-            changed = True
+    # Legacy whole-card operations remain supported for old files.
+    legacy = service.find_confirm_operation_by_pending_id(pending_id)
+    if legacy and not by_item:
+        target_status = "rolled_back" if legacy.get("is_rolled_back") else "confirmed"
+        operation_id = str(legacy.get("operation_id") or "")
+        for item in pending.get("items", []):
+            if item.get("status") != target_status:
+                item["status"] = target_status
+                item["operation_id"] = operation_id
+                item["requires_confirmation"] = False
+                changed = True
+    sync_pending_from_items(pending)
     if changed:
+        pending["reconciled_at"] = utc_now_iso()
         save_pending(pending)
     return pending
 
 
+def _public_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "item_id": item.get("item_id"),
+        "index": item.get("index", 0),
+        "summary": item.get("summary"),
+        "action_type": item.get("action_type"),
+        "changes": [_normalize_public_change(change) for change in item.get("changes", [])],
+        "missing_fields": item.get("missing_fields", []),
+        "warnings": item.get("warnings", []),
+        "instrument_candidates": item.get("instrument_candidates", []),
+        "revision_options": item.get("revision_options", []),
+        "revision_diffs": item.get("revision_diffs", []),
+        "status": item.get("status", "pending"),
+        "requires_confirmation": item.get("requires_confirmation", False),
+        "operation_id": item.get("operation_id"),
+        "version": item.get("version", 1),
+    }
+
+
 def public_pending(pending: Dict[str, Any]) -> Dict[str, Any]:
-    normalized_changes = []
-    service = PortfolioWriteService()
-    for raw_change in pending.get("changes", []):
-        action_type = str(raw_change.get("action_type") or raw_change.get("action") or "add_or_update")
-        if action_type in {"deposit", "withdraw", "set_cash"}:
-            normalized_changes.append({
-                "action_type": action_type,
-                "account": str(raw_change.get("account") or "").strip(),
-                "currency": str(raw_change.get("currency") or "").upper().strip(),
-                "amount": to_float(raw_change.get("amount"), None),
-                "note": str(raw_change.get("note") or ""),
-                "source": str(raw_change.get("source") or "ai"),
-            })
-        else:
-            normalized_changes.append(service.normalize_position(raw_change))
+    ensure_pending_items(pending)
+    sync_pending_from_items(pending)
+    normalized_changes = [_normalize_public_change(change) for change in pending.get("changes", [])]
     return {
         "ok": True,
         "pending_id": pending.get("pending_id"),
         "summary": pending.get("summary"),
         "action_type": pending.get("action_type"),
         "changes": normalized_changes,
+        "items": [_public_item(item) for item in pending.get("items", [])],
         "missing_fields": pending.get("missing_fields", []),
         "warnings": pending.get("warnings", []),
         "requires_confirmation": pending.get("requires_confirmation", False),
+        "can_confirm_all": pending.get("can_confirm_all", False),
+        "pending_item_count": pending.get("pending_item_count", 0),
+        "confirmed_item_count": pending.get("confirmed_item_count", 0),
+        "rolled_back_item_count": pending.get("rolled_back_item_count", 0),
         "intent": pending.get("intent", "bookkeeping"),
         "status": pending.get("status", "pending"),
         "operation_id": pending.get("operation_id"),
+        "operation_ids": pending.get("operation_ids", []),
         "instrument_candidates": pending.get("instrument_candidates", []),
         "revision_options": pending.get("revision_options", []),
         "revision_diffs": pending.get("revision_diffs", []),
@@ -2699,6 +3003,8 @@ def make_pending(parsed: Dict[str, Any], input_type: str, message: str) -> Dict[
             and not parsed.get("revision_options")
         ),
     }
+    pending["items"] = build_pending_items(parsed)
+    sync_pending_from_items(pending)
     return pending
 
 
@@ -2951,111 +3257,415 @@ async def ai_revise(request: ReviseRequest):
         return public_pending(successor)
 
 
+def apply_action_type_revision(
+    item_pending: Dict[str, Any],
+    message: str,
+) -> Optional[Dict[str, Any]]:
+    if len(item_pending.get("changes", [])) != 1:
+        return None
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(message or "")))
+    action_type: Optional[str] = None
+    if re.search(r"(?:更新持仓|设置持仓|当前持仓|现在持有|改成持有|改为持有)", text):
+        action_type = "set_position"
+    elif re.search(r"(?:改为|改成|按|是|作为)?(?:卖出|减持|清仓)", text):
+        action_type = "sell"
+    elif re.search(r"(?:改为|改成|按|是|作为)?(?:买入|加仓|补仓)", text):
+        action_type = "add_or_update"
+    if action_type is None:
+        return None
+
+    change = dict(item_pending["changes"][0])
+    previous_action = str(change.get("action_type") or item_pending.get("action_type") or "add_or_update")
+    if previous_action == action_type:
+        return None
+    change["action_type"] = action_type
+    change["updated_at"] = utc_now_iso()
+    if action_type != "sell":
+        quantity = to_float(change.get("quantity"), None)
+        cost_price = to_float(change.get("cost_price"), None)
+        fee = to_float(change.get("fee"), 0.0) or 0.0
+        if quantity is not None and cost_price is not None:
+            change["total_cost"] = quantity * cost_price + fee
+    evaluated = _evaluate_item(action_type, [change])
+    labels = {
+        "add_or_update": "买入",
+        "sell": "卖出",
+        "set_position": "更新当前持仓",
+    }
+    return {
+        "intent": "bookkeeping",
+        "summary": f"已将操作类型改为{labels[action_type]}",
+        "action_type": action_type,
+        "changes": evaluated.get("changes", [change]),
+        "missing_fields": evaluated.get("missing_fields", []),
+        "warnings": [f"操作类型：{labels.get(previous_action, previous_action)}→{labels[action_type]}，请重新核对"],
+        "instrument_candidates": item_pending.get("instrument_candidates", []),
+        "revision_options": [],
+    }
+
+
+def _item_as_pending(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "action_type": item.get("action_type"),
+        "changes": deepcopy(item.get("changes", [])),
+        "missing_fields": list(item.get("missing_fields", [])),
+        "warnings": list(item.get("warnings", [])),
+        "instrument_candidates": deepcopy(item.get("instrument_candidates", [])),
+        "revision_options": deepcopy(item.get("revision_options", [])),
+        "message": "",
+    }
+
+
+def _item_snapshot(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "action_type": item.get("action_type"),
+        "changes": deepcopy(item.get("changes", [])),
+        "missing_fields": deepcopy(item.get("missing_fields", [])),
+        "warnings": deepcopy(item.get("warnings", [])),
+        "instrument_candidates": deepcopy(item.get("instrument_candidates", [])),
+        "revision_options": deepcopy(item.get("revision_options", [])),
+        "summary": item.get("summary"),
+        "version": item.get("version", 1),
+    }
+
+
+def _restore_item_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "intent": "bookkeeping",
+        "summary": "已撤销该子项上一步修改",
+        "action_type": snapshot.get("action_type"),
+        "changes": deepcopy(snapshot.get("changes", [])),
+        "missing_fields": deepcopy(snapshot.get("missing_fields", [])),
+        "warnings": stable_revision_warnings(list(snapshot.get("warnings", []))) + [
+            "已恢复该子项到上一步修改前；尚未写入Portfolio"
+        ],
+        "instrument_candidates": deepcopy(snapshot.get("instrument_candidates", [])),
+        "revision_options": deepcopy(snapshot.get("revision_options", [])),
+    }
+
+
+@router.post("/ai-revise-item")
+async def ai_revise_item(request: ItemReviseRequest):
+    correction = is_revision_correction(request.message)
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = load_pending(request.pending_id)
+        ensure_pending_items(pending)
+        if expire_pending_if_needed(pending):
+            raise HTTPException(status_code=409, detail="pending_action已过期")
+        item = get_pending_item(pending, request.item_id)
+        if item.get("status", "pending") != "pending":
+            raise HTTPException(status_code=409, detail=f"该子项已结束：{item.get('status')}")
+        token = pending.get("updated_at") or pending.get("created_at")
+        current_snapshot = _item_snapshot(item)
+        history = deepcopy(item.get("revision_history", []))
+        restored_snapshot: Optional[Dict[str, Any]] = None
+        if correction and history:
+            restored_snapshot = deepcopy(history[-1].get("before_item") or {})
+            base_item = _item_as_pending(restored_snapshot)
+        else:
+            base_item = _item_as_pending(item)
+
+    parsed = apply_action_type_revision(base_item, request.message)
+    if parsed is None:
+        parsed = apply_direct_field_revision(base_item, request.message)
+    if parsed is None:
+        parsed = apply_bare_numeric_revision(base_item, request.message)
+    if parsed is None:
+        parsed = apply_direct_code_revision(base_item, request.message)
+    if (
+        parsed is None
+        and correction
+        and restored_snapshot is not None
+        and not correction_has_replacement_instruction(request.message)
+    ):
+        parsed = _restore_item_snapshot(restored_snapshot)
+    if parsed is None:
+        parsed = await apply_contextual_revision(base_item, request.message)
+    if parsed is None and correction and restored_snapshot is not None:
+        parsed = _restore_item_snapshot(restored_snapshot)
+    if parsed is None:
+        parsed = parse_bookkeeping_message(request.message, previous=base_item)
+        parsed = await enrich_with_online_instrument_search(parsed, request.message)
+    parsed = enrich_cash_availability(parsed)
+    parsed = enrich_sell_availability(parsed)
+    if parsed.get("intent") == "chat_only" or not parsed.get("changes"):
+        raise HTTPException(status_code=400, detail="未识别到可用于修改该子项的信息")
+    if len(parsed.get("changes", [])) != len(base_item.get("changes", [])):
+        raise HTTPException(status_code=400, detail="单个子项修改不能拆成多条记录")
+
+    before_for_diff = (restored_snapshot or current_snapshot).get("changes", [])
+    revision_diffs: List[Dict[str, Any]] = []
+    if restored_snapshot is not None:
+        revision_diffs.extend(build_revision_diffs(
+            current_snapshot.get("changes", []),
+            restored_snapshot.get("changes", []),
+            kind="reverted",
+        ))
+    revision_diffs.extend(build_revision_diffs(
+        before_for_diff,
+        parsed.get("changes", []),
+        kind="applied",
+    ))
+
+    with PORTFOLIO_MUTATION_LOCK:
+        latest = load_pending(request.pending_id)
+        ensure_pending_items(latest)
+        latest_token = latest.get("updated_at") or latest.get("created_at")
+        if latest_token != token:
+            raise HTTPException(status_code=409, detail="该确认卡已被其他操作更新，请刷新后重试")
+        latest_item = get_pending_item(latest, request.item_id)
+        if latest_item.get("status", "pending") != "pending":
+            raise HTTPException(status_code=409, detail=f"该子项已结束：{latest_item.get('status')}")
+
+        if restored_snapshot is not None:
+            next_history = history[:-1]
+            next_history.append({"before_item": deepcopy(restored_snapshot), "created_at": utc_now_iso()})
+        else:
+            next_history = history + [{"before_item": current_snapshot, "created_at": utc_now_iso()}]
+        next_history = next_history[-20:]
+
+        action_type = str(parsed.get("action_type") or latest_item.get("action_type") or "add_or_update")
+        evaluated = _evaluate_item(
+            action_type,
+            parsed.get("changes", []),
+            parsed.get("warnings", []),
+            parsed.get("instrument_candidates", []),
+        )
+        latest_item.update({
+            "action_type": action_type,
+            "changes": evaluated.get("changes", parsed.get("changes", [])),
+            "missing_fields": evaluated.get("missing_fields", parsed.get("missing_fields", [])),
+            "warnings": list(dict.fromkeys(evaluated.get("warnings", parsed.get("warnings", [])))),
+            "instrument_candidates": parsed.get("instrument_candidates", []),
+            "revision_options": parsed.get("revision_options", []),
+            "revision_diffs": revision_diffs,
+            "revision_history": next_history,
+            "summary": _item_summary(action_type, parsed.get("changes", []), int(latest_item.get("index", 0))),
+            "version": int(latest_item.get("version", 1)) + 1,
+            "updated_at": utc_now_iso(),
+        })
+        sync_pending_from_items(latest)
+        latest["updated_at"] = utc_now_iso()
+        save_pending(latest)
+        return public_pending(latest)
+
+
+def _confirmable_open_items(pending: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [item for item in pending.get("items", []) if item.get("status", "pending") == "pending"]
+
+
+def _already_confirmed_result(pending: Dict[str, Any]) -> Dict[str, Any]:
+    operation_ids = [
+        str(item.get("operation_id"))
+        for item in pending.get("items", [])
+        if item.get("operation_id")
+    ]
+    return {
+        "ok": True,
+        "operation_id": operation_ids[0] if len(operation_ids) == 1 else None,
+        "operation_ids": operation_ids,
+        "portfolio_updated": False,
+        "already_confirmed": True,
+        "pending": public_pending(pending),
+        "quote_refresh": {"ok": True, "refreshed": False},
+    }
+
+
+@router.post("/ai-confirm-item")
+async def ai_confirm_item(request: ItemRequest):
+    refresh_quotes = False
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = reconcile_pending_with_operations(load_pending(request.pending_id))
+        ensure_pending_items(pending)
+        if expire_pending_if_needed(pending):
+            raise HTTPException(status_code=409, detail="pending_action已过期")
+        item = get_pending_item(pending, request.item_id)
+        if item.get("status") == "rolled_back":
+            raise HTTPException(status_code=409, detail="该子项对应的写入已经撤回")
+        if item.get("status") == "confirmed":
+            return {
+                **_already_confirmed_result(pending),
+                "operation_id": item.get("operation_id"),
+                "item_id": item.get("item_id"),
+            }
+        if item.get("status", "pending") != "pending":
+            raise HTTPException(status_code=409, detail=f"该子项已结束：{item.get('status')}")
+        if item.get("missing_fields") or item.get("revision_options"):
+            missing = list(item.get("missing_fields", [])) or ["需要先完成选择"]
+            raise HTTPException(status_code=400, detail=f"该子项仍不能确认: {', '.join(missing)}")
+        validate_item_group(item)
+
+        service = PortfolioWriteService()
+        existing = service.find_confirm_operation_by_pending_item(request.pending_id, request.item_id)
+        if existing:
+            if existing.get("is_rolled_back"):
+                item["status"] = "rolled_back"
+                item["operation_id"] = existing.get("operation_id")
+                sync_pending_from_items(pending)
+                save_pending(pending)
+                raise HTTPException(status_code=409, detail="该子项对应的写入已经撤回")
+            item["status"] = "confirmed"
+            item["operation_id"] = existing.get("operation_id")
+            item["confirmed_at"] = item.get("confirmed_at") or utc_now_iso()
+            sync_pending_from_items(pending)
+            save_pending(pending)
+            return {
+                **_already_confirmed_result(pending),
+                "operation_id": existing.get("operation_id"),
+                "item_id": item.get("item_id"),
+            }
+
+        try:
+            result = service.safe_add_items_atomic(
+                [{
+                    "item_id": item["item_id"],
+                    "changes": item.get("changes", []),
+                    "summary": item.get("summary"),
+                }],
+                pending_id=request.pending_id,
+                summary=item.get("summary", "确认子项"),
+            )
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        operation = result["item_operations"][0]
+        item["status"] = "confirmed"
+        item["operation_id"] = operation["operation_id"]
+        item["confirmed_at"] = utc_now_iso()
+        sync_pending_from_items(pending)
+        pending["updated_at"] = utc_now_iso()
+        save_pending(pending)
+        refresh_quotes = any(
+            str(change.get("action_type") or "add_or_update") not in {"deposit", "withdraw", "set_cash"}
+            for change in item.get("changes", [])
+        )
+        response_pending = public_pending(pending)
+
+    refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=refresh_quotes)
+    return {
+        **result,
+        "operation_id": operation["operation_id"],
+        "item_id": item["item_id"],
+        "pending": response_pending,
+        "quote_refresh": refresh_result,
+    }
+
+
+@router.post("/ai-rollback-item")
+async def ai_rollback_item(request: ItemRequest):
+    with PORTFOLIO_MUTATION_LOCK:
+        pending = reconcile_pending_with_operations(load_pending(request.pending_id))
+        ensure_pending_items(pending)
+        item = get_pending_item(pending, request.item_id)
+        if item.get("status") == "rolled_back":
+            return {
+                "ok": True,
+                "already_rolled_back": True,
+                "item_id": request.item_id,
+                "pending": public_pending(pending),
+            }
+        if item.get("status") != "confirmed" or not item.get("operation_id"):
+            raise HTTPException(status_code=409, detail="只有已确认且尚未撤回的子项可以回滚")
+        operation_id = str(item["operation_id"])
+        try:
+            result = PortfolioWriteService().rollback_operation(operation_id)
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        latest = load_pending(request.pending_id)
+        ensure_pending_items(latest)
+        latest_item = get_pending_item(latest, request.item_id)
+        latest_item["status"] = "rolled_back"
+        latest_item["requires_confirmation"] = False
+        latest_item["rolled_back_at"] = utc_now_iso()
+        latest_item["rollback_operation_id"] = result.get("rollback_operation_id")
+        sync_pending_from_items(latest)
+        latest["updated_at"] = utc_now_iso()
+        save_pending(latest)
+        response_pending = public_pending(latest)
+
+    await reload_and_refresh_portfolio_provider(refresh_quotes=True)
+    return {
+        **result,
+        "item_id": request.item_id,
+        "pending": response_pending,
+    }
+
+
 @router.post("/ai-confirm")
 async def ai_confirm(request: ConfirmRequest):
     refresh_quotes = False
     with PORTFOLIO_MUTATION_LOCK:
-        pending = load_pending(request.pending_id)
+        pending = reconcile_pending_with_operations(load_pending(request.pending_id))
+        ensure_pending_items(pending)
+        if expire_pending_if_needed(pending) or pending.get("status") == "expired":
+            raise HTTPException(status_code=409, detail="pending_action已过期")
+        open_items = _confirmable_open_items(pending)
+        if not open_items:
+            return _already_confirmed_result(pending)
+
+        for item in open_items:
+            validate_item_group(item)
+        runtime_only_missing = {"available_cash", "available_quantity"}
+        invalid = []
+        for item in open_items:
+            hard_missing = [
+                field for field in item.get("missing_fields", [])
+                if field not in runtime_only_missing
+            ]
+            if hard_missing or item.get("revision_options"):
+                invalid.append((item, hard_missing))
+        if invalid:
+            descriptions = [
+                f"第{int(item.get('index', 0)) + 1}条："
+                + "、".join(hard_missing or ["需要先完成选择"])
+                for item, hard_missing in invalid
+            ]
+            raise HTTPException(status_code=400, detail="；".join(descriptions))
+
         service = PortfolioWriteService()
-
-        if pending.get("status") == "confirmed":
-            operation_id = str(pending.get("operation_id") or "").strip()
-            existing = service.find_confirm_operation_by_pending_id(request.pending_id)
-            if existing and existing.get("is_rolled_back"):
-                pending["status"] = "rolled_back"
-                pending["requires_confirmation"] = False
-                pending["operation_id"] = existing.get("operation_id")
-                save_pending(pending)
-                raise HTTPException(status_code=409, detail="该确认卡对应的写入已经撤回")
-            if not operation_id and existing:
-                operation_id = str(existing.get("operation_id") or "")
-                pending["operation_id"] = operation_id
-                save_pending(pending)
-            if operation_id:
-                return {
-                    "ok": True,
-                    "operation_id": operation_id,
-                    "imported_positions": (existing or {}).get("imported_positions", 0),
-                    "backup_path": (existing or {}).get("backup_path", ""),
-                    "portfolio_updated": False,
-                    "already_confirmed": True,
-                    "quote_refresh": {"ok": True, "refreshed": False},
-                }
-            raise HTTPException(status_code=409, detail="该确认卡已确认，但缺少operation记录")
-
-        require_open_pending(pending)
-        if pending.get("missing_fields"):
-            raise HTTPException(status_code=400, detail=f"仍有缺失字段: {', '.join(pending['missing_fields'])}")
-
-        existing = service.find_confirm_operation_by_pending_id(request.pending_id)
-        if existing and existing.get("is_rolled_back"):
-            pending["status"] = "rolled_back"
-            pending["requires_confirmation"] = False
-            pending["operation_id"] = existing.get("operation_id")
-            save_pending(pending)
-            raise HTTPException(status_code=409, detail="该确认卡对应的写入已经撤回")
-        if existing:
-            pending["status"] = "confirmed"
-            pending["requires_confirmation"] = False
-            pending["confirmed_at"] = pending.get("confirmed_at") or utc_now_iso()
-            pending["operation_id"] = existing["operation_id"]
-            save_pending(pending)
-            return {
-                "ok": True,
-                "operation_id": existing["operation_id"],
-                "imported_positions": existing.get("imported_positions", 0),
-                "backup_path": existing.get("backup_path", ""),
-                "portfolio_updated": False,
-                "already_confirmed": True,
-                "quote_refresh": {"ok": True, "refreshed": False},
-            }
-
-        pending_changes = pending.get("changes", [])
-        if str(pending.get("action_type") or "") == "fx_exchange":
-            if len(pending_changes) != 2:
-                raise HTTPException(status_code=400, detail="换汇必须包含且仅包含一笔换出和一笔换入")
-            source, target = pending_changes
-            source_action = str(source.get("action_type") or "")
-            target_action = str(target.get("action_type") or "")
-            if source_action != "withdraw" or target_action != "deposit":
-                raise HTTPException(status_code=400, detail="换汇顺序必须是先换出、后换入")
-            source_account = str(source.get("account") or "").strip()
-            target_account = str(target.get("account") or "").strip()
-            if source_account and target_account and source_account != target_account:
-                raise HTTPException(status_code=400, detail="同一笔换汇的换出和换入必须属于同一账户")
-            source_currency = str(source.get("currency") or "").upper().strip()
-            target_currency = str(target.get("currency") or "").upper().strip()
-            if source_currency and target_currency and source_currency == target_currency:
-                raise HTTPException(status_code=400, detail="换出币种和换入币种不能相同")
-
-        for change in pending_changes:
-            missing = service.validate_confirmable_change(change)
-            if missing:
-                raise HTTPException(status_code=400, detail=f"无法确认，字段无效: {', '.join(missing)}")
-
         try:
-            result = service.safe_add_positions(
-                pending.get("changes", []),
-                summary=pending.get("summary", "AI确认写入"),
-                pending_action=pending,
+            result = service.safe_add_items_atomic(
+                [
+                    {
+                        "item_id": item["item_id"],
+                        "changes": item.get("changes", []),
+                        "summary": item.get("summary"),
+                    }
+                    for item in open_items
+                ],
+                pending_id=request.pending_id,
+                summary=pending.get("summary", "AI确认全部子项"),
             )
         except (ValueError, FileNotFoundError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        pending["status"] = "confirmed"
-        pending["requires_confirmation"] = False
-        pending["confirmed_at"] = utc_now_iso()
-        pending["operation_id"] = result["operation_id"]
+        operations = {
+            item_operation["item_id"]: item_operation
+            for item_operation in result.get("item_operations", [])
+        }
+        for item in open_items:
+            operation = operations[item["item_id"]]
+            item["status"] = "confirmed"
+            item["operation_id"] = operation["operation_id"]
+            item["confirmed_at"] = utc_now_iso()
+        sync_pending_from_items(pending)
+        pending["batch_id"] = result.get("batch_id")
+        pending["updated_at"] = utc_now_iso()
         save_pending(pending)
         refresh_quotes = any(
-            str(change.get("action_type") or change.get("action") or "add_or_update")
-            not in {"deposit", "withdraw", "set_cash"}
-            for change in pending.get("changes", [])
+            str(change.get("action_type") or "add_or_update") not in {"deposit", "withdraw", "set_cash"}
+            for item in open_items
+            for change in item.get("changes", [])
         )
+        response_pending = public_pending(pending)
 
     refresh_result = await reload_and_refresh_portfolio_provider(refresh_quotes=refresh_quotes)
-    result["quote_refresh"] = refresh_result
-    return result
+    operation_ids = result.get("operation_ids", [])
+    return {
+        **result,
+        "operation_id": operation_ids[0] if len(operation_ids) == 1 else None,
+        "pending": response_pending,
+        "quote_refresh": refresh_result,
+    }
 
 
 @router.post("/ai-cancel")

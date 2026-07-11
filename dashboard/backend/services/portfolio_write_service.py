@@ -957,10 +957,39 @@ class PortfolioWriteService:
                     try:
                         with open(pending_path, "r", encoding="utf-8") as f:
                             pending = json.load(f)
-                        pending["status"] = "rolled_back"
-                        pending["requires_confirmation"] = False
-                        pending["rolled_back_at"] = utc_now_iso()
-                        pending["rollback_operation_id"] = rollback["operation_id"]
+                        item_id = str(operation.get("pending_action", {}).get("item_id") or "").strip()
+                        if item_id and isinstance(pending.get("items"), list):
+                            matched_item = None
+                            for item in pending["items"]:
+                                if str(item.get("item_id") or "") == item_id:
+                                    matched_item = item
+                                    break
+                            if matched_item is not None:
+                                matched_item["status"] = "rolled_back"
+                                matched_item["requires_confirmation"] = False
+                                matched_item["rolled_back_at"] = utc_now_iso()
+                                matched_item["rollback_operation_id"] = rollback["operation_id"]
+                                statuses = [str(item.get("status") or "pending") for item in pending["items"]]
+                                pending["pending_item_count"] = sum(value == "pending" for value in statuses)
+                                pending["confirmed_item_count"] = sum(value == "confirmed" for value in statuses)
+                                pending["rolled_back_item_count"] = sum(value == "rolled_back" for value in statuses)
+                                if statuses and all(value == "rolled_back" for value in statuses):
+                                    pending["status"] = "rolled_back"
+                                elif any(value == "pending" for value in statuses):
+                                    pending["status"] = "partially_confirmed"
+                                else:
+                                    pending["status"] = "partially_rolled_back"
+                                open_items = [item for item in pending["items"] if item.get("status") == "pending"]
+                                pending["can_confirm_all"] = bool(open_items) and all(
+                                    not item.get("missing_fields") and not item.get("revision_options")
+                                    for item in open_items
+                                )
+                                pending["requires_confirmation"] = pending["can_confirm_all"]
+                        else:
+                            pending["status"] = "rolled_back"
+                            pending["requires_confirmation"] = False
+                            pending["rolled_back_at"] = utc_now_iso()
+                            pending["rollback_operation_id"] = rollback["operation_id"]
                         tmp_path = pending_path.with_name(f".{pending_path.name}.{uuid4().hex}.tmp")
                         try:
                             with open(tmp_path, "w", encoding="utf-8") as f:

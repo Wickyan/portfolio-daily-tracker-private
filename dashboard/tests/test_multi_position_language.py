@@ -348,7 +348,8 @@ class MultiPositionWriteFlowTest(unittest.TestCase):
         self.assertEqual(identities[("IBKR", "AAPL", "USD")], 3)
         self.assertEqual(result["imported_positions"], 2)
 
-        self.service.rollback_operation(result["operation_id"])
+        for operation_id in reversed(result["operation_ids"]):
+            self.service.rollback_operation(operation_id)
         self.assertEqual(self.service.load_portfolio()["positions"], [])
 
     def test_one_invalid_child_prevents_any_write(self) -> None:
