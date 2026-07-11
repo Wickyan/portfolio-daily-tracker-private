@@ -126,6 +126,7 @@ export interface InstrumentCandidate {
   currency: string
   asset_type: string
   score?: number
+  match_score?: number
 }
 
 export interface PendingAction {

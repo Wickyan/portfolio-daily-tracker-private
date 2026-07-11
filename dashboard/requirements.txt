@@ -10,3 +10,5 @@ uvicorn>=0.23.0
 anthropic>=0.25.0
 openai>=1.12.0
 requests>=2.31.0
+
+pypinyin>=0.53.0

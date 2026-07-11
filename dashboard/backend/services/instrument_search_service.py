@@ -6,9 +6,11 @@ portfolio schema. It returns only user-facing instrument metadata.
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
 import httpx
+from pypinyin import lazy_pinyin
 
 
 class InstrumentSearchService:
@@ -36,6 +38,61 @@ class InstrumentSearchService:
         text = re.sub(r"etf(?:联接)?[ac]?$", "", text)
         text = re.sub(r"[ac]$", "", text)
         return text
+
+    @classmethod
+    def _fuzzy_text(cls, value: str) -> str:
+        text = cls._normalize_text(value)
+        # Normalize common market abbreviations, not user-specific typo pairs.
+        semantic_aliases = {
+            "纳斯达克": "纳指",
+            "标准普尔": "标普",
+            "恒生科技": "恒科",
+        }
+        for full, short in semantic_aliases.items():
+            text = text.replace(full, short)
+        text = re.sub(r"(?:etf|lof|qdii|指数|基金|股票|联接)", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\d+", "", text)
+        return text
+
+    @staticmethod
+    def _phonetic_text(value: str) -> str:
+        return "".join(lazy_pinyin(str(value or ""))).lower()
+
+    @classmethod
+    def fuzzy_similarity(cls, keyword: str, candidate_name: str) -> float:
+        query = cls._fuzzy_text(keyword)
+        candidate = cls._fuzzy_text(candidate_name)
+        if not query or not candidate:
+            return 0.0
+        if query == candidate:
+            return 1.0
+        ratio = SequenceMatcher(None, query, candidate).ratio()
+        if query in candidate or candidate in query:
+            ratio = max(ratio, min(len(query), len(candidate)) / max(len(query), len(candidate)))
+
+        # Generic homophone tolerance handles input-method typos such as
+        # “达成/大成” or “纳之/纳指” without maintaining typo-pair rules.
+        query_pinyin = cls._phonetic_text(query)
+        candidate_pinyin = cls._phonetic_text(candidate)
+        if query_pinyin and candidate_pinyin:
+            ratio = max(ratio, SequenceMatcher(None, query_pinyin, candidate_pinyin).ratio())
+        return round(ratio, 6)
+
+    @classmethod
+    def rank_candidates(cls, keyword: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ranked: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            item = dict(candidate)
+            item["match_score"] = cls.fuzzy_similarity(keyword, str(item.get("name") or ""))
+            ranked.append(item)
+        ranked.sort(
+            key=lambda row: (
+                -float(row.get("match_score") or 0.0),
+                -int(row.get("score") or 0),
+                str(row.get("code") or ""),
+            )
+        )
+        return ranked
 
     @staticmethod
     def _metadata(item: Dict[str, Any]) -> tuple[str, str]:
@@ -150,6 +207,12 @@ class InstrumentSearchService:
         if not candidates:
             return None
         first = candidates[0]
+        if "match_score" in first:
+            first_match = float(first.get("match_score") or 0.0)
+            second_match = float(candidates[1].get("match_score") or 0.0) if len(candidates) > 1 else 0.0
+            if first_match >= 0.72 and (len(candidates) == 1 or first_match - second_match >= 0.12):
+                return first
+            return None
         second_score = int(candidates[1]["score"]) if len(candidates) > 1 else -1
         first_score = int(first["score"])
         if first_score >= 180 and first_score - second_score >= 25:

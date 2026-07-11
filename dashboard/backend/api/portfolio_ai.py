@@ -7,6 +7,7 @@ PortfolioWriteService with backup and operation logs.
 from __future__ import annotations
 
 from copy import deepcopy
+import asyncio
 from datetime import datetime, timedelta
 import json
 import math
@@ -1392,17 +1393,24 @@ def instrument_search_keywords(keyword: str) -> List[str]:
     raw = str(keyword or "").strip()
     if not raw:
         return []
-    normalized = raw.replace("纳之", "纳指")
-    if "纳指" in normalized:
-        normalized = normalized.replace("达成", "大成")
 
-    keywords: List[str] = []
-    # “纳指大成/纳指达成” refers to the exchange-traded ETF, not its
-    # off-exchange A/C feeder funds. Put the listed-security query first.
-    if "大成" in normalized and ("纳指" in normalized or "纳斯达克" in normalized):
-        keywords.extend(["纳斯达克100ETF 大成", "159513"])
-    keywords.extend([normalized, raw])
-    return list(dict.fromkeys(keyword for keyword in keywords if keyword))
+    keywords: List[str] = [raw]
+    abbreviation_expansions = {
+        "纳指": "纳斯达克",
+        "标普": "标准普尔",
+        "恒科": "恒生科技",
+    }
+    for short, full in abbreviation_expansions.items():
+        if short in raw:
+            keywords.extend([raw.replace(short, full), full])
+
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", raw))
+    if len(chinese) >= 4:
+        # Generic fallback: search the trailing issuer/name fragment across
+        # exchange-traded products, then rank all results fuzzily.
+        keywords.append(f"ETF{chinese[-2:]}")
+        keywords.append(chinese[-2:])
+    return list(dict.fromkeys(item for item in keywords if item))[:6]
 
 
 async def enrich_with_online_instrument_search(
@@ -1422,24 +1430,30 @@ async def enrich_with_online_instrument_search(
     if not keyword:
         return parsed
 
-    candidates: List[Dict[str, Any]] = []
-    search_error: Optional[Exception] = None
-    for search_keyword in instrument_search_keywords(keyword):
-        try:
-            candidates = await InstrumentSearchService().search(search_keyword, limit=8)
-        except Exception as exc:
-            search_error = exc
+    search_keywords = instrument_search_keywords(keyword)
+    service = InstrumentSearchService()
+    results = await asyncio.gather(
+        *(service.search(search_keyword, limit=20) for search_keyword in search_keywords),
+        return_exceptions=True,
+    )
+    search_errors = [result for result in results if isinstance(result, Exception)]
+    pooled: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for result in results:
+        if isinstance(result, Exception):
             continue
-        candidates = [
-            candidate for candidate in candidates
-            if str(candidate.get("classify") or "") != "OTCFUND"
-        ]
-        if candidates:
-            break
+        for candidate in result:
+            if str(candidate.get("classify") or "") == "OTCFUND":
+                continue
+            key = (str(candidate.get("code") or ""), str(candidate.get("currency") or ""))
+            existing = pooled.get(key)
+            if existing is None or int(candidate.get("score") or 0) > int(existing.get("score") or 0):
+                pooled[key] = candidate
+
+    candidates = InstrumentSearchService.rank_candidates(keyword, list(pooled.values()))
     if not candidates:
-        if search_error is not None:
+        if search_errors:
             warnings = list(parsed.get("warnings", []))
-            warnings.append(f"标的在线搜索暂时失败：{search_error}")
+            warnings.append(f"标的在线搜索暂时失败：{search_errors[0]}")
             parsed["warnings"] = list(dict.fromkeys(warnings))
         return parsed
 
@@ -1459,16 +1473,23 @@ async def enrich_with_online_instrument_search(
         change = PortfolioWriteService().normalize_position(change)
         parsed["changes"] = [change]
         parsed["missing_fields"] = build_missing(change, str(parsed.get("action_type") or "add_or_update"))
-        warnings.append(
-            f"已联网匹配：{chosen['code']} {chosen['name']}；请在确认写入前核对"
-        )
+        query_match = InstrumentSearchService._fuzzy_text(keyword)
+        chosen_match = InstrumentSearchService._fuzzy_text(str(chosen.get("name") or ""))
+        if query_match != chosen_match:
+            warnings.append(
+                f"输入“{keyword}”可能包含简称或错别字，系统推测为“{chosen['name']}”（{chosen['code']}）；请在确认写入前核对"
+            )
+        else:
+            warnings.append(
+                f"已联网匹配：{chosen['code']} {chosen['name']}；请在确认写入前核对"
+            )
         parsed["warnings"] = list(dict.fromkeys(warnings))
         parsed["instrument_candidates"] = candidates[:5]
         return enrich_instrument_currency_consistency(parsed)
 
     parsed["instrument_candidates"] = candidates[:5]
     preview = "、".join(f"{item['code']} {item['name']}" for item in candidates[:5])
-    warnings.append(f"联网找到多个候选：{preview}。请补充具体代码")
+    warnings.append(f"未能唯一确定标的，找到以下场内候选：{preview}。请选择正确代码")
     parsed["warnings"] = list(dict.fromkeys(warnings))
     return parsed
 

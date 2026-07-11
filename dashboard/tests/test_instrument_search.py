@@ -56,56 +56,109 @@ class InstrumentSearchTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(InstrumentSearchService.choose_confident(candidates))
 
 
-    def test_nasdaq_dacheng_alias_prefers_listed_etf_query(self) -> None:
+    def test_generic_search_keywords_do_not_hardcode_typo_pairs(self) -> None:
         keywords = instrument_search_keywords("纳指达成")
-        self.assertEqual(keywords[0], "纳斯达克100ETF 大成")
-        self.assertIn("159513", keywords)
-        self.assertIn("纳指大成", keywords)
+        self.assertIn("纳斯达克达成", keywords)
+        self.assertIn("纳斯达克", keywords)
+        self.assertNotIn("纳指大成", keywords)
+        self.assertNotIn("159513", keywords)
 
-    async def test_otc_feeder_funds_are_not_offered_as_candidates(self) -> None:
+        keywords = instrument_search_keywords("纳之大成")
+        self.assertIn("ETF大成", keywords)
+        self.assertNotIn("纳指大成", keywords)
+
+    def test_phonetic_similarity_handles_generic_homophone_typos(self) -> None:
+        self.assertEqual(
+            InstrumentSearchService.fuzzy_similarity("纳指达成", "纳斯达克100ETF大成"),
+            1.0,
+        )
+        self.assertEqual(
+            InstrumentSearchService.fuzzy_similarity("纳之大成", "纳斯达克100ETF大成"),
+            1.0,
+        )
+
+    def test_fuzzy_ranking_can_infer_single_likely_typo(self) -> None:
+        candidates = [
+            {"code": "159513", "name": "纳斯达克100ETF大成", "score": 80},
+            {"code": "159501", "name": "纳指ETF嘉实", "score": 80},
+            {"code": "159660", "name": "纳指ETF汇添富", "score": 80},
+        ]
+        ranked = InstrumentSearchService.rank_candidates("纳指达成", candidates)
+        self.assertEqual(ranked[0]["code"], "159513")
+        self.assertGreaterEqual(ranked[0]["match_score"], 0.72)
+        self.assertEqual(InstrumentSearchService.choose_confident(ranked)["code"], "159513")
+
+    async def test_typo_is_inferred_with_warning_without_hardcoded_rewrite(self) -> None:
         parsed = parse_bookkeeping_message("银河 纳指达成 1.243元 12700个")
         listed = {
             "code": "159513",
             "name": "纳斯达克100ETF大成",
             "currency": "CNY",
             "asset_type": "stock",
-            "score": 210,
+            "score": 80,
             "classify": "Fund",
             "source": "test",
         }
-        otc_a = {
-            "code": "000834",
-            "name": "大成纳斯达克100ETF联接(QDII)A",
-            "currency": "CNY",
-            "asset_type": "stock",
-            "score": 220,
-            "classify": "OTCFUND",
-            "source": "test",
-        }
-        otc_c = {
-            "code": "008971",
-            "name": "大成纳斯达克100ETF联接(QDII)C",
-            "currency": "CNY",
-            "asset_type": "stock",
-            "score": 220,
-            "classify": "OTCFUND",
-            "source": "test",
-        }
-        with patch.object(
-            InstrumentSearchService,
-            "search",
-            new=AsyncMock(return_value=[otc_a, otc_c, listed]),
-        ):
+        alternatives = [
+            {
+                "code": "159501",
+                "name": "纳指ETF嘉实",
+                "currency": "CNY",
+                "asset_type": "stock",
+                "score": 80,
+                "classify": "Fund",
+                "source": "test",
+            }
+        ]
+
+        async def fake_search(_self, keyword: str, limit: int = 20):
+            if "纳斯达克" in keyword:
+                return [listed, *alternatives]
+            return []
+
+        with patch.object(InstrumentSearchService, "search", new=fake_search):
             enriched = await enrich_with_online_instrument_search(
                 parsed,
                 "银河 纳指达成 1.243元 12700个",
             )
 
         self.assertEqual(enriched["changes"][0]["code"], "159513")
-        self.assertEqual(enriched["changes"][0]["name"], "纳斯达克100ETF大成")
-        self.assertEqual(enriched["instrument_candidates"], [listed])
+        self.assertTrue(any("可能包含简称或错别字" in warning for warning in enriched["warnings"]))
+
+    async def test_ambiguous_fuzzy_search_returns_choices_instead_of_guessing(self) -> None:
+        parsed = parse_bookkeeping_message("银河 纳指基金 1.243元 12700个")
+        choices = [
+            {
+                "code": "159501", "name": "纳指ETF嘉实", "currency": "CNY",
+                "asset_type": "stock", "score": 80, "classify": "Fund", "source": "test",
+            },
+            {
+                "code": "159660", "name": "纳指ETF汇添富", "currency": "CNY",
+                "asset_type": "stock", "score": 80, "classify": "Fund", "source": "test",
+            },
+        ]
+        with patch.object(InstrumentSearchService, "search", new=AsyncMock(return_value=choices)):
+            enriched = await enrich_with_online_instrument_search(parsed, "银河 纳指基金 1.243元 12700个")
+
+        self.assertFalse(enriched["changes"][0].get("code"))
+        self.assertEqual(len(enriched["instrument_candidates"]), 2)
+        self.assertTrue(any("未能唯一确定标的" in warning for warning in enriched["warnings"]))
+
+    async def test_otc_feeder_funds_are_not_offered_as_candidates(self) -> None:
+        parsed = parse_bookkeeping_message("银河 纳指达成 1.243元 12700个")
+        listed = {
+            "code": "159513", "name": "纳斯达克100ETF大成", "currency": "CNY",
+            "asset_type": "stock", "score": 80, "classify": "Fund", "source": "test",
+        }
+        otc = {
+            "code": "000834", "name": "大成纳斯达克100ETF联接(QDII)A", "currency": "CNY",
+            "asset_type": "stock", "score": 220, "classify": "OTCFUND", "source": "test",
+        }
+        with patch.object(InstrumentSearchService, "search", new=AsyncMock(return_value=[otc, listed])):
+            enriched = await enrich_with_online_instrument_search(parsed, "银河 纳指达成 1.243元 12700个")
+
+        self.assertEqual(enriched["changes"][0]["code"], "159513")
         self.assertNotIn("000834", str(enriched))
-        self.assertNotIn("008971", str(enriched))
 
 
 
