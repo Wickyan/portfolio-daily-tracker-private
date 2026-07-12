@@ -934,6 +934,68 @@ class PortfolioWriteService:
         ]
         return result
 
+    def _can_apply_delta_inverse_without_absolute_conflict(
+        self,
+        operation: Dict[str, Any],
+    ) -> bool:
+        """Return whether inverse deltas are safe for this rollback.
+
+        Incremental buys/sells/deposits/withdrawals compose additively. They can
+        therefore be removed from the current ledger without replaying old
+        history, unless a later active absolute set_position/set_cash touches
+        the same identity. This avoids resurrecting stale historical writes
+        while preserving the existing replay semantics for absolute updates.
+        """
+        incremental_actions = {"add_or_update", "sell", "deposit", "withdraw"}
+        target_changes = self._semantic_changes(operation)
+        if not target_changes:
+            return False
+        if any(
+            str(change.get("action_type") or change.get("action") or "add_or_update")
+            not in incremental_actions
+            for change in target_changes
+        ):
+            return False
+
+        target_id = str(operation.get("operation_id") or "")
+        position_ids, cash_ids = self._affected_identities(operation)
+        operations_desc = self._load_all_operations()
+        rolled_back_ids = self._rolled_back_operation_ids(operations_desc)
+        target_index = next(
+            (
+                index for index, candidate in enumerate(operations_desc)
+                if str(candidate.get("operation_id") or "") == target_id
+            ),
+            None,
+        )
+        if target_index is None:
+            return False
+
+        for later in operations_desc[:target_index]:
+            later_id = str(later.get("operation_id") or "")
+            if later.get("type") == "rollback" or later_id in rolled_back_ids:
+                continue
+            if not self._operation_touches_identities(later, position_ids, cash_ids):
+                continue
+            later_changes = self._semantic_changes(later)
+            if not later_changes:
+                return False
+            for change in later_changes:
+                kind, identity = self._change_identity(change)
+                relevant = (
+                    kind == "cash" and tuple(identity) in cash_ids
+                ) or (
+                    kind == "position" and tuple(identity) in position_ids
+                )
+                if not relevant:
+                    continue
+                action_type = str(
+                    change.get("action_type") or change.get("action") or "add_or_update"
+                )
+                if action_type in {"set_position", "set_cash"}:
+                    return False
+        return True
+
     def _replay_without_operation(
         self,
         current: Dict[str, Any],
@@ -1183,9 +1245,12 @@ class PortfolioWriteService:
             if not before_snapshot:
                 raise ValueError("operation does not have before_snapshot")
             current = self.load_portfolio()
-            restored = self._replay_without_operation(current, operation)
-            if restored is None:
+            if self._can_apply_delta_inverse_without_absolute_conflict(operation):
                 restored = self._apply_selective_inverse(current, operation)
+            else:
+                restored = self._replay_without_operation(current, operation)
+                if restored is None:
+                    restored = self._apply_selective_inverse(current, operation)
             rollback, backup_path = self._commit_portfolio_change(
                 before=current,
                 after=restored,

@@ -81,6 +81,40 @@ class AtomicItemOperationTest(unittest.TestCase):
         self.service.rollback_operation(op_by_item["item-b"])
         self.assertEqual(self.service.load_portfolio()["positions"], [])
 
+    def test_reverse_rollback_does_not_resurrect_stale_historical_writes(self) -> None:
+        # Simulate durable old operation logs whose effects are no longer in the
+        # current ledger (for example after a verified repair/reset).
+        stale = self.service.safe_add_items_atomic(
+            [
+                {"item_id": "stale-a", "changes": [self.buy("银河", "002594", "比亚迪", "CNY", 30, 90)]},
+                {"item_id": "stale-b", "changes": [self.buy("银河", "159513", "纳指", "CNY", 40, 1.1)]},
+                {"item_id": "stale-c", "changes": [self.buy("银河", "501312", "海外科技", "CNY", 50, 2.0)]},
+            ],
+            pending_id="stale-history",
+            summary="stale history",
+        )
+        self.assertEqual(len(stale["item_operations"]), 3)
+        self.service.save_portfolio_atomic({
+            "positions": [],
+            "cash": 0.0,
+            "cash_accounts": [],
+        })
+
+        fresh = self.service.safe_add_items_atomic(
+            [
+                {"item_id": "fresh-a", "changes": [self.buy("银河", "002594", "比亚迪", "CNY", 10, 100)]},
+                {"item_id": "fresh-b", "changes": [self.buy("银河", "159513", "纳指", "CNY", 20, 1.2)]},
+                {"item_id": "fresh-c", "changes": [self.buy("银河", "501312", "海外科技", "CNY", 30, 2.3)]},
+            ],
+            pending_id="fresh-batch",
+            summary="fresh batch",
+        )
+        operation_ids = [item["operation_id"] for item in fresh["item_operations"]]
+        for operation_id in reversed(operation_ids):
+            self.service.rollback_operation(operation_id)
+
+        self.assertEqual(self.service.load_portfolio()["positions"], [])
+
     def test_invalid_child_writes_nothing_and_creates_no_operations(self) -> None:
         with self.assertRaises(ValueError):
             self.service.safe_add_items_atomic(
