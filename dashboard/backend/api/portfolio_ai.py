@@ -693,6 +693,11 @@ def _public_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "requires_confirmation": item.get("requires_confirmation", False),
         "operation_id": item.get("operation_id"),
         "version": item.get("version", 1),
+        "confirmed_at": item.get("confirmed_at"),
+        "rolled_back_at": item.get("rolled_back_at"),
+        "reopened_at": item.get("reopened_at"),
+        "reopened_from_item_id": item.get("reopened_from_item_id"),
+        "reopened_from_operation_id": item.get("reopened_from_operation_id"),
     }
 
 

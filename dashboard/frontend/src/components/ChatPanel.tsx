@@ -212,6 +212,144 @@ const MISSING_LABELS: Record<string, string> = {
   'target_amount/currency': '换入金额和币种',
 }
 
+type LifecycleStepState = 'done' | 'current' | 'next'
+
+type LifecycleStep = {
+  label: string
+  state: LifecycleStepState
+}
+
+function buildItemLifecycle(item: PendingItem): { current: string; steps: LifecycleStep[] } {
+  const status = item.status || 'pending'
+  const reopened = Boolean(item.reopened_from_item_id || item.reopened_from_operation_id)
+
+  if (reopened) {
+    if (status === 'confirmed') {
+      return {
+        current: '已重新写入Portfolio',
+        steps: [
+          { label: '原记录已写入', state: 'done' },
+          { label: '已撤回', state: 'done' },
+          { label: '修改完成', state: 'done' },
+          { label: '重新写入', state: 'current' },
+        ],
+      }
+    }
+    if (status === 'rolled_back') {
+      return {
+        current: '重新写入后再次撤回',
+        steps: [
+          { label: '原记录已写入', state: 'done' },
+          { label: '第一次撤回', state: 'done' },
+          { label: '修改后重写', state: 'done' },
+          { label: '再次撤回', state: 'current' },
+        ],
+      }
+    }
+    if (status === 'expired' || status === 'cancelled') {
+      return {
+        current: status === 'expired' ? '修改后的记录已过期' : '修改后的记录已取消',
+        steps: [
+          { label: '原记录已写入', state: 'done' },
+          { label: '已撤回', state: 'done' },
+          { label: '修改完成', state: 'done' },
+          { label: status === 'expired' ? '已过期' : '已取消', state: 'current' },
+        ],
+      }
+    }
+    return {
+      current: item.requires_confirmation ? '等待重新确认' : '修改后仍需补充信息',
+      steps: [
+        { label: '原记录已写入', state: 'done' },
+        { label: '已撤回', state: 'done' },
+        { label: '修改完成', state: 'done' },
+        { label: item.requires_confirmation ? '等待重新确认' : '补充信息', state: 'current' },
+      ],
+    }
+  }
+
+  if (status === 'confirmed') {
+    return {
+      current: '已写入Portfolio',
+      steps: [
+        { label: '识别完成', state: 'done' },
+        { label: '信息确认', state: 'done' },
+        { label: '写入Portfolio', state: 'current' },
+      ],
+    }
+  }
+  if (status === 'rolled_back') {
+    return {
+      current: '已撤回，可修改后重新记账',
+      steps: [
+        { label: '识别完成', state: 'done' },
+        { label: '曾写入Portfolio', state: 'done' },
+        { label: '已撤回', state: 'current' },
+        { label: '修改后重记', state: 'next' },
+      ],
+    }
+  }
+  if (status === 'expired' || status === 'cancelled' || status === 'superseded') {
+    const label = status === 'expired' ? '已过期' : status === 'cancelled' ? '已取消' : '已被替代'
+    return {
+      current: label,
+      steps: [
+        { label: '识别完成', state: 'done' },
+        { label, state: 'current' },
+      ],
+    }
+  }
+
+  const ready = item.requires_confirmation
+  return {
+    current: ready ? '等待确认写入' : '需要补充或核对信息',
+    steps: [
+      { label: '识别完成', state: 'done' },
+      { label: ready ? '信息完整' : '补充信息', state: ready ? 'done' : 'current' },
+      { label: '等待确认', state: ready ? 'current' : 'next' },
+      { label: '写入Portfolio', state: 'next' },
+    ],
+  }
+}
+
+function ItemLifecycle({ item }: { item: PendingItem }) {
+  const lifecycle = buildItemLifecycle(item)
+  return (
+    <div className="rounded-lg border border-white/10 bg-slate-950/35 px-3 py-3">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-medium text-slate-400">处理进度</span>
+        <span className="text-sm font-semibold text-sky-200">当前：{lifecycle.current}</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {lifecycle.steps.map((step, index) => (
+          <div key={`${step.label}-${index}`} className="flex items-center gap-1.5">
+            <div className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
+              step.state === 'current'
+                ? 'border-sky-400/60 bg-sky-500/15 font-semibold text-sky-100'
+                : step.state === 'done'
+                  ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
+                  : 'border-slate-700 bg-slate-900/50 text-slate-500'
+            }`}>
+              <span className={`flex h-4 w-4 items-center justify-center rounded-full text-[10px] ${
+                step.state === 'current'
+                  ? 'bg-sky-400 text-slate-950'
+                  : step.state === 'done'
+                    ? 'bg-emerald-500/25 text-emerald-200'
+                    : 'bg-slate-800 text-slate-500'
+              }`}>
+                {step.state === 'done' ? <Check className="h-3 w-3" /> : index + 1}
+              </span>
+              {step.label}
+            </div>
+            {index < lifecycle.steps.length - 1 && <span className="text-xs text-slate-600">→</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+
 function PendingItemCard({
   item,
   totalItems,
@@ -297,6 +435,8 @@ function PendingItemCard({
           </button>
         </div>
       </div>
+
+      <ItemLifecycle item={item} />
 
       <div className="space-y-2">
         {changes.map((change, changeIndex) => {

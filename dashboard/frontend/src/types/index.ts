@@ -168,6 +168,11 @@ export interface PendingItem {
   requires_confirmation: boolean
   operation_id?: string | null
   version?: number
+  confirmed_at?: string | null
+  rolled_back_at?: string | null
+  reopened_at?: string | null
+  reopened_from_item_id?: string | null
+  reopened_from_operation_id?: string | null
 }
 
 export interface PendingAction {

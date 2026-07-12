@@ -151,6 +151,9 @@ class BatchItemWorkflowTest(unittest.TestCase):
         self.assertEqual(reopened_item["changes"][0]["quantity"], 12)
         self.assertTrue(reopened_item["requires_confirmation"])
         self.assertTrue(any("作为一次新写入" in warning for warning in reopened_item["warnings"]))
+        self.assertEqual(reopened_item["reopened_from_item_id"], original_item["item_id"])
+        self.assertEqual(reopened_item["reopened_from_operation_id"], original_operation_id)
+        self.assertTrue(reopened_item["reopened_at"])
         self.assertNotIn(("银河", "002594", "CNY"), self.position_map())
 
         reconfirmed = asyncio.run(ai_confirm_item(ItemRequest(
