@@ -268,6 +268,7 @@ function PendingItemCard({
     cancelled: '已取消',
     superseded: '已替代',
   }
+  const canEdit = status === 'pending' || status === 'rolled_back'
 
   return (
     <div className={`space-y-3 rounded-xl border p-3.5 shadow-sm ${theme.card}`}>
@@ -368,7 +369,7 @@ function PendingItemCard({
         </div>
       )}
 
-      {item.revision_options && item.revision_options.length > 0 && status === 'pending' && (
+      {item.revision_options && item.revision_options.length > 0 && canEdit && (
         <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-950/25 p-3">
           <div className="text-sm font-medium text-amber-200">请选择这个值要修改的字段：</div>
           <div className="flex flex-wrap gap-2">
@@ -386,7 +387,7 @@ function PendingItemCard({
         </div>
       )}
 
-      {item.instrument_candidates && item.instrument_candidates.length > 0 && status === 'pending' && !changes[0]?.code && (
+      {item.instrument_candidates && item.instrument_candidates.length > 0 && canEdit && !changes[0]?.code && (
         <div className="space-y-2">
           <div className="text-sm text-slate-300">搜索候选：</div>
           <div className="flex flex-wrap gap-2">
@@ -406,8 +407,13 @@ function PendingItemCard({
 
       {workError && <div className="text-sm text-red-300">操作失败：{workError}</div>}
 
-      {status === 'pending' && (
+      {canEdit && (
         <div className="space-y-2">
+          {status === 'rolled_back' && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-950/25 px-3 py-2 text-sm text-amber-200">
+              这一条已撤回，可以修改后重新生成待确认记录；再次确认会作为一笔新写入。
+            </div>
+          )}
           {isEditing && (
             <div className="space-y-2 rounded-lg border border-white/10 bg-slate-950/35 p-3">
               <div className="text-xs text-slate-400">只修改这一条，不会影响其他子项。</div>
@@ -446,15 +452,17 @@ function PendingItemCard({
               disabled={isWorking}
               className="rounded border border-white/15 bg-slate-900/45 px-3 py-1.5 text-sm hover:bg-slate-800 disabled:opacity-50"
             >
-              {isEditing ? '关闭修改' : '修改这一条'}
+              {isEditing ? '关闭修改' : (status === 'rolled_back' ? '修改后重新记账' : '修改这一条')}
             </button>
-            <button
-              onClick={() => run(onConfirm)}
-              disabled={isWorking || !item.requires_confirmation}
-              className={`rounded px-3 py-1.5 text-sm text-white disabled:cursor-not-allowed disabled:opacity-40 ${theme.button}`}
-            >
-              {isWorking ? '处理中…' : `确认${ACTION_LABELS[item.action_type || ''] || '这一条'}`}
-            </button>
+            {status === 'pending' && (
+              <button
+                onClick={() => run(onConfirm)}
+                disabled={isWorking || !item.requires_confirmation}
+                className={`rounded px-3 py-1.5 text-sm text-white disabled:cursor-not-allowed disabled:opacity-40 ${theme.button}`}
+              >
+                {isWorking ? '处理中…' : `确认${ACTION_LABELS[item.action_type || ''] || '这一条'}`}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -474,7 +482,6 @@ function PendingItemCard({
           </button>
         </div>
       )}
-      {status === 'rolled_back' && <div className="text-sm text-amber-300">这一条写入已经撤回，其他子项不受影响。</div>}
       {status === 'expired' && <div className="text-sm text-amber-300">这一条已经过期，请复制后重新提交。</div>}
       {status === 'cancelled' && <div className="text-sm text-slate-400">这一条已经取消。</div>}
     </div>

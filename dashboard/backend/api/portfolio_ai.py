@@ -3654,8 +3654,10 @@ async def ai_revise_item(request: ItemReviseRequest):
         if expire_pending_if_needed(pending):
             raise HTTPException(status_code=409, detail="pending_action已过期")
         item = get_pending_item(pending, request.item_id)
-        if item.get("status", "pending") != "pending":
-            raise HTTPException(status_code=409, detail=f"该子项已结束：{item.get('status')}")
+        item_status = str(item.get("status") or "pending")
+        if item_status not in {"pending", "rolled_back"}:
+            raise HTTPException(status_code=409, detail=f"该子项已结束：{item_status}")
+        reopening_rolled_back = item_status == "rolled_back"
         token = pending.get("updated_at") or pending.get("created_at")
         current_snapshot = _item_snapshot(item)
         history = deepcopy(item.get("revision_history", []))
@@ -3715,8 +3717,10 @@ async def ai_revise_item(request: ItemReviseRequest):
         if latest_token != token:
             raise HTTPException(status_code=409, detail="该确认卡已被其他操作更新，请刷新后重试")
         latest_item = get_pending_item(latest, request.item_id)
-        if latest_item.get("status", "pending") != "pending":
-            raise HTTPException(status_code=409, detail=f"该子项已结束：{latest_item.get('status')}")
+        latest_status = str(latest_item.get("status") or "pending")
+        allowed_statuses = {"pending", "rolled_back"} if reopening_rolled_back else {"pending"}
+        if latest_status not in allowed_statuses:
+            raise HTTPException(status_code=409, detail=f"该子项已结束：{latest_status}")
 
         if restored_snapshot is not None:
             next_history = history[:-1]
@@ -3732,11 +3736,19 @@ async def ai_revise_item(request: ItemReviseRequest):
             parsed.get("warnings", []),
             parsed.get("instrument_candidates", []),
         )
+        next_warnings = list(dict.fromkeys(evaluated.get("warnings", parsed.get("warnings", []))))
+        if reopening_rolled_back:
+            next_warnings = list(dict.fromkeys(next_warnings + [
+                "这条原写入已撤回；本次修改已生成新的待确认记录，确认后会作为一次新写入"
+            ]))
+
+        previous_item_id = str(latest_item.get("item_id") or "")
+        previous_operation_id = str(latest_item.get("operation_id") or "")
         latest_item.update({
             "action_type": action_type,
             "changes": evaluated.get("changes", parsed.get("changes", [])),
             "missing_fields": evaluated.get("missing_fields", parsed.get("missing_fields", [])),
-            "warnings": list(dict.fromkeys(evaluated.get("warnings", parsed.get("warnings", [])))),
+            "warnings": next_warnings,
             "instrument_candidates": parsed.get("instrument_candidates", []),
             "revision_options": parsed.get("revision_options", []),
             "revision_diffs": revision_diffs,
@@ -3745,6 +3757,21 @@ async def ai_revise_item(request: ItemReviseRequest):
             "version": int(latest_item.get("version", 1)) + 1,
             "updated_at": utc_now_iso(),
         })
+        if reopening_rolled_back:
+            # A confirmed operation is uniquely identified by pending_id + item_id.
+            # Reopening therefore receives a fresh item_id so the durable rolled-back
+            # operation remains immutable and a later confirmation creates a new log.
+            latest_item["item_id"] = str(uuid4())
+            latest_item["status"] = "pending"
+            latest_item["requires_confirmation"] = False
+            latest_item["operation_id"] = None
+            latest_item["reopened_from_item_id"] = previous_item_id
+            latest_item["reopened_from_operation_id"] = previous_operation_id or None
+            latest_item["reopened_at"] = utc_now_iso()
+            for stale_key in (
+                "confirmed_at", "rolled_back_at", "rollback_operation_id", "reconciled_at"
+            ):
+                latest_item.pop(stale_key, None)
         sync_pending_from_items(latest)
         latest["updated_at"] = utc_now_iso()
         save_pending(latest)

@@ -125,6 +125,52 @@ class BatchItemWorkflowTest(unittest.TestCase):
         self.assertTrue(rolled_again["already_rolled_back"])
         self.assertEqual(rolled_again["pending"]["items"][1]["item_id"], second["item_id"])
 
+    def test_rolled_back_item_can_be_modified_and_confirmed_as_new_write(self) -> None:
+        card = self.preview("银河买入10股比亚迪，均价100元")
+        original_item = card["items"][0]
+        confirmed = asyncio.run(ai_confirm_item(ItemRequest(
+            pending_id=card["pending_id"], item_id=original_item["item_id"],
+        )))
+        original_operation_id = confirmed["operation_id"]
+
+        rolled = asyncio.run(ai_rollback_item(ItemRequest(
+            pending_id=card["pending_id"], item_id=original_item["item_id"],
+        )))
+        self.assertEqual(rolled["pending"]["items"][0]["status"], "rolled_back")
+        self.assertNotIn(("银河", "002594", "CNY"), self.position_map())
+
+        revised = asyncio.run(ai_revise_item(ItemReviseRequest(
+            pending_id=card["pending_id"],
+            item_id=original_item["item_id"],
+            message="数量改成12",
+        )))
+        reopened_item = revised["items"][0]
+        self.assertEqual(reopened_item["status"], "pending")
+        self.assertNotEqual(reopened_item["item_id"], original_item["item_id"])
+        self.assertIsNone(reopened_item["operation_id"])
+        self.assertEqual(reopened_item["changes"][0]["quantity"], 12)
+        self.assertTrue(reopened_item["requires_confirmation"])
+        self.assertTrue(any("作为一次新写入" in warning for warning in reopened_item["warnings"]))
+        self.assertNotIn(("银河", "002594", "CNY"), self.position_map())
+
+        reconfirmed = asyncio.run(ai_confirm_item(ItemRequest(
+            pending_id=card["pending_id"], item_id=reopened_item["item_id"],
+        )))
+        self.assertNotEqual(reconfirmed["operation_id"], original_operation_id)
+        self.assertEqual(reconfirmed["pending"]["items"][0]["status"], "confirmed")
+        self.assertEqual(self.position_map()[("银河", "002594", "CNY")]["quantity"], 12)
+
+        operations = self.service.find_confirm_operations_by_pending_id(card["pending_id"])
+        self.assertEqual(len(operations), 2)
+        old_operation = next(op for op in operations if op["operation_id"] == original_operation_id)
+        new_operation = next(op for op in operations if op["operation_id"] == reconfirmed["operation_id"])
+        self.assertTrue(old_operation["is_rolled_back"])
+        self.assertFalse(new_operation["is_rolled_back"])
+        self.assertNotEqual(
+            (old_operation.get("pending_action") or {}).get("item_id"),
+            (new_operation.get("pending_action") or {}).get("item_id"),
+        )
+
     def test_item_confirmation_is_idempotent(self) -> None:
         card = self.preview("银河买入10股比亚迪，均价100元")
         item = card["items"][0]
