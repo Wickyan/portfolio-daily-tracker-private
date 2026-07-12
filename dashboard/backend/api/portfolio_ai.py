@@ -933,6 +933,58 @@ def infer_account(message: str, allow_single: bool = False) -> tuple[Optional[st
     return None, None
 
 
+def _parse_shared_record_count(value: Optional[str]) -> Optional[int]:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        number = int(token)
+        return number if number > 0 else None
+    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if token == "十":
+        return 10
+    if "十" in token:
+        left, right = token.split("十", 1)
+        tens = digits.get(left, 1) if left else 1
+        ones = digits.get(right, 0) if right else 0
+        number = tens * 10 + ones
+        return number if number > 0 else None
+    return digits.get(token)
+
+
+def infer_shared_account_directive(message: str) -> tuple[Optional[str], Optional[int]]:
+    """Read a global account statement such as “这三个都是银河的”."""
+    text = unicodedata.normalize("NFKC", str(message or ""))
+    subject = (
+        r"(?:这\s*(?P<count>[一二两三四五六七八九十\d]+)\s*(?:个|条)?"
+        r"|这几(?:个|条)?|这些|以上|上述|前述|前面这些|全部|所有)"
+    )
+    relation = (
+        r"(?:记录|持仓|标的|资产)?\s*"
+        r"(?:都(?:是|在|属于|归到|归于|放在)?|全部(?:是|在|属于|归到|归于|放在)?|是|属于|归到|归于|放在)\s*"
+    )
+    suffix = r"(?:账户|券商|分组)?\s*(?:的)?"
+
+    known_accounts = COMMON_ACCOUNTS | NEW_ACCOUNT_HINTS | set(ACCOUNT_ALIASES)
+    for token in sorted(known_accounts, key=len, reverse=True):
+        match = re.search(
+            rf"{subject}{relation}{re.escape(token)}{suffix}(?=$|[。！!，,；;\s])",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return normalize_account(token), _parse_shared_record_count(match.groupdict().get("count"))
+
+    match = re.search(
+        rf"{subject}{relation}([A-Za-z0-9\u4e00-\u9fff]{{2,12}}(?:证券|银行|资本|投资|券商)){suffix}(?=$|[。！!，,；;\s])",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return normalize_account(match.group(2)), _parse_shared_record_count(match.groupdict().get("count"))
+    return None, None
+
+
 def infer_asset(message: str, existing_positions: List[Dict[str, Any]]) -> tuple[Dict[str, Any], List[str]]:
     warnings: List[str] = []
     name = parse_first_key_value(message, ("name", "名称", "标的"))
@@ -1829,6 +1881,39 @@ def parse_bookkeeping_message(
                         ))
                         parsed_clauses[index] = reparsed
             actionable = [parsed for parsed in parsed_clauses if parsed.get("intent") == "bookkeeping"]
+            shared_account, shared_record_count = infer_shared_account_directive(text)
+            shared_account_warning: Optional[str] = None
+            if shared_account and actionable:
+                if shared_record_count is not None and shared_record_count != len(actionable):
+                    shared_account_warning = (
+                        f"整体账户说明写的是{shared_record_count}条，但实际识别到{len(actionable)}条记录；"
+                        "为避免错配，暂未批量补充账户"
+                    )
+                else:
+                    applied_count = 0
+                    for parsed in actionable:
+                        item_action = str(parsed.get("action_type") or "add_or_update")
+                        item_changes = [dict(change) for change in parsed.get("changes", [])]
+                        for change in item_changes:
+                            if not change.get("account"):
+                                change["account"] = shared_account
+                                applied_count += 1
+                        parsed["changes"] = item_changes
+                        preserved_blockers = [
+                            field for field in parsed.get("missing_fields", [])
+                            if field in {
+                                "invalid_number", "distinct_currencies",
+                                "source_amount/currency", "target_amount/currency",
+                                "multiple_operations", "unparsed_record",
+                            }
+                        ]
+                        parsed["missing_fields"] = list(dict.fromkeys(
+                            collect_missing_fields(item_changes, item_action) + preserved_blockers
+                        ))
+                    if applied_count:
+                        shared_account_warning = (
+                            f"已根据整体说明，将{applied_count}条记录的账户统一补充为{shared_account}"
+                        )
             record_like_unparsed = [
                 index + 1
                 for index, (clause, parsed) in enumerate(zip(clauses, parsed_clauses))
@@ -1851,6 +1936,10 @@ def parse_bookkeeping_message(
                     "warnings": [f"{labels}看起来像记账记录，但未完整识别。为避免漏记，本次不会只写入其他条目；请补充后重新发送"],
                 }
             if len(actionable) == 1:
+                if shared_account_warning:
+                    actionable[0]["warnings"] = list(dict.fromkeys(
+                        list(actionable[0].get("warnings", [])) + [shared_account_warning]
+                    ))
                 return actionable[0]
             if len(actionable) > 1:
                 position_actions = {"add_or_update", "sell", "set_position"}
@@ -1952,6 +2041,8 @@ def parse_bookkeeping_message(
                     general_warnings = [
                         f"已分别解析为{len(item_specs)}个可独立确认、修改和撤回的子项"
                     ]
+                    if shared_account_warning:
+                        general_warnings.insert(0, shared_account_warning)
                     if action_types.issubset(position_actions):
                         general_warnings.append(f"已分别解析为{len(item_specs)}条持仓记录，请逐条核对操作类型")
                     if action_types.issubset(cash_actions):

@@ -167,6 +167,37 @@ class MultiPositionLanguageParseTest(unittest.TestCase):
         self.assertEqual(len(parsed["changes"]), 1)
         self.assertEqual(parsed["missing_fields"], [])
 
+    def test_trailing_all_records_account_statement_applies_to_every_position(self) -> None:
+        parsed = parse_bookkeeping_message(
+            "比亚迪 500个 102.742；"
+            "纳之大成 1.243 12700个；"
+            "海外科技 2.436 2052个。"
+            "这三个都是银河的"
+        )
+        self.assertEqual(parsed["action_type"], "add_or_update")
+        self.assertEqual(len(parsed["changes"]), 3)
+        self.assertEqual([change.get("account") for change in parsed["changes"]], ["银河", "银河", "银河"])
+        self.assertNotIn("account", parsed["missing_fields"])
+        self.assertTrue(any("账户统一补充为银河" in warning for warning in parsed["warnings"]))
+
+    def test_shared_account_count_mismatch_does_not_guess(self) -> None:
+        parsed = parse_bookkeeping_message(
+            "比亚迪 500个 102.742；"
+            "海外科技 2.436 2052个。"
+            "这三个都是银河的"
+        )
+        self.assertEqual(len(parsed["changes"]), 2)
+        self.assertEqual([change.get("account") for change in parsed["changes"]], [None, None])
+        self.assertIn("account", parsed["missing_fields"])
+        self.assertTrue(any("实际识别到2条" in warning for warning in parsed["warnings"]))
+
+    def test_shared_account_statement_supports_flexible_broker_name(self) -> None:
+        parsed = parse_bookkeeping_message(
+            "比亚迪 500个 102.742；海外科技 2.436 2052个。以上都是华泰证券的"
+        )
+        self.assertEqual([change.get("account") for change in parsed["changes"]], ["华泰证券", "华泰证券"])
+        self.assertNotIn("account", parsed["missing_fields"])
+
 
 class MultiPositionSearchAndRevisionTest(unittest.IsolatedAsyncioTestCase):
     async def test_each_missing_instrument_is_searched_independently(self) -> None:

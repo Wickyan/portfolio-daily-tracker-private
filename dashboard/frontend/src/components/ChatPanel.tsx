@@ -1284,13 +1284,20 @@ export default function ChatPanel() {
           >
             <Image className="h-5 w-5" />
           </button>
-          <input
-            type="text"
+          <textarea
+            rows={1}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
-            placeholder="输入已发生的持仓/现金/换汇记录…（支持拖拽或Ctrl+V粘贴图片）"
-            className="flex-1 input-field"
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter' || e.nativeEvent.isComposing) return
+              // Enter提交；Ctrl/Cmd/Shift+Enter保留textarea原生换行行为。
+              if (e.ctrlKey || e.metaKey || e.shiftKey) return
+              e.preventDefault()
+              e.currentTarget.form?.requestSubmit()
+            }}
+            placeholder="输入已发生的持仓/现金/换汇记录…（Enter提交，Ctrl+Enter换行）"
+            className="flex-1 input-field min-h-[42px] max-h-32 resize-y py-2"
             disabled={isLoading}
           />
           <button
