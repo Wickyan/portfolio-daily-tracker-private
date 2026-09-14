@@ -64,3 +64,33 @@ Explicit offsets are preserved in `effective_at`. Natural-language date/time
 resolution (for example `昨天`, `去年3月12号`, or broker-local timestamps) is a
 separate V3 date-resolver step and must be decided before voice/history input is
 connected to the ledger.
+
+## Replay checkpoint
+
+The replay engine is now implemented in isolation from the production
+portfolio write path.
+
+Supported replay semantics:
+
+- `BUY`: moving-average cost basis; buy fees/taxes are capitalized.
+- `OPENING_POSITION`: establishes a historical baseline and fails if earlier
+  position history already exists for the same account/code/currency.
+- `SELL`: reduces quantity/cost at moving-average cost and records realized P&L;
+  sell fees/taxes reduce realized P&L.
+- `DEPOSIT` / `WITHDRAW`: replay explicit cash events; withdrawals fail closed
+  if they would make cash negative.
+- `FX`: atomically moves explicit source cash to counter-currency cash.
+- `DIVIDEND`: adds net dividend cash after fee/tax and records instrument income
+  when a code is present.
+- `as_of=YYYY-MM-DD`: returns state through the end of the reported/local
+  calendar date, not the UTC-converted date.
+
+Deliberately unsupported in replay at this checkpoint:
+
+- `SPLIT`
+- `TRANSFER_IN` / `TRANSFER_OUT`
+- `REVERSAL`
+- margin/negative-cash settlement
+- automatic BUY/SELL cash settlement
+
+Unsupported event types raise `ReplayError` instead of being silently ignored.
