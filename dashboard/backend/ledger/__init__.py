@@ -7,8 +7,10 @@ Current holdings remain untouched until the replay layer is introduced.
 from .models import Transaction, TransactionType
 from .repository import TransactionRepository
 from .replay import PositionState, ReplayError, ReplayState, replay_transactions
+from .compat import replay_state_to_portfolio
 
 __all__ = [
     "Transaction", "TransactionType", "TransactionRepository",
     "PositionState", "ReplayState", "ReplayError", "replay_transactions",
+    "replay_state_to_portfolio",
 ]

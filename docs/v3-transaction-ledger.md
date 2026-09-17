@@ -94,3 +94,21 @@ Deliberately unsupported in replay at this checkpoint:
 - automatic BUY/SELL cash settlement
 
 Unsupported event types raise `ReplayError` instead of being silently ignored.
+
+## Legacy dashboard compatibility checkpoint
+
+`replay_state_to_portfolio()` provides a read-only boundary from exact V3
+`Decimal` replay state into the float-based raw portfolio shape already consumed
+by the existing valuation/dashboard layer.
+
+Important constraints:
+
+- Decimal-to-float conversion happens only at this compatibility boundary.
+- No legacy `portfolio.json` file is written by the adapter.
+- Current prices are supplied explicitly; when absent, average cost is used as a
+  neutral compatibility fallback rather than fetching or inventing a quote.
+- V3 realized P&L and dividend income are preserved as extension metadata even
+  though the current legacy valuation code does not aggregate them yet.
+- `backend.services` now lazily imports `AgentService`, allowing pure valuation
+  and ledger modules to be imported/tested without booting the optional LLM
+  dependency stack.
