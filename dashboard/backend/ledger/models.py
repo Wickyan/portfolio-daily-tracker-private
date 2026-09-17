@@ -18,6 +18,7 @@ class TransactionType(str, Enum):
     SELL = "SELL"
     OPENING_POSITION = "OPENING_POSITION"
     DEPOSIT = "DEPOSIT"
+    OPENING_CASH = "OPENING_CASH"
     WITHDRAW = "WITHDRAW"
     FX = "FX"
     DIVIDEND = "DIVIDEND"
@@ -156,7 +157,7 @@ class Transaction:
                 if price is None or price < 0:
                     raise ValueError("price must be >= 0 for buy/sell/opening events")
 
-        if event_type in {TransactionType.DEPOSIT, TransactionType.WITHDRAW, TransactionType.DIVIDEND}:
+        if event_type in {TransactionType.DEPOSIT, TransactionType.OPENING_CASH, TransactionType.WITHDRAW, TransactionType.DIVIDEND}:
             if currency is None:
                 raise ValueError("currency is required for cash events")
             if amount is None or amount <= 0:

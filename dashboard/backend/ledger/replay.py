@@ -125,7 +125,7 @@ def _apply_transaction(state: ReplayState, tx: Transaction) -> None:
     if event_type == TransactionType.SELL:
         _apply_sell(state, tx)
         return
-    if event_type in {TransactionType.DEPOSIT, TransactionType.WITHDRAW}:
+    if event_type in {TransactionType.DEPOSIT, TransactionType.OPENING_CASH, TransactionType.WITHDRAW}:
         _apply_cash(state, tx)
         return
     if event_type == TransactionType.FX:
@@ -195,7 +195,12 @@ def _apply_cash(state: ReplayState, tx: Transaction) -> None:
     key = (tx.account, str(tx.currency or "").upper())
     current = state.cash.get(key, ZERO)
     amount = tx.amount or ZERO
-    target = current + amount if tx.event_type == TransactionType.DEPOSIT else current - amount
+    if tx.event_type == TransactionType.OPENING_CASH:
+        if key in state.cash:
+            raise ReplayError(f"opening cash conflicts with existing history: {key}")
+        target = amount
+    else:
+        target = current + amount if tx.event_type == TransactionType.DEPOSIT else current - amount
     if target < ZERO:
         raise ReplayError(f"cash would become negative for {key}: {target}")
     state.cash[key] = target

@@ -112,3 +112,29 @@ Important constraints:
 - `backend.services` now lazily imports `AgentService`, allowing pure valuation
   and ledger modules to be imported/tested without booting the optional LLM
   dependency stack.
+
+## Historical input normalization checkpoint
+
+The V3 input layer now resolves common explicit historical time expressions
+without asking an LLM to invent dates. Supported deterministic forms include:
+
+- ISO dates such as `2025-03-12`
+- Chinese dates such as `2025年3月12日`
+- `今天` / `昨天` / `前天`
+- `去年3月12日` / `今年...` / `前年...`
+- `15:30` and common Chinese clock forms such as `下午3点30分`
+
+No date means "now". Date-only input is retained as date precision in event
+metadata so confirmation UI can make the missing clock time visible.
+
+Existing bookkeeper change semantics map to V3 events as follows:
+
+- incremental buy/add -> `BUY`
+- sell/reduce -> `SELL`
+- absolute position baseline -> `OPENING_POSITION`
+- deposit/withdraw -> corresponding cash event
+- absolute cash baseline -> `OPENING_CASH`
+- legacy withdraw+deposit FX pair -> one atomic `FX` event
+
+`OPENING_CASH` was added because a known historical cash balance is a baseline,
+not a fake deposit.
