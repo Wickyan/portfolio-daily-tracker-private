@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .models import Transaction, TransactionType
 
@@ -67,33 +67,75 @@ class TransactionRepository:
                 """
             )
 
+    @staticmethod
+    def _insert_transaction(conn: sqlite3.Connection, tx: Transaction) -> None:
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                transaction_id, event_type, effective_at, entered_at,
+                account, instrument_id, code, name, currency, quantity,
+                price, fee, tax, amount, counter_currency, counter_amount,
+                source, note, external_trade_id, reverses_transaction_id,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tx.transaction_id, tx.event_type.value, tx.effective_at, tx.entered_at,
+                tx.account, tx.instrument_id, tx.code, tx.name, tx.currency, _decimal_text(tx.quantity),
+                _decimal_text(tx.price), _decimal_text(tx.fee), _decimal_text(tx.tax), _decimal_text(tx.amount),
+                tx.counter_currency, _decimal_text(tx.counter_amount),
+                tx.source, tx.note, tx.external_trade_id, tx.reverses_transaction_id,
+                json.dumps(tx.metadata, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+
     def append(self, transaction: Transaction) -> Transaction:
-        tx = transaction.validated()
+        return self.append_many([transaction])[0]
+
+    def append_many(self, transactions: List[Transaction]) -> List[Transaction]:
+        return self.append_many_atomic(transactions)
+
+    def append_many_atomic(
+        self,
+        transactions: List[Transaction],
+        *,
+        precommit_validator: Optional[Callable[[List[Transaction], List[Transaction]], None]] = None,
+    ) -> List[Transaction]:
+        """Validate against a locked current history and append as one transaction.
+
+        ``precommit_validator`` executes after ``BEGIN IMMEDIATE`` and receives
+        (existing_history, proposed_events). If it raises, SQLite rolls the
+        whole write transaction back before any proposed event becomes visible.
+        """
+        validated = [transaction.validated() for transaction in transactions]
+        if not validated:
+            return []
+        ids = [tx.transaction_id for tx in validated]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate transaction_id inside batch")
+        external_keys = [
+            (tx.account, tx.external_trade_id)
+            for tx in validated
+            if tx.external_trade_id
+        ]
+        if len(external_keys) != len(set(external_keys)):
+            raise ValueError("duplicate external_trade_id inside batch/account")
+
         self.initialize()
         try:
             with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO transactions (
-                        transaction_id, event_type, effective_at, entered_at,
-                        account, instrument_id, code, name, currency, quantity,
-                        price, fee, tax, amount, counter_currency, counter_amount,
-                        source, note, external_trade_id, reverses_transaction_id,
-                        metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        tx.transaction_id, tx.event_type.value, tx.effective_at, tx.entered_at,
-                        tx.account, tx.instrument_id, tx.code, tx.name, tx.currency, _decimal_text(tx.quantity),
-                        _decimal_text(tx.price), _decimal_text(tx.fee), _decimal_text(tx.tax), _decimal_text(tx.amount),
-                        tx.counter_currency, _decimal_text(tx.counter_amount),
-                        tx.source, tx.note, tx.external_trade_id, tx.reverses_transaction_id,
-                        json.dumps(tx.metadata, ensure_ascii=False, sort_keys=True),
-                    ),
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                if precommit_validator is not None:
+                    rows = conn.execute(
+                        "SELECT * FROM transactions ORDER BY effective_at, entered_at, transaction_id"
+                    ).fetchall()
+                    existing = [self._row_to_transaction(row) for row in rows]
+                    precommit_validator(existing, validated)
+                for tx in validated:
+                    self._insert_transaction(conn, tx)
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate transaction/external id: {exc}") from exc
-        return tx
+        return validated
 
     def get(self, transaction_id: str) -> Optional[Transaction]:
         self.initialize()
