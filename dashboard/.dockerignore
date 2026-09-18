@@ -1,0 +1,28 @@
+# Runtime/private data are mounted by docker-compose; never bake them into images.
+data/
+config.json
+.env
+.env.*
+
+# Python caches and local test artifacts.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend local build/dependency artifacts.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Tool-local dependencies and logs.
+tools/browser-mcp/node_modules/
+*.log
+logs/
+
+# Editor / OS files.
+.DS_Store
+.vscode/
+.idea/
