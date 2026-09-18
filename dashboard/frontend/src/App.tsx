@@ -8,6 +8,7 @@ import Memory from './pages/Memory'
 import Settings from './pages/Settings'
 import Help from './pages/Help'
 import Backtest from './pages/Backtest'
+import Ledger from './pages/Ledger'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
         <Route path="/" element={<Layout />}>
           <Route index element={<Dashboard />} />
           <Route path="portfolio" element={<Portfolio />} />
+          <Route path="ledger" element={<Ledger />} />
           <Route path="tracker" element={<PortfolioTracker />} />
           <Route path="market" element={<Market />} />
           <Route path="memory" element={<Memory />} />

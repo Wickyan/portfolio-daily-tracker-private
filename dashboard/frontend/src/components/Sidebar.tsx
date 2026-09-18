@@ -6,7 +6,8 @@ import {
   Settings,
   HelpCircle,
   BarChart2,
-  LineChart
+  LineChart,
+  History
 } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { clsx } from 'clsx'
@@ -14,6 +15,7 @@ import { clsx } from 'clsx'
 const navItems = [
   { icon: MessageSquare, label: '对话', path: '/' },
   { icon: Wallet, label: '持仓', path: '/portfolio' },
+  { icon: History, label: '账本', path: '/ledger' },
   { icon: LineChart, label: '跟踪', path: '/tracker' },
   { icon: TrendingUp, label: '行情', path: '/market' },
   { icon: Brain, label: '记忆', path: '/memory' },
