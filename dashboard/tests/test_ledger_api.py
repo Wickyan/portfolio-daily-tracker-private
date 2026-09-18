@@ -150,6 +150,47 @@ class LedgerApiTest(unittest.TestCase):
         response = self.client.get("/api/ledger-v3/pending/does-not-exist")
         self.assertEqual(response.status_code, 404)
 
+    def test_preview_text_historical_buy_creates_pending_only(self):
+        response = self.client.post("/api/ledger-v3/preview-text", json={
+            "message": "去年3月12号在IBKR买了1股苹果，87.5美元一股，手续费1美元",
+            "reference_time": "2026-09-18T10:00:00+08:00",
+            "source": "voice",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        event = body["events"][0]
+        self.assertEqual(event["effective_at"], "2025-03-12T00:00:00+08:00")
+        self.assertEqual(event["price"], "87.5")
+        self.assertEqual(event["fee"], "1")
+        self.assertEqual(event["source"], "voice")
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_preview_text_multi_clause_inherits_asset_and_year(self):
+        response = self.client.post("/api/ledger-v3/preview-text", json={
+            "message": "去年3月12号IBKR买1股苹果87.5美元；5月8号又买2股92美元",
+            "reference_time": "2026-09-18T10:00:00+08:00",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        events = response.json()["events"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual([e["code"] for e in events], ["AAPL", "AAPL"])
+        self.assertEqual(events[1]["effective_at"], "2025-05-08T00:00:00+08:00")
+
+    def test_preview_text_oversell_is_rejected_by_v3_replay(self):
+        response = self.client.post("/api/ledger-v3/preview-text", json={
+            "message": "2025年3月1日在IBKR卖2股苹果成交价160美元",
+            "reference_time": "2026-09-18T10:00:00+08:00",
+        })
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_preview_text_requires_offset_when_reference_is_supplied(self):
+        response = self.client.post("/api/ledger-v3/preview-text", json={
+            "message": "昨天IBKR入金500美元",
+            "reference_time": "2026-09-18T10:00:00",
+        })
+        self.assertEqual(response.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

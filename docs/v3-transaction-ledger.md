@@ -164,3 +164,18 @@ Structured V3 writes now follow a two-step confirmation flow:
 Pending batches expire, cannot be confirmed twice, and are not transactions themselves.
 If history changes after preview in a way that makes the pending batch invalid, confirm fails and no proposed event is written.
 GET /api/ledger-v3/pending/{pending_id} exposes confirmation status.
+
+## Historical natural-language preview checkpoint
+
+POST /api/ledger-v3/preview-text converts historical bookkeeping text into a server-side pending batch.
+The adapter strips deterministic date/time expressions before invoking the mature legacy account/instrument parser, then applies V3-specific price/fee parsing and context inheritance.
+
+Important safeguards:
+
+- Historical SELL validation ignores legacy current-portfolio availability and is validated only by V3 replay at the event date.
+- A SELL account must be explicit in the clause or inherited from a previous clause; today's legacy holdings are never used to guess a historical broker.
+- Later clauses may inherit the previous account and instrument, and a month/day without year inherits the historical year context.
+- Chinese punctuation and fee phrases are normalized so fees are not mistaken for trade prices.
+- Client reference_time must include a timezone offset when supplied, allowing relative dates such as 今天/昨天 to be resolved in the user's local time.
+
+Text and voice transcripts use the same preview path; neither can bypass server-side pending confirmation.

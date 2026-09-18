@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -14,6 +15,7 @@ from backend.ledger import (
     Transaction,
     TransactionRepository,
     TransactionType,
+    parse_historical_bookkeeping_text,
     replay_state_to_portfolio,
     replay_transactions,
 )
@@ -49,6 +51,13 @@ class LedgerEventRequest(BaseModel):
 
 class LedgerPreviewRequest(BaseModel):
     events: List[LedgerEventRequest]
+    ttl_seconds: int = Field(default=1800, ge=30, le=3600)
+
+
+class LedgerTextPreviewRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+    reference_time: Optional[str] = None
+    source: str = "text"
     ttl_seconds: int = Field(default=1800, ge=30, le=3600)
 
 
@@ -197,6 +206,61 @@ async def preview_events(request: LedgerPreviewRequest):
         "historical_backfill": pending["historical_backfill"],
         "events": [_transaction_payload(tx) for tx in pending["events"]],
         "projected_state": _state_payload(pending["projected_state"]),
+    }
+
+
+@router.post("/preview-text")
+async def preview_text(request: LedgerTextPreviewRequest):
+    reference = None
+    if request.reference_time:
+        raw_reference = request.reference_time
+        candidate = raw_reference[:-1] + "+00:00" if raw_reference.endswith("Z") else raw_reference
+        try:
+            reference = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="reference_time must be ISO datetime") from exc
+        if reference.tzinfo is None:
+            raise HTTPException(status_code=400, detail="reference_time must include timezone offset")
+
+    if request.source not in {"text", "voice"}:
+        raise HTTPException(status_code=400, detail="source must be text or voice")
+
+    try:
+        interpreted = parse_historical_bookkeeping_text(
+            request.message, reference=reference, source=request.source
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        pending = get_write_service().create_pending(
+            interpreted.events, ttl_seconds=request.ttl_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "pending_id": pending["pending_id"],
+        "status": pending["status"],
+        "created_at": pending["created_at"],
+        "expires_at": pending["expires_at"],
+        "historical_backfill": pending["historical_backfill"],
+        "events": [_transaction_payload(tx) for tx in pending["events"]],
+        "projected_state": _state_payload(pending["projected_state"]),
+        "interpretation": {
+            "warnings": interpreted.warnings,
+            "clauses": [
+                {
+                    "original": item.original,
+                    "cleaned": item.cleaned,
+                    "effective_at": item.effective_at,
+                    "date_precision": item.date_precision,
+                    "action_type": item.action_type,
+                    "warnings": item.warnings,
+                }
+                for item in interpreted.clauses
+            ],
+        },
     }
 
 

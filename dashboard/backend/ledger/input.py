@@ -21,9 +21,9 @@ class ResolvedEffectiveTime:
 
 _DATE_PATTERNS = [
     re.compile(r"(?P<y>20\d{2})[-/.](?P<m>\d{1,2})[-/.](?P<d>\d{1,2})"),
-    re.compile(r"(?P<y>20\d{2})年(?P<m>\d{1,2})月(?P<d>\d{1,2})日?"),
+    re.compile(r"(?P<y>20\d{2})年(?P<m>\d{1,2})月(?P<d>\d{1,2})(?:日|号)?"),
 ]
-_MONTH_DAY = re.compile(r"(?:(?P<rel>前年|去年|今年))?(?P<m>\d{1,2})月(?P<d>\d{1,2})日?")
+_MONTH_DAY = re.compile(r"(?:(?P<rel>前年|去年|今年))?(?P<m>\d{1,2})月(?P<d>\d{1,2})(?:日|号)?")
 _CLOCK_COLON = re.compile(r"(?<!\d)(?P<h>[01]?\d|2[0-3]):(?P<min>[0-5]\d)(?!\d)")
 _CLOCK_CN = re.compile(
     r"(?P<period>凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*"
@@ -121,6 +121,22 @@ def resolve_effective_time(text: str, *, reference: Optional[datetime] = None) -
     matched = " ".join(part for part in (date_match_text, clock_text) if part)
     return ResolvedEffectiveTime(resolved.isoformat(), precision, matched, bool(date_match_text or clock_text))
 
+
+
+
+def strip_effective_time_text(text: str) -> str:
+    """Remove deterministic date/time phrases before legacy bookkeeping parsing."""
+    cleaned = str(text or "")
+    for pattern in _DATE_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"(?:前天|昨天|今天)", " ", cleaned)
+    cleaned = _MONTH_DAY.sub(" ", cleaned)
+    cleaned = _CLOCK_COLON.sub(" ", cleaned)
+    cleaned = _CLOCK_CN.sub(" ", cleaned)
+    cleaned = cleaned.replace("，", " ")
+    cleaned = re.sub(r"(?<!\d),(?!\d)", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 def _decimal(value: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
     if value is None or value == "":
