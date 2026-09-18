@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -98,7 +98,13 @@ def replay_transactions(
         )
     )
     as_of_raw = str(as_of or "").strip()
-    date_only_cutoff = as_of_raw if len(as_of_raw) == 10 else None
+    date_only_cutoff = None
+    if as_of_raw and len(as_of_raw) == 10:
+        try:
+            date.fromisoformat(as_of_raw)
+        except ValueError as exc:
+            raise ValueError("as_of must be ISO date/datetime") from exc
+        date_only_cutoff = as_of_raw
     instant_cutoff = _as_of_timestamp(as_of_raw) if as_of_raw and not date_only_cutoff else None
     state = ReplayState()
 

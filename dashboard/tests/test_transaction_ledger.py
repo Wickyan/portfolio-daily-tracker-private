@@ -114,6 +114,26 @@ class TransactionRepositoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.repo.append(self.make_buy(external_trade_id="broker-fill-123"))
 
+    def test_date_range_uses_reported_local_date(self):
+        self.repo.append(self.make_buy(
+            effective_at="2025-03-13T00:30:00+08:00",
+            price=123,
+        ))
+        rows = self.repo.list_transactions(effective_to="2025-03-12")
+        self.assertEqual(rows, [])
+        rows = self.repo.list_transactions(effective_from="2025-03-13", effective_to="2025-03-13")
+        self.assertEqual(len(rows), 1)
+
+    def test_ordering_uses_absolute_time_when_offsets_differ(self):
+        self.repo.append(self.make_buy(
+            effective_at="2025-01-01T10:00:00+08:00", price=100
+        ))
+        self.repo.append(self.make_buy(
+            effective_at="2025-01-01T01:30:00+00:00", price=90
+        ))
+        rows = self.repo.list_transactions()
+        self.assertEqual([row.price for row in rows], [Decimal("90"), Decimal("100")])
+
     def test_same_external_trade_id_can_exist_in_different_accounts(self):
         self.repo.append(self.make_buy(external_trade_id="fill-1", account="长桥"))
         self.repo.append(self.make_buy(external_trade_id="fill-1", account="IBKR"))

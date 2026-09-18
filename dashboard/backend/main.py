@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from backend.api import chat, portfolio, market, memory, suggestions, settings, dev_tools, portfolio_ai
-from backend.api import backtest, portfolio_tracker
+from backend.api import backtest, portfolio_tracker, ledger_v3
 from backend.services.agent_service import AgentService
 
 
@@ -64,6 +64,7 @@ app.include_router(settings.router, prefix="/api/settings", tags=["设置"])
 app.include_router(dev_tools.router, prefix="/api/dev", tags=["开发工具"])
 app.include_router(backtest.router, tags=["回测"])
 app.include_router(portfolio_tracker.router, prefix="/api/tracker", tags=["投资组合跟踪"])
+app.include_router(ledger_v3.router, prefix="/api/ledger-v3", tags=["V3交易账本"])
 
 
 @app.get("/")

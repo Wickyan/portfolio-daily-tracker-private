@@ -138,3 +138,18 @@ Existing bookkeeper change semantics map to V3 events as follows:
 
 `OPENING_CASH` was added because a known historical cash balance is a baseline,
 not a fake deposit.
+
+## Read-only HTTP API checkpoint
+
+The main FastAPI app now exposes a read-only V3 surface under /api/ledger-v3:
+
+- GET /transactions with optional account/code/date-range filters.
+- GET /state?as_of=... for current or historical replay state.
+- GET /portfolio-compat?as_of=... for the legacy dashboard-compatible raw portfolio shape.
+
+Exact ledger decimals are returned as strings. Date-only transaction filters use
+the event's reported/local calendar date, while datetime ordering uses absolute
+instants across timezone offsets. Invalid historical as_of values fail with
+HTTP 400 instead of producing server errors.
+
+No write endpoint is exposed in this checkpoint.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -15,6 +16,32 @@ def _decimal_text(value):
 
 
 DEFAULT_LEDGER_PATH = Path("data") / "ledger.sqlite3"
+
+
+def _absolute_timestamp(value: str) -> float:
+    raw = str(value or "").strip()
+    candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    dt = datetime.fromisoformat(candidate)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).timestamp()
+
+
+def _effective_in_range(value: str, lower: Optional[str], upper: Optional[str]) -> bool:
+    reported_date = str(value)[:10]
+    if lower:
+        if len(lower) == 10:
+            if reported_date < lower:
+                return False
+        elif _absolute_timestamp(value) < _absolute_timestamp(lower):
+            return False
+    if upper:
+        if len(upper) == 10:
+            if reported_date > upper:
+                return False
+        elif _absolute_timestamp(value) > _absolute_timestamp(upper):
+            return False
+    return True
 
 
 class TransactionRepository:
@@ -163,22 +190,23 @@ class TransactionRepository:
         if code:
             clauses.append("code = ?")
             params.append(code.upper())
-        if effective_from:
-            clauses.append("effective_at >= ?")
-            params.append(effective_from)
-        if effective_to:
-            clauses.append("effective_at <= ?")
-            params.append(effective_to)
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        query = (
-            "SELECT * FROM transactions"
-            + where
-            + " ORDER BY effective_at, entered_at, transaction_id"
-        )
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return [self._row_to_transaction(row) for row in rows]
+            rows = conn.execute("SELECT * FROM transactions" + where, params).fetchall()
+        transactions = [self._row_to_transaction(row) for row in rows]
+        transactions = [
+            tx for tx in transactions
+            if _effective_in_range(str(tx.effective_at), effective_from, effective_to)
+        ]
+        transactions.sort(
+            key=lambda tx: (
+                _absolute_timestamp(str(tx.effective_at)),
+                _absolute_timestamp(str(tx.entered_at)),
+                tx.transaction_id,
+            )
+        )
+        return transactions
 
     @staticmethod
     def _row_to_transaction(row: sqlite3.Row) -> Transaction:
