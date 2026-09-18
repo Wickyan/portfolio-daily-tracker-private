@@ -153,3 +153,14 @@ instants across timezone offsets. Invalid historical as_of values fail with
 HTTP 400 instead of producing server errors.
 
 No write endpoint is exposed in this checkpoint.
+
+## Server-side pending confirmation checkpoint
+
+Structured V3 writes now follow a two-step confirmation flow:
+
+1. POST /api/ledger-v3/preview validates the complete projected history and creates a server-side pending batch.
+2. POST /api/ledger-v3/confirm/{pending_id} acquires a SQLite write lock, reloads the latest history, replays it with the pending events, and only then atomically inserts the whole batch and marks the pending item confirmed.
+
+Pending batches expire, cannot be confirmed twice, and are not transactions themselves.
+If history changes after preview in a way that makes the pending batch invalid, confirm fails and no proposed event is written.
+GET /api/ledger-v3/pending/{pending_id} exposes confirmation status.

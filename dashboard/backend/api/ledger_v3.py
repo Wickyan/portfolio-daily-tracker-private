@@ -1,21 +1,63 @@
-"""Read-only HTTP API for the V3 transaction ledger."""
+"""HTTP API for the V3 transaction ledger."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from backend.ledger import TransactionRepository, replay_state_to_portfolio, replay_transactions
+from backend.ledger import (
+    LedgerWriteService,
+    Transaction,
+    TransactionRepository,
+    TransactionType,
+    replay_state_to_portfolio,
+    replay_transactions,
+)
 
 
 router = APIRouter()
+NumberInput = Union[str, int, float]
+
+
+class LedgerEventRequest(BaseModel):
+    event_type: str
+    effective_at: str
+    account: str
+
+    entered_at: Optional[str] = None
+    instrument_id: Optional[str] = None
+    code: Optional[str] = None
+    name: Optional[str] = None
+    currency: Optional[str] = None
+    quantity: Optional[NumberInput] = None
+    price: Optional[NumberInput] = None
+    fee: NumberInput = "0"
+    tax: NumberInput = "0"
+    amount: Optional[NumberInput] = None
+    counter_currency: Optional[str] = None
+    counter_amount: Optional[NumberInput] = None
+    source: str = "manual"
+    note: str = ""
+    external_trade_id: Optional[str] = None
+    reverses_transaction_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class LedgerPreviewRequest(BaseModel):
+    events: List[LedgerEventRequest]
+    ttl_seconds: int = Field(default=1800, ge=30, le=3600)
 
 
 def get_repository() -> TransactionRepository:
     return TransactionRepository(Path("data") / "ledger.sqlite3")
+
+
+def get_write_service() -> LedgerWriteService:
+    return LedgerWriteService(get_repository())
 
 
 def _decimal_text(value):
@@ -74,6 +116,19 @@ def _state_payload(state):
     }
 
 
+def _request_to_transaction(request: LedgerEventRequest) -> Transaction:
+    try:
+        event_type = TransactionType(request.event_type.upper())
+    except ValueError as exc:
+        raise ValueError(f"unsupported event_type: {request.event_type}") from exc
+
+    kwargs = request.model_dump()
+    kwargs["event_type"] = event_type
+    if kwargs.get("entered_at") is None:
+        kwargs.pop("entered_at", None)
+    return Transaction(**kwargs).validated()
+
+
 @router.get("/transactions")
 async def list_transactions(
     account: Optional[str] = None,
@@ -81,12 +136,15 @@ async def list_transactions(
     effective_from: Optional[str] = Query(None, alias="from"),
     effective_to: Optional[str] = Query(None, alias="to"),
 ):
-    rows = get_repository().list_transactions(
-        account=account,
-        code=code,
-        effective_from=effective_from,
-        effective_to=effective_to,
-    )
+    try:
+        rows = get_repository().list_transactions(
+            account=account,
+            code=code,
+            effective_from=effective_from,
+            effective_to=effective_to,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "count": len(rows),
         "transactions": [_transaction_payload(tx) for tx in rows],
@@ -109,5 +167,69 @@ async def get_state(as_of: Optional[str] = None):
 @router.get("/portfolio-compat")
 async def get_portfolio_compat(as_of: Optional[str] = None):
     rows = get_repository().list_transactions()
-    state = replay_transactions(rows, as_of=as_of)
+    try:
+        state = replay_transactions(rows, as_of=as_of)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return replay_state_to_portfolio(state)
+
+
+@router.post("/preview")
+async def preview_events(request: LedgerPreviewRequest):
+    try:
+        events = [_request_to_transaction(item) for item in request.events]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        pending = get_write_service().create_pending(
+            events,
+            ttl_seconds=request.ttl_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "pending_id": pending["pending_id"],
+        "status": pending["status"],
+        "created_at": pending["created_at"],
+        "expires_at": pending["expires_at"],
+        "historical_backfill": pending["historical_backfill"],
+        "events": [_transaction_payload(tx) for tx in pending["events"]],
+        "projected_state": _state_payload(pending["projected_state"]),
+    }
+
+
+@router.get("/pending/{pending_id}")
+async def get_pending(pending_id: str):
+    pending = get_repository().get_pending_batch(pending_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="pending batch not found")
+    return {
+        "pending_id": pending["pending_id"],
+        "status": pending["status"],
+        "created_at": pending["created_at"],
+        "expires_at": pending["expires_at"],
+        "confirmed_at": pending["confirmed_at"],
+        "events": [_transaction_payload(tx) for tx in pending["events"]],
+    }
+
+
+@router.post("/confirm/{pending_id}")
+async def confirm_pending(pending_id: str):
+    service = get_write_service()
+    try:
+        preview = service.confirm_pending(pending_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="pending batch not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    pending = get_repository().get_pending_batch(pending_id)
+    return {
+        "pending_id": pending_id,
+        "status": pending["status"] if pending else "confirmed",
+        "historical_backfill": preview.historical_backfill,
+        "events": [_transaction_payload(tx) for tx in preview.events],
+        "projected_state": _state_payload(preview.projected_state),
+    }

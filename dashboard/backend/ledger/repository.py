@@ -2,17 +2,48 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import Transaction, TransactionType
 
 
 def _decimal_text(value):
     return None if value is None else str(value)
+
+
+def _transaction_json_payload(tx: Transaction) -> Dict:
+    tx = tx.validated()
+    return {
+        "transaction_id": tx.transaction_id, "event_type": tx.event_type.value,
+        "effective_at": str(tx.effective_at), "entered_at": str(tx.entered_at),
+        "account": tx.account, "instrument_id": tx.instrument_id, "code": tx.code,
+        "name": tx.name, "currency": tx.currency,
+        "quantity": _decimal_text(tx.quantity), "price": _decimal_text(tx.price),
+        "fee": _decimal_text(tx.fee), "tax": _decimal_text(tx.tax),
+        "amount": _decimal_text(tx.amount), "counter_currency": tx.counter_currency,
+        "counter_amount": _decimal_text(tx.counter_amount), "source": tx.source,
+        "note": tx.note, "external_trade_id": tx.external_trade_id,
+        "reverses_transaction_id": tx.reverses_transaction_id, "metadata": tx.metadata,
+    }
+
+
+def _transaction_from_json_payload(data: Dict) -> Transaction:
+    return Transaction(
+        transaction_id=data["transaction_id"], event_type=TransactionType(data["event_type"]),
+        effective_at=data["effective_at"], entered_at=data["entered_at"], account=data["account"],
+        instrument_id=data.get("instrument_id"), code=data.get("code"), name=data.get("name"),
+        currency=data.get("currency"), quantity=data.get("quantity"), price=data.get("price"),
+        fee=data.get("fee", "0"), tax=data.get("tax", "0"), amount=data.get("amount"),
+        counter_currency=data.get("counter_currency"), counter_amount=data.get("counter_amount"),
+        source=data.get("source", "manual"), note=data.get("note", ""),
+        external_trade_id=data.get("external_trade_id"),
+        reverses_transaction_id=data.get("reverses_transaction_id"),
+        metadata=dict(data.get("metadata") or {}),
+    ).validated()
 
 
 DEFAULT_LEDGER_PATH = Path("data") / "ledger.sqlite3"
@@ -91,6 +122,15 @@ class TransactionRepository:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_id
                     ON transactions(account, external_trade_id)
                     WHERE external_trade_id IS NOT NULL AND external_trade_id <> '';
+
+                CREATE TABLE IF NOT EXISTS pending_batches (
+                    pending_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    events_json TEXT NOT NULL,
+                    confirmed_at TEXT
+                );
                 """
             )
 
@@ -163,6 +203,74 @@ class TransactionRepository:
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate transaction/external id: {exc}") from exc
         return validated
+
+    def create_pending_batch(self, pending_id: str, transactions: List[Transaction], *, ttl_seconds: int = 1800) -> Dict:
+        validated = [tx.validated() for tx in transactions]
+        if not validated:
+            raise ValueError("pending batch cannot be empty")
+        self.initialize()
+        now = datetime.now(timezone.utc)
+        payload = json.dumps([_transaction_json_payload(tx) for tx in validated], ensure_ascii=False, sort_keys=True)
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO pending_batches (pending_id, created_at, expires_at, status, events_json) VALUES (?, ?, ?, 'pending', ?)",
+                    (pending_id, now.isoformat(), (now + timedelta(seconds=ttl_seconds)).isoformat(), payload),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"duplicate pending_id: {pending_id}") from exc
+        return self.get_pending_batch(pending_id)
+
+    def get_pending_batch(self, pending_id: str) -> Optional[Dict]:
+        self.initialize()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM pending_batches WHERE pending_id = ?", (pending_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "pending_id": row["pending_id"], "created_at": row["created_at"],
+            "expires_at": row["expires_at"], "status": row["status"],
+            "confirmed_at": row["confirmed_at"],
+            "events": [_transaction_from_json_payload(item) for item in json.loads(row["events_json"] or "[]")],
+        }
+
+    def confirm_pending_batch(self, pending_id: str, validator: Callable[[List[Transaction], List[Transaction]], object]) -> Tuple[List[Transaction], object]:
+        self.initialize()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM pending_batches WHERE pending_id = ?", (pending_id,)).fetchone()
+            if row is None:
+                raise FileNotFoundError(pending_id)
+            if row["status"] != "pending":
+                raise ValueError(f"pending batch is already {row['status']}")
+            now = datetime.now(timezone.utc)
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if now > expires_at.astimezone(timezone.utc):
+                conn.execute("UPDATE pending_batches SET status = 'expired' WHERE pending_id = ?", (pending_id,))
+                conn.commit()
+                raise ValueError("pending batch expired")
+            proposed = [_transaction_from_json_payload(item) for item in json.loads(row["events_json"] or "[]")]
+            existing_rows = conn.execute("SELECT * FROM transactions").fetchall()
+            existing = [self._row_to_transaction(item) for item in existing_rows]
+            validation_result = validator(existing, proposed)
+            for tx in proposed:
+                self._insert_transaction(conn, tx)
+            confirmed_at = now.isoformat()
+            conn.execute("UPDATE pending_batches SET status = 'confirmed', confirmed_at = ? WHERE pending_id = ?", (confirmed_at, pending_id))
+            conn.commit()
+            return proposed, validation_result
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise ValueError(f"duplicate transaction/external id: {exc}") from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get(self, transaction_id: str) -> Optional[Transaction]:
         self.initialize()

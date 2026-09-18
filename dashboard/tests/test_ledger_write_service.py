@@ -55,7 +55,9 @@ class AtomicRepositoryTest(unittest.TestCase):
         self.assertEqual(self.repo.list_transactions(), [])
 
     def test_append_many_persists_whole_valid_batch(self):
-        stored = self.repo.append_many([buy("2025-01-01", 1, 100), buy("2025-02-01", 2, 120)])
+        stored = self.repo.append_many(
+            [buy("2025-01-01", 1, 100), buy("2025-02-01", 2, 120)]
+        )
         self.assertEqual(len(stored), 2)
         self.assertEqual(len(self.repo.list_transactions()), 2)
 
@@ -84,7 +86,10 @@ class LedgerWriteServiceTest(unittest.TestCase):
 
     def test_preview_does_not_persist(self):
         preview = self.service.preview([buy("2025-01-01", 2, 100)])
-        self.assertEqual(preview.projected_state.get_position("IBKR", "AAPL", "USD").quantity, Decimal("2"))
+        self.assertEqual(
+            preview.projected_state.get_position("IBKR", "AAPL", "USD").quantity,
+            Decimal("2"),
+        )
         self.assertEqual(self.repo.list_transactions(), [])
 
     def test_confirm_persists_only_after_full_history_is_valid(self):
@@ -110,6 +115,61 @@ class LedgerWriteServiceTest(unittest.TestCase):
         pos = preview.projected_state.get_position("IBKR", "AAPL", "USD")
         self.assertEqual(pos.quantity, Decimal("2"))
         self.assertEqual(pos.average_cost, Decimal("150"))
+
+
+class PendingLedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = TransactionRepository(Path(self.tmp.name) / "ledger.sqlite3")
+        self.service = LedgerWriteService(self.repo)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pending_preview_does_not_write_transactions(self):
+        pending = self.service.create_pending([buy("2025-01-01", 2, 100)])
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(self.repo.list_transactions(), [])
+        self.assertEqual(len(pending["events"]), 1)
+
+    def test_confirm_pending_writes_once_and_marks_confirmed(self):
+        pending = self.service.create_pending([buy("2025-01-01", 2, 100)])
+        preview = self.service.confirm_pending(pending["pending_id"])
+        self.assertEqual(len(self.repo.list_transactions()), 1)
+        self.assertEqual(
+            preview.projected_state.get_position("IBKR", "AAPL", "USD").quantity,
+            Decimal("2"),
+        )
+        stored = self.repo.get_pending_batch(pending["pending_id"])
+        self.assertEqual(stored["status"], "confirmed")
+        with self.assertRaises(ValueError):
+            self.service.confirm_pending(pending["pending_id"])
+        self.assertEqual(len(self.repo.list_transactions()), 1)
+
+    def test_confirm_revalidates_after_history_changes(self):
+        self.service.confirm([buy("2025-01-01", 2, 100)])
+        pending = self.service.create_pending([sell("2025-03-01", 2, 120)])
+        self.service.confirm([sell("2025-02-01", 1, 110)])
+        with self.assertRaises(ReplayError):
+            self.service.confirm_pending(pending["pending_id"])
+        rows = self.repo.list_transactions()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            self.repo.get_pending_batch(pending["pending_id"])["status"],
+            "pending",
+        )
+
+    def test_expired_pending_never_writes(self):
+        pending = self.service.create_pending(
+            [buy("2025-01-01", 2, 100)], ttl_seconds=-1
+        )
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.service.confirm_pending(pending["pending_id"])
+        self.assertEqual(self.repo.list_transactions(), [])
+        self.assertEqual(
+            self.repo.get_pending_batch(pending["pending_id"])["status"],
+            "expired",
+        )
 
 
 if __name__ == "__main__":

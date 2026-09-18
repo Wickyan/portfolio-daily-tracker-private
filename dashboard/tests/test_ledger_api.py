@@ -82,6 +82,74 @@ class LedgerApiTest(unittest.TestCase):
         self.assertEqual(pos["quantity"], "2")
         self.assertEqual(pos["realized_pnl"], "0")
 
+    def test_preview_then_confirm_writes_exactly_once(self):
+        payload = {
+            "events": [{
+                "event_type": "BUY",
+                "effective_at": "2025-03-01T10:00:00+08:00",
+                "account": "IBKR",
+                "code": "AAPL",
+                "name": "Apple",
+                "currency": "USD",
+                "quantity": "1",
+                "price": "125.25",
+                "fee": "0.01",
+            }]
+        }
+        preview = self.client.post("/api/ledger-v3/preview", json=payload)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        pending_id = preview.json()["pending_id"]
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+        self.assertEqual(preview.json()["events"][0]["price"], "125.25")
+
+        pending = self.client.get(f"/api/ledger-v3/pending/{pending_id}")
+        self.assertEqual(pending.status_code, 200)
+        self.assertEqual(pending.json()["status"], "pending")
+
+        confirmed = self.client.post(f"/api/ledger-v3/confirm/{pending_id}")
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(confirmed.json()["status"], "confirmed")
+        self.assertEqual(len(self.repo.list_transactions()), 3)
+
+        repeated = self.client.post(f"/api/ledger-v3/confirm/{pending_id}")
+        self.assertEqual(repeated.status_code, 409)
+        self.assertEqual(len(self.repo.list_transactions()), 3)
+
+    def test_preview_rejects_oversell_against_v3_history(self):
+        response = self.client.post("/api/ledger-v3/preview", json={
+            "events": [{
+                "event_type": "SELL",
+                "effective_at": "2025-03-01",
+                "account": "IBKR",
+                "code": "AAPL",
+                "currency": "USD",
+                "quantity": "2",
+                "price": "160",
+            }]
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_historical_preview_is_marked_as_backfill(self):
+        response = self.client.post("/api/ledger-v3/preview", json={
+            "events": [{
+                "event_type": "BUY",
+                "effective_at": "2024-01-01",
+                "account": "IBKR",
+                "code": "AAPL",
+                "currency": "USD",
+                "quantity": "1",
+                "price": "80",
+            }]
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["historical_backfill"])
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_missing_pending_returns_404(self):
+        response = self.client.get("/api/ledger-v3/pending/does-not-exist")
+        self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()
