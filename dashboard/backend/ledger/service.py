@@ -62,6 +62,7 @@ class LedgerWriteService:
                 historical_backfill=historical_backfill,
             )
 
+        self.repository.backup_database()
         self.repository.append_many_atomic(proposed, precommit_validator=validate_locked)
         return result["preview"]
     def create_pending(self, events: Iterable[Transaction], *, ttl_seconds: int = 1800) -> dict:
@@ -90,5 +91,6 @@ class LedgerWriteService:
                 historical_backfill=historical_backfill,
             )
 
+        self.repository.backup_database()
         _events, preview = self.repository.confirm_pending_batch(pending_id, validate)
         return preview

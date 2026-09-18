@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from decimal import Decimal
@@ -61,6 +62,15 @@ class AtomicRepositoryTest(unittest.TestCase):
         self.assertEqual(len(stored), 2)
         self.assertEqual(len(self.repo.list_transactions()), 2)
 
+    def test_backup_database_is_consistent_snapshot(self):
+        self.repo.append(buy("2025-01-01", 1, 100))
+        backup = self.repo.backup_database()
+        self.assertIsNotNone(backup)
+        self.assertTrue(backup.exists())
+        with sqlite3.connect(str(backup)) as conn:
+            self.assertEqual(conn.execute("select count(*) from transactions").fetchone()[0], 1)
+            self.assertEqual(conn.execute("pragma integrity_check").fetchone()[0], "ok")
+
     def test_precommit_validator_failure_rolls_back_entire_batch(self):
         def reject(existing, proposed):
             self.assertEqual(existing, [])
@@ -90,6 +100,16 @@ class LedgerWriteServiceTest(unittest.TestCase):
             preview.projected_state.get_position("IBKR", "AAPL", "USD").quantity,
             Decimal("2"),
         )
+        self.assertEqual(self.repo.list_transactions(), [])
+
+    def test_backup_failure_prevents_confirm_write(self):
+        original = self.repo.backup_database
+        self.repo.backup_database = lambda: (_ for _ in ()).throw(RuntimeError("backup failed"))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "backup failed"):
+                self.service.confirm([buy("2025-01-01", 2, 100)])
+        finally:
+            self.repo.backup_database = original
         self.assertEqual(self.repo.list_transactions(), [])
 
     def test_confirm_persists_only_after_full_history_is_valid(self):
@@ -131,6 +151,14 @@ class PendingLedgerTest(unittest.TestCase):
         self.assertEqual(pending["status"], "pending")
         self.assertEqual(self.repo.list_transactions(), [])
         self.assertEqual(len(pending["events"]), 1)
+
+    def test_pending_confirm_creates_prewrite_backup(self):
+        pending = self.service.create_pending([buy("2025-01-01", 2, 100)])
+        self.service.confirm_pending(pending["pending_id"])
+        backups = sorted((Path(self.tmp.name) / "ledger_backups").glob("ledger.sqlite3.bak-*"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(str(backups[0])) as conn:
+            self.assertEqual(conn.execute("select count(*) from transactions").fetchone()[0], 0)
 
     def test_confirm_pending_writes_once_and_marks_confirmed(self):
         pending = self.service.create_pending([buy("2025-01-01", 2, 100)])

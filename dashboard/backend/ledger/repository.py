@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from .models import Transaction, TransactionType
 
@@ -155,6 +156,26 @@ class TransactionRepository:
                 json.dumps(tx.metadata, ensure_ascii=False, sort_keys=True),
             ),
         )
+
+    def backup_database(self) -> Optional[Path]:
+        """Create a consistent SQLite snapshot before a durable ledger write."""
+        if str(self.db_path) == ":memory:":
+            return None
+        self.initialize()
+        backup_dir = self.db_path.parent / "ledger_backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
+        backup_path = backup_dir / f"ledger.sqlite3.bak-{stamp}-{uuid4().hex[:8]}"
+        try:
+            with self._connect() as source, sqlite3.connect(str(backup_path)) as target:
+                source.backup(target)
+                check = target.execute("PRAGMA integrity_check").fetchone()
+                if not check or str(check[0]).lower() != "ok":
+                    raise RuntimeError(f"ledger backup integrity check failed: {check}")
+        except Exception:
+            backup_path.unlink(missing_ok=True)
+            raise
+        return backup_path
 
     def append(self, transaction: Transaction) -> Transaction:
         return self.append_many([transaction])[0]

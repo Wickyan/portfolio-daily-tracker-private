@@ -189,3 +189,13 @@ Confirmed ledger events are never physically deleted. A correction starts by pre
 - Reversing an event is rejected if removing its economic effect would make later history invalid (for example, a later SELL would become an oversell).
 - A REVERSAL cannot itself be reversed, and the same transaction cannot be reversed twice.
 - The frontend exposes a two-step 冲销 action: preview first, confirm second.
+
+## Ledger backup checkpoint
+
+Every durable V3 confirmation now requires a successful SQLite backup first.
+Backups are written under data/ledger_backups using SQLite's online backup API
+and are integrity-checked before the transaction write proceeds.
+
+The backup policy is intentionally append-only: this implementation does not
+auto-delete old ledger backups. A backup failure fails closed and prevents the
+ledger write.
