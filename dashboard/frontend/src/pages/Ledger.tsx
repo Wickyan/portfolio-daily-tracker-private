@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Undo2,
   WalletCards,
 } from 'lucide-react'
 
@@ -92,6 +93,11 @@ function eventDescription(event: LedgerEvent) {
     return `${compactNumber(event.amount)} ${event.currency} → ${compactNumber(event.counter_amount)} ${event.counter_currency}`
   }
 
+  if (event.event_type === 'REVERSAL') {
+    const target = event.reverses_transaction_id?.slice(0, 8) || '未知记录'
+    return `冲销交易 ${target}${event.note ? ` · ${event.note}` : ''}`
+  }
+
   return event.amount && event.currency
     ? `${compactNumber(event.amount)} ${event.currency}`
     : event.code || event.name || '账户事件'
@@ -115,6 +121,7 @@ export default function Ledger() {
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [reversingId, setReversingId] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [listening, setListening] = useState(false)
   const [error, setError] = useState('')
@@ -255,6 +262,30 @@ export default function Ledger() {
   const queryAsOf = async () => {
     await refreshAll(asOf || undefined)
     setNotice(asOf ? `正在显示 ${asOf} 日终的账本状态。` : '已恢复显示当前账本状态。')
+  }
+
+
+  const previewReversal = async (event: LedgerEvent) => {
+    if (event.event_type === 'REVERSAL' || event.is_reversed) return
+    const reason = window.prompt(
+      '冲销不会删除原记录，而是新增一条 REVERSAL 审计事件。可填写原因（可留空）：',
+      '',
+    )
+    if (reason === null) return
+
+    setReversingId(event.transaction_id)
+    setError('')
+    setNotice('')
+    try {
+      const result = await ledgerService.previewReverse(event.transaction_id, reason.trim())
+      setPending(result)
+      setNotice('已生成冲销确认卡。原交易尚未改变；请核对后再确认写入。')
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    } catch (err) {
+      setError(getApiErrorMessage(err))
+    } finally {
+      setReversingId('')
+    }
   }
 
   return (
@@ -560,7 +591,9 @@ export default function Ledger() {
           {filteredTransactions.map((event) => (
             <div
               key={event.transaction_id}
-              className="grid gap-2 rounded-lg border border-slate-700 bg-slate-900/60 p-3 md:grid-cols-[190px_110px_130px_1fr]"
+              className={`grid gap-2 rounded-lg border border-slate-700 bg-slate-900/60 p-3 md:grid-cols-[190px_110px_130px_1fr_auto] ${
+                event.is_reversed ? 'opacity-60' : ''
+              }`}
             >
               <div className="text-xs text-slate-400">{displayTime(event.effective_at)}</div>
               <div>
@@ -571,7 +604,27 @@ export default function Ledger() {
                 </span>
               </div>
               <div className="text-sm font-medium text-slate-200">{event.account}</div>
-              <div className="text-sm text-slate-300">{eventDescription(event)}</div>
+              <div className="text-sm text-slate-300">
+                {eventDescription(event)}
+                {event.is_reversed && (
+                  <span className="ml-2 rounded border border-slate-600 px-1.5 py-0.5 text-[11px] text-slate-400">
+                    已冲销
+                  </span>
+                )}
+              </div>
+              <div className="flex justify-end">
+                {event.event_type !== 'REVERSAL' && !event.is_reversed ? (
+                  <button
+                    type="button"
+                    onClick={() => void previewReversal(event)}
+                    disabled={Boolean(reversingId)}
+                    className="flex items-center gap-1 rounded border border-slate-600 px-2 py-1 text-xs text-slate-400 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40"
+                  >
+                    <Undo2 className="h-3.5 w-3.5" />
+                    {reversingId === event.transaction_id ? '检查中…' : '冲销'}
+                  </button>
+                ) : null}
+              </div>
             </div>
           ))}
           {!filteredTransactions.length && (

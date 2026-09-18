@@ -191,6 +191,56 @@ class LedgerApiTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
 
+    def test_reverse_sell_preview_confirm_restores_position(self):
+        rows = self.repo.list_transactions()
+        sell_id = next(tx.transaction_id for tx in rows if tx.event_type == TransactionType.SELL)
+        preview = self.client.post(
+            f"/api/ledger-v3/reverse/{sell_id}/preview", json={"reason": "录错了卖出"}
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+        pending_id = preview.json()["pending_id"]
+
+        confirmed = self.client.post(f"/api/ledger-v3/confirm/{pending_id}")
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(len(self.repo.list_transactions()), 3)
+        pos = confirmed.json()["projected_state"]["positions"][0]
+        self.assertEqual(pos["quantity"], "2")
+        self.assertEqual(pos["realized_pnl"], "0")
+
+        history = self.client.get("/api/ledger-v3/transactions").json()["transactions"]
+        target = next(item for item in history if item["transaction_id"] == sell_id)
+        reversal = next(item for item in history if item["event_type"] == "REVERSAL")
+        self.assertTrue(target["is_reversed"])
+        self.assertEqual(target["reversed_by"], reversal["transaction_id"])
+
+    def test_reverse_buy_is_rejected_if_later_sell_would_be_invalid(self):
+        rows = self.repo.list_transactions()
+        buy_id = next(tx.transaction_id for tx in rows if tx.event_type == TransactionType.BUY)
+        response = self.client.post(
+            f"/api/ledger-v3/reverse/{buy_id}/preview", json={"reason": "尝试冲销"}
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_reverse_missing_transaction_returns_404(self):
+        response = self.client.post(
+            "/api/ledger-v3/reverse/not-found/preview", json={"reason": "test"}
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_reversal_cannot_be_reversed_again(self):
+        rows = self.repo.list_transactions()
+        sell_id = next(tx.transaction_id for tx in rows if tx.event_type == TransactionType.SELL)
+        preview = self.client.post(f"/api/ledger-v3/reverse/{sell_id}/preview", json={})
+        pending_id = preview.json()["pending_id"]
+        self.client.post(f"/api/ledger-v3/confirm/{pending_id}")
+        reversal = next(tx for tx in self.repo.list_transactions() if tx.event_type == TransactionType.REVERSAL)
+        response = self.client.post(
+            f"/api/ledger-v3/reverse/{reversal.transaction_id}/preview", json={}
+        )
+        self.assertEqual(response.status_code, 409)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,11 @@ class LedgerTextPreviewRequest(BaseModel):
     ttl_seconds: int = Field(default=1800, ge=30, le=3600)
 
 
+class LedgerReverseRequest(BaseModel):
+    reason: str = Field(default="", max_length=1000)
+    ttl_seconds: int = Field(default=1800, ge=30, le=3600)
+
+
 def get_repository() -> TransactionRepository:
     return TransactionRepository(Path("data") / "ledger.sqlite3")
 
@@ -73,7 +78,7 @@ def _decimal_text(value):
     return None if value is None else str(value)
 
 
-def _transaction_payload(tx):
+def _transaction_payload(tx, *, is_reversed: bool = False, reversed_by: Optional[str] = None):
     return {
         "transaction_id": tx.transaction_id,
         "event_type": tx.event_type.value,
@@ -96,6 +101,8 @@ def _transaction_payload(tx):
         "external_trade_id": tx.external_trade_id,
         "reverses_transaction_id": tx.reverses_transaction_id,
         "metadata": tx.metadata,
+        "is_reversed": is_reversed,
+        "reversed_by": reversed_by,
     }
 
 
@@ -122,6 +129,7 @@ def _state_payload(state):
         "positions": positions,
         "cash_accounts": cash,
         "applied_transactions": len(state.applied_transaction_ids),
+        "reversed_transaction_ids": list(state.reversed_transaction_ids),
     }
 
 
@@ -154,9 +162,22 @@ async def list_transactions(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    all_rows = get_repository().list_transactions()
+    reversed_by = {
+        str(tx.reverses_transaction_id): tx.transaction_id
+        for tx in all_rows
+        if tx.event_type == TransactionType.REVERSAL and tx.reverses_transaction_id
+    }
     return {
         "count": len(rows),
-        "transactions": [_transaction_payload(tx) for tx in rows],
+        "transactions": [
+            _transaction_payload(
+                tx,
+                is_reversed=tx.transaction_id in reversed_by,
+                reversed_by=reversed_by.get(tx.transaction_id),
+            )
+            for tx in rows
+        ],
     }
 
 
@@ -261,6 +282,46 @@ async def preview_text(request: LedgerTextPreviewRequest):
                 for item in interpreted.clauses
             ],
         },
+    }
+
+
+@router.post("/reverse/{transaction_id}/preview")
+async def preview_reversal(transaction_id: str, request: LedgerReverseRequest):
+    repository = get_repository()
+    target = repository.get(transaction_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="transaction not found")
+    if target.event_type == TransactionType.REVERSAL:
+        raise HTTPException(status_code=409, detail="reversal of a reversal is not supported")
+
+    reversal = Transaction(
+        event_type=TransactionType.REVERSAL,
+        effective_at=target.effective_at,
+        account=target.account,
+        source="manual",
+        note=request.reason.strip(),
+        reverses_transaction_id=target.transaction_id,
+        metadata={
+            "target_event_type": target.event_type.value,
+            "target_code": target.code,
+            "target_effective_at": str(target.effective_at),
+        },
+    ).validated()
+    try:
+        pending = LedgerWriteService(repository).create_pending(
+            [reversal], ttl_seconds=request.ttl_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "pending_id": pending["pending_id"],
+        "status": pending["status"],
+        "created_at": pending["created_at"],
+        "expires_at": pending["expires_at"],
+        "historical_backfill": pending["historical_backfill"],
+        "events": [_transaction_payload(tx) for tx in pending["events"]],
+        "projected_state": _state_payload(pending["projected_state"]),
     }
 
 

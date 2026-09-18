@@ -94,6 +94,46 @@ class TransactionReplayTest(unittest.TestCase):
         self.assertEqual(state.get_cash("长桥", "HKD"), Decimal("500"))
         self.assertEqual(state.get_cash("长桥", "USD"), Decimal("73"))
 
+    def test_reversal_removes_target_effect_but_keeps_audit_id(self):
+        buy_event = tx(TransactionType.BUY, "2025-01-01", code="AAPL", currency="USD", quantity=2, price=100)
+        sell_event = tx(TransactionType.SELL, "2025-02-01", code="AAPL", currency="USD", quantity=1, price=150)
+        reversal = tx(
+            TransactionType.REVERSAL, "2025-02-01",
+            reverses_transaction_id=sell_event.transaction_id,
+        )
+        state = replay_transactions([buy_event, sell_event, reversal])
+        pos = state.get_position("长桥", "AAPL", "USD")
+        self.assertEqual(pos.quantity, Decimal("2"))
+        self.assertEqual(state.get_realized_pnl("长桥", "AAPL", "USD"), Decimal("0"))
+        self.assertIn(sell_event.transaction_id, state.reversed_transaction_ids)
+        self.assertEqual(len(state.applied_transaction_ids), 3)
+
+    def test_reversing_buy_fails_if_later_sell_would_become_invalid(self):
+        buy_event = tx(TransactionType.BUY, "2025-01-01", code="AAPL", currency="USD", quantity=2, price=100)
+        sell_event = tx(TransactionType.SELL, "2025-02-01", code="AAPL", currency="USD", quantity=1, price=150)
+        reversal = tx(
+            TransactionType.REVERSAL, "2025-01-01",
+            reverses_transaction_id=buy_event.transaction_id,
+        )
+        with self.assertRaises(ReplayError):
+            replay_transactions([buy_event, sell_event, reversal])
+
+    def test_duplicate_reversal_is_rejected(self):
+        buy_event = tx(TransactionType.BUY, "2025-01-01", code="AAPL", currency="USD", quantity=1, price=100)
+        reversal_a = tx(TransactionType.REVERSAL, "2025-01-01", reverses_transaction_id=buy_event.transaction_id)
+        reversal_b = tx(TransactionType.REVERSAL, "2025-01-01", reverses_transaction_id=buy_event.transaction_id)
+        with self.assertRaisesRegex(ReplayError, "already reversed"):
+            replay_transactions([buy_event, reversal_a, reversal_b])
+
+    def test_reversal_respects_its_own_effective_date_for_as_of_queries(self):
+        buy_event = tx(TransactionType.BUY, "2025-01-01", code="AAPL", currency="USD", quantity=2, price=100)
+        sell_event = tx(TransactionType.SELL, "2025-02-01", code="AAPL", currency="USD", quantity=1, price=150)
+        reversal = tx(TransactionType.REVERSAL, "2025-03-01", reverses_transaction_id=sell_event.transaction_id)
+        feb = replay_transactions([buy_event, sell_event, reversal], as_of="2025-02-28")
+        mar = replay_transactions([buy_event, sell_event, reversal], as_of="2025-03-01")
+        self.assertEqual(feb.get_position("长桥", "AAPL", "USD").quantity, Decimal("1"))
+        self.assertEqual(mar.get_position("长桥", "AAPL", "USD").quantity, Decimal("2"))
+
     def test_unimplemented_corporate_action_fails_explicitly(self):
         with self.assertRaisesRegex(ReplayError, "not replayable yet"):
             replay_transactions([

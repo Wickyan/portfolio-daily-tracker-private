@@ -37,6 +37,7 @@ class ReplayState:
     realized_pnl: Dict[PositionKey, Decimal] = field(default_factory=dict)
     dividend_income: Dict[PositionKey, Decimal] = field(default_factory=dict)
     applied_transaction_ids: List[str] = field(default_factory=list)
+    reversed_transaction_ids: List[str] = field(default_factory=list)
 
     def get_position(self, account: str, code: str, currency: str) -> Optional[PositionState]:
         return self.positions.get((account, code.upper(), currency.upper()))
@@ -106,8 +107,7 @@ def replay_transactions(
             raise ValueError("as_of must be ISO date/datetime") from exc
         date_only_cutoff = as_of_raw
     instant_cutoff = _as_of_timestamp(as_of_raw) if as_of_raw and not date_only_cutoff else None
-    state = ReplayState()
-
+    included: List[Transaction] = []
     for tx in validated:
         if date_only_cutoff is not None:
             # A date query means the reported/local calendar date, not the UTC
@@ -117,8 +117,38 @@ def replay_transactions(
                 continue
         elif instant_cutoff is not None and _sort_timestamp(str(tx.effective_at)) > instant_cutoff:
             continue
+        included.append(tx)
+
+    by_id = {tx.transaction_id: tx for tx in included}
+    if len(by_id) != len(included):
+        raise ReplayError("duplicate transaction_id in replay input")
+
+    reversed_ids = set()
+    for tx in included:
+        if tx.event_type != TransactionType.REVERSAL:
+            continue
+        target_id = str(tx.reverses_transaction_id or "")
+        if target_id == tx.transaction_id:
+            raise ReplayError("reversal cannot target itself")
+        target = by_id.get(target_id)
+        if target is None:
+            raise ReplayError(f"reversal target not found: {target_id}")
+        if target.event_type == TransactionType.REVERSAL:
+            raise ReplayError("reversal of a reversal is not supported")
+        if target_id in reversed_ids:
+            raise ReplayError(f"transaction already reversed: {target_id}")
+        reversed_ids.add(target_id)
+
+    state = ReplayState(
+        applied_transaction_ids=[tx.transaction_id for tx in included],
+        reversed_transaction_ids=sorted(reversed_ids),
+    )
+    for tx in included:
+        if tx.event_type == TransactionType.REVERSAL:
+            continue
+        if tx.transaction_id in reversed_ids:
+            continue
         _apply_transaction(state, tx)
-        state.applied_transaction_ids.append(tx.transaction_id)
     return state
 
 

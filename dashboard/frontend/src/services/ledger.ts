@@ -20,6 +20,9 @@ export interface LedgerEvent {
   source: string
   note: string
   external_trade_id?: string | null
+  reverses_transaction_id?: string | null
+  is_reversed?: boolean
+  reversed_by?: string | null
   metadata?: Record<string, unknown>
 }
 
@@ -46,6 +49,7 @@ export interface LedgerState {
   positions: LedgerPosition[]
   cash_accounts: LedgerCash[]
   applied_transactions: number
+  reversed_transaction_ids?: string[]
 }
 
 export interface LedgerClause {
@@ -132,6 +136,18 @@ export const ledgerService = {
         source,
         reference_time: referenceTime,
       },
+      { timeout: 30000 },
+    )
+    return response.data
+  },
+
+  async previewReverse(
+    transactionId: string,
+    reason = '',
+  ): Promise<LedgerPreview> {
+    const response = await api.post<LedgerPreview>(
+      `/ledger-v3/reverse/${encodeURIComponent(transactionId)}/preview`,
+      { reason },
       { timeout: 30000 },
     )
     return response.data

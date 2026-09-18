@@ -179,3 +179,13 @@ Important safeguards:
 - Client reference_time must include a timezone offset when supplied, allowing relative dates such as 今天/昨天 to be resolved in the user's local time.
 
 Text and voice transcripts use the same preview path; neither can bypass server-side pending confirmation.
+
+## Reversal / correction checkpoint
+
+Confirmed ledger events are never physically deleted. A correction starts by previewing a REVERSAL event against the full current history and then uses the same server-side pending confirmation flow.
+
+- A reversed target stays visible in the transaction timeline and is marked is_reversed/reversed_by.
+- REVERSAL takes effect at the original target's effective time while retaining its own later entered_at audit timestamp.
+- Reversing an event is rejected if removing its economic effect would make later history invalid (for example, a later SELL would become an oversell).
+- A REVERSAL cannot itself be reversed, and the same transaction cannot be reversed twice.
+- The frontend exposes a two-step 冲销 action: preview first, confirm second.
