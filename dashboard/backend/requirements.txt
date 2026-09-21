@@ -11,3 +11,5 @@ requests>=2.31.0
 python-multipart>=0.0.9
 
 pypinyin>=0.53.0
+
+rapidocr_onnxruntime==1.4.4

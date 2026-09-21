@@ -12,6 +12,7 @@ services:
       - ./dashboard/config.json:/app/config.json
     environment:
       - PORTFOLIO_DIR=/app/portfolio
+      - VISION_PROXY_URL=${VISION_PROXY_URL:-http://10.26.64.42:21982}
     restart: unless-stopped
 
   # Portfolio Dashboard Frontend (React + Vite)

@@ -242,6 +242,25 @@ class TransactionRepository:
                 raise ValueError(f"duplicate pending_id: {pending_id}") from exc
         return self.get_pending_batch(pending_id)
 
+    def list_active_pending_transactions(self) -> List[Transaction]:
+        """Return events from non-expired pending batches for deduplication."""
+        self.initialize()
+        now = datetime.now(timezone.utc)
+        events: List[Transaction] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT expires_at, events_json FROM pending_batches WHERE status = 'pending'"
+            ).fetchall()
+        for row in rows:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if now > expires_at.astimezone(timezone.utc):
+                continue
+            for item in json.loads(row["events_json"] or "[]"):
+                events.append(_transaction_from_json_payload(item))
+        return events
+
     def get_pending_batch(self, pending_id: str) -> Optional[Dict]:
         self.initialize()
         with self._connect() as conn:

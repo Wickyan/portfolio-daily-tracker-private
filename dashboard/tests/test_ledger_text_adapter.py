@@ -61,6 +61,34 @@ class HistoricalTextAdapterTest(unittest.TestCase):
         self.assertEqual(second.quantity, Decimal('3'))
         self.assertEqual(second.price, Decimal('92'))
 
+    def test_total_trade_amount_is_divided_by_quantity(self):
+        result = parse_historical_bookkeeping_text(
+            '去年3月12号在长桥买了2股英伟达，总共175美元',
+            reference=REF,
+        )
+        event = result.events[0]
+        self.assertEqual(event.price, Decimal('87.5'))
+        self.assertEqual(event.quantity, Decimal('2'))
+        self.assertTrue(any('总成交金额' in warning for warning in result.warnings))
+
+    def test_total_trade_amount_keeps_fee_separate(self):
+        result = parse_historical_bookkeeping_text(
+            '去年3月12号在长桥买了2股英伟达，总共175美元，手续费1美元',
+            reference=REF,
+        )
+        event = result.events[0]
+        self.assertEqual(event.price, Decimal('87.5'))
+        self.assertEqual(event.fee, Decimal('1'))
+
+    def test_explicit_per_share_price_wins_over_other_money(self):
+        result = parse_historical_bookkeeping_text(
+            '去年3月12号在长桥买了2股英伟达，87.5美元一股，手续费1美元',
+            reference=REF,
+        )
+        event = result.events[0]
+        self.assertEqual(event.price, Decimal('87.5'))
+        self.assertEqual(event.fee, Decimal('1'))
+
     def test_sell_without_explicit_or_inherited_account_fails(self):
         with self.assertRaisesRegex(ValueError, '缺少字段|缺少账户'):
             parse_historical_bookkeeping_text(

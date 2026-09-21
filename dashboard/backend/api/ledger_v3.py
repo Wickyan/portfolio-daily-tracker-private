@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.ledger import (
@@ -18,6 +18,10 @@ from backend.ledger import (
     parse_historical_bookkeeping_text,
     replay_state_to_portfolio,
     replay_transactions,
+    ScreenshotLedgerExtractor,
+    create_configured_vision_providers,
+    create_local_ocr_fallback,
+    transaction_fingerprint_key,
 )
 
 
@@ -283,6 +287,139 @@ async def preview_text(request: LedgerTextPreviewRequest):
             ],
         },
     }
+
+
+def _screenshot_candidate_payload(candidate):
+    return {
+        "event": _transaction_payload(candidate.event) if candidate.event is not None else None,
+        "raw": candidate.raw,
+        "warnings": list(candidate.warnings),
+        "missing_fields": list(candidate.missing_fields),
+        "duplicate_reason": candidate.duplicate_reason,
+    }
+
+
+@router.post("/preview-screenshots")
+async def preview_screenshots(
+    images: List[UploadFile] = File(...),
+    account_hint: str = Form(""),
+    ttl_seconds: int = Form(1800),
+):
+    if not images:
+        raise HTTPException(status_code=400, detail="至少需要一张截图")
+    if len(images) > 12:
+        raise HTTPException(status_code=400, detail="一次最多上传12张截图")
+    if ttl_seconds < 30 or ttl_seconds > 3600:
+        raise HTTPException(status_code=400, detail="ttl_seconds must be between 30 and 3600")
+
+    payloads = []
+    total_bytes = 0
+    for image in images:
+        if image.content_type and not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"{image.filename or 'file'} 不是图片")
+        content = await image.read()
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{image.filename or 'file'} 超过单张50MB限制",
+            )
+        total_bytes += len(content)
+        if total_bytes > 150 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="本次截图总大小超过150MB")
+        payloads.append((image.filename or "screenshot", content))
+
+    vision = []
+    vision_error = None
+    try:
+        vision = create_configured_vision_providers()
+    except RuntimeError as exc:
+        vision_error = str(exc)
+
+    ocr_fallback = None
+    ocr_error = None
+    try:
+        ocr_fallback = create_local_ocr_fallback()
+    except RuntimeError as exc:
+        ocr_error = str(exc)
+
+    if not vision and ocr_fallback is None:
+        detail = "截图识别能力不可用"
+        if vision_error:
+            detail += f"；视觉模型: {vision_error}"
+        if ocr_error:
+            detail += f"；本地OCR: {ocr_error}"
+        raise HTTPException(status_code=503, detail=detail)
+
+    repository = get_repository()
+    existing_rows = repository.list_transactions()
+    pending_rows = repository.list_active_pending_transactions()
+    all_existing_rows = [*existing_rows, *pending_rows]
+    existing_keys = {
+        (tx.account, str(tx.external_trade_id))
+        for tx in all_existing_rows
+        if tx.external_trade_id
+    }
+    existing_fingerprint_keys = {
+        (tx.account, transaction_fingerprint_key(tx))
+        for tx in all_existing_rows
+        if not tx.external_trade_id
+    }
+
+    extractor = ScreenshotLedgerExtractor(vision, ocr_fallback=ocr_fallback)
+    try:
+        result = await extractor.extract(
+            payloads,
+            account_hint=account_hint.strip(),
+            existing_external_keys=existing_keys,
+            existing_fingerprint_keys=existing_fingerprint_keys,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"截图识别失败: {exc}") from exc
+
+    pending = None
+    if result.events:
+        try:
+            pending = get_write_service().create_pending(
+                result.events,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if pending is not None:
+        response = {
+            "pending_id": pending["pending_id"],
+            "status": pending["status"],
+            "created_at": pending["created_at"],
+            "expires_at": pending["expires_at"],
+            "historical_backfill": pending["historical_backfill"],
+            "events": [_transaction_payload(tx) for tx in pending["events"]],
+            "projected_state": _state_payload(pending["projected_state"]),
+        }
+    else:
+        current_state = replay_transactions(existing_rows)
+        response = {
+            "pending_id": None,
+            "status": "no_new_events",
+            "created_at": None,
+            "expires_at": None,
+            "historical_backfill": False,
+            "events": [],
+            "projected_state": _state_payload(current_state),
+        }
+
+    response["extraction"] = {
+        "model": result.model_label,
+        "images": result.image_summaries,
+        "warnings": result.warnings,
+        "duplicate_count": len(result.duplicates),
+        "duplicates": [_screenshot_candidate_payload(item) for item in result.duplicates],
+        "unresolved_count": len(result.unresolved),
+        "unresolved": [_screenshot_candidate_payload(item) for item in result.unresolved],
+    }
+    return response
 
 
 @router.post("/reverse/{transaction_id}/preview")

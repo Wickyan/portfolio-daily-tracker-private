@@ -1,12 +1,52 @@
 import tempfile
+import json
+from io import BytesIO
 import unittest
 from pathlib import Path
 
 from fastapi import FastAPI
+from PIL import Image
 from fastapi.testclient import TestClient
 
 from backend.api import ledger_v3
 from backend.ledger import Transaction, TransactionRepository, TransactionType
+from backend.ledger.screenshot import VisionProviderSpec
+from core.llm.base import LLMResponse
+
+
+class FakeScreenshotVisionProvider:
+    async def chat(self, messages, **kwargs):
+        return LLMResponse(
+            content=json.dumps({
+                "rows": [{
+                    "event_type": "BUY",
+                    "effective_at": "2025-03-12T10:30:00+08:00",
+                    "account": "IBKR",
+                    "code": "NVDA",
+                    "name": "NVIDIA",
+                    "currency": "USD",
+                    "quantity": "2",
+                    "price": "87.5",
+                    "fee": "1",
+                    "tax": "0",
+                    "order_id": "SCREEN-ORDER-1",
+                    "status": "已成交",
+                    "confidence": 0.99,
+                    "raw_text": "NVDA 2 @ 87.5"
+                }],
+                "warnings": [],
+            }, ensure_ascii=False),
+            model="fake",
+            usage={"prompt_tokens": 0, "completion_tokens": 0},
+            finish_reason="stop",
+        )
+
+
+def screenshot_bytes():
+    image = Image.new("RGB", (800, 1000), "white")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 class LedgerApiTest(unittest.TestCase):
@@ -36,13 +76,21 @@ class LedgerApiTest(unittest.TestCase):
             ),
         ])
         self.original_get_repository = ledger_v3.get_repository
+        self.original_create_vision = ledger_v3.create_configured_vision_providers
         ledger_v3.get_repository = lambda: self.repo
+        ledger_v3.create_configured_vision_providers = lambda: [VisionProviderSpec(
+            provider=FakeScreenshotVisionProvider(),
+            family="openai",
+            model="fake",
+            label="fake vision",
+        )]
         app = FastAPI()
         app.include_router(ledger_v3.router, prefix="/api/ledger-v3")
         self.client = TestClient(app)
 
     def tearDown(self):
         ledger_v3.get_repository = self.original_get_repository
+        ledger_v3.create_configured_vision_providers = self.original_create_vision
         self.tmp.cleanup()
 
     def test_transactions_return_exact_decimal_strings(self):
@@ -190,6 +238,42 @@ class LedgerApiTest(unittest.TestCase):
             "reference_time": "2026-09-18T10:00:00",
         })
         self.assertEqual(response.status_code, 400)
+
+    def test_screenshot_preview_creates_pending_without_writing(self):
+        response = self.client.post(
+            "/api/ledger-v3/preview-screenshots",
+            files={"images": ("orders.png", screenshot_bytes(), "image/png")},
+            data={"account_hint": "IBKR"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(len(body["events"]), 1)
+        self.assertEqual(body["events"][0]["code"], "NVDA")
+        self.assertEqual(body["events"][0]["source"], "screenshot")
+        self.assertEqual(body["extraction"]["duplicate_count"], 0)
+        self.assertEqual(len(self.repo.list_transactions()), 2)
+
+    def test_same_screenshot_order_is_deduped_against_pending(self):
+        first = self.client.post(
+            "/api/ledger-v3/preview-screenshots",
+            files={"images": ("orders.png", screenshot_bytes(), "image/png")},
+            data={"account_hint": "IBKR"},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post(
+            "/api/ledger-v3/preview-screenshots",
+            files={"images": ("orders-again.png", screenshot_bytes(), "image/png")},
+            data={"account_hint": "IBKR"},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        body = second.json()
+        self.assertIsNone(body["pending_id"])
+        self.assertEqual(body["status"], "no_new_events")
+        self.assertEqual(body["extraction"]["duplicate_count"], 1)
+        self.assertEqual(
+            body["extraction"]["duplicates"][0]["duplicate_reason"],
+            "already_in_ledger_or_pending",
+        )
 
     def test_reverse_sell_preview_confirm_restores_position(self):
         rows = self.repo.list_transactions()

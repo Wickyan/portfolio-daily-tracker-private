@@ -75,6 +75,42 @@ export interface LedgerPreview {
   }
 }
 
+export interface ScreenshotExtractionCandidate {
+  event?: LedgerEvent | null
+  raw: Record<string, unknown>
+  warnings: string[]
+  missing_fields: string[]
+  duplicate_reason?: string | null
+}
+
+export interface ScreenshotImageSummary {
+  filename: string
+  sha256: string
+  width: number
+  height: number
+  tile_count: number
+  raw_rows: number
+}
+
+export interface LedgerScreenshotPreview {
+  pending_id: string | null
+  status: string
+  created_at?: string | null
+  expires_at?: string | null
+  historical_backfill: boolean
+  events: LedgerEvent[]
+  projected_state: LedgerState
+  extraction: {
+    model: string
+    images: ScreenshotImageSummary[]
+    warnings: string[]
+    duplicate_count: number
+    duplicates: ScreenshotExtractionCandidate[]
+    unresolved_count: number
+    unresolved: ScreenshotExtractionCandidate[]
+  }
+}
+
 export interface LedgerTransactionsResponse {
   count: number
   transactions: LedgerEvent[]
@@ -137,6 +173,21 @@ export const ledgerService = {
         reference_time: referenceTime,
       },
       { timeout: 30000 },
+    )
+    return response.data
+  },
+
+  async previewScreenshots(
+    images: File[],
+    accountHint = '',
+  ): Promise<LedgerScreenshotPreview> {
+    const form = new FormData()
+    images.forEach((image) => form.append('images', image))
+    if (accountHint.trim()) form.append('account_hint', accountHint.trim())
+    const response = await api.post<LedgerScreenshotPreview>(
+      '/ledger-v3/preview-screenshots',
+      form,
+      { timeout: 180000 },
     )
     return response.data
   },

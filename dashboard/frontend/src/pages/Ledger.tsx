@@ -5,11 +5,13 @@ import {
   CheckCircle2,
   Clock3,
   History,
+  ImagePlus,
   Mic,
   MicOff,
   RefreshCw,
   Search,
   Send,
+  Trash2,
   Undo2,
   WalletCards,
 } from 'lucide-react'
@@ -18,6 +20,7 @@ import { getApiErrorMessage } from '@/services/api'
 import ledgerService, {
   type LedgerEvent,
   type LedgerPreview,
+  type LedgerScreenshotPreview,
   type LedgerState,
 } from '@/services/ledger'
 
@@ -126,7 +129,12 @@ export default function Ledger() {
   const [listening, setListening] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [screenshotFiles, setScreenshotFiles] = useState<File[]>([])
+  const [screenshotAccount, setScreenshotAccount] = useState('')
+  const [screenshotLoading, setScreenshotLoading] = useState(false)
+  const [screenshotResult, setScreenshotResult] = useState<LedgerScreenshotPreview | null>(null)
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
+  const screenshotInputRef = useRef<HTMLInputElement | null>(null)
 
   const refreshAll = async (stateDate?: string) => {
     setRefreshing(true)
@@ -209,6 +217,75 @@ export default function Ledger() {
     setListening(false)
   }
 
+  const addScreenshotFiles = (incoming: File[]) => {
+    const valid = incoming.filter((file) => {
+      const looksLikeImage =
+        file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name)
+      return looksLikeImage && file.size <= 50 * 1024 * 1024
+    })
+    const rejected = incoming.length - valid.length
+    setScreenshotFiles((current) => {
+      const seen = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`))
+      const next = [...current]
+      for (const file of valid) {
+        const key = `${file.name}:${file.size}:${file.lastModified}`
+        if (!seen.has(key) && next.length < 12) {
+          seen.add(key)
+          next.push(file)
+        }
+      }
+      return next
+    })
+    setScreenshotResult(null)
+    if (rejected > 0) {
+      setError(`有 ${rejected} 个文件不是支持的图片或超过单张50MB限制。`)
+    } else if (incoming.length > 12) {
+      setError('一次最多选择12张截图。')
+    } else {
+      setError('')
+    }
+  }
+
+  const previewScreenshotInput = async () => {
+    if (!screenshotFiles.length) {
+      setError('请先选择至少一张订单截图。')
+      return
+    }
+    setScreenshotLoading(true)
+    setError('')
+    setNotice('')
+    try {
+      const result = await ledgerService.previewScreenshots(
+        screenshotFiles,
+        screenshotAccount,
+      )
+      setScreenshotResult(result)
+      if (result.pending_id && result.created_at && result.expires_at) {
+        setPending({
+          pending_id: result.pending_id,
+          status: result.status,
+          created_at: result.created_at,
+          expires_at: result.expires_at,
+          historical_backfill: result.historical_backfill,
+          events: result.events,
+          projected_state: result.projected_state,
+        })
+        setNotice(
+          `截图识别出 ${result.events.length} 条新订单；已去重 ${result.extraction.duplicate_count} 条，无法确定 ${result.extraction.unresolved_count} 条。请核对确认卡后再写入。`,
+        )
+      } else if (result.extraction.duplicate_count > 0 && result.extraction.unresolved_count === 0) {
+        setNotice('截图中的订单都已存在于账本/待确认记录中，没有生成新的确认卡。')
+      } else {
+        setNotice('没有生成可写入的新订单；请查看下方无法确定字段或去重结果。')
+      }
+    } catch (err) {
+      setScreenshotResult(null)
+      setError(getApiErrorMessage(err))
+    } finally {
+      setScreenshotLoading(false)
+    }
+  }
+
   const previewInput = async () => {
     if (!input.trim()) {
       setError('请先输入或说出一条交易记录。')
@@ -239,6 +316,7 @@ export default function Ledger() {
 
   const confirmPending = async () => {
     if (!pending) return
+    const confirmingScreenshot = pending.events.some((event) => event.source === 'screenshot')
     setConfirming(true)
     setError('')
     try {
@@ -251,6 +329,10 @@ export default function Ledger() {
       setPending(null)
       setInput('')
       setInputSource('text')
+      if (confirmingScreenshot) {
+        setScreenshotFiles([])
+        setScreenshotResult(null)
+      }
       await refreshAll(asOf || undefined)
     } catch (err) {
       setError(getApiErrorMessage(err))
@@ -383,6 +465,217 @@ export default function Ledger() {
             清空
           </button>
         </div>
+      </section>
+
+      <section
+        className="rounded-xl border border-slate-700 bg-slate-800 p-5"
+        tabIndex={0}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => {
+          event.preventDefault()
+          addScreenshotFiles(Array.from(event.dataTransfer.files))
+        }}
+        onPaste={(event) => {
+          const files = Array.from(event.clipboardData.files)
+          if (files.length) addScreenshotFiles(files)
+        }}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 font-semibold text-white">
+              <ImagePlus className="h-5 w-5 text-primary-400" />
+              历史订单截图导入
+            </h2>
+            <p className="mt-1 text-xs text-slate-400">
+              支持短截图、超长截图和多张截图。长图会自动重叠切片；相同订单会在切片、多图、待确认和已确认账本之间去重。
+            </p>
+          </div>
+          <span className="rounded-full border border-slate-600 bg-slate-900 px-2.5 py-1 text-xs text-slate-400">
+            最多12张 · 单张50MB
+          </span>
+        </div>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_260px]">
+          <div
+            className="rounded-lg border border-dashed border-slate-600 bg-slate-900/60 p-5 text-center"
+          >
+            <input
+              ref={screenshotInputRef}
+              type="file"
+              multiple
+              accept="image/png,image/jpeg,image/webp,image/*"
+              className="hidden"
+              onChange={(event) => {
+                addScreenshotFiles(Array.from(event.target.files || []))
+                event.target.value = ''
+              }}
+            />
+            <ImagePlus className="mx-auto h-8 w-8 text-slate-500" />
+            <div className="mt-2 text-sm text-slate-300">拖进来、粘贴截图，或选择图片</div>
+            <div className="mt-1 text-xs text-slate-500">PNG / JPEG / WebP；超长图无需手工裁剪</div>
+            <button
+              type="button"
+              onClick={() => screenshotInputRef.current?.click()}
+              className="mt-3 rounded-lg border border-slate-600 bg-slate-700 px-3 py-2 text-sm text-slate-100 hover:bg-slate-600"
+            >
+              选择截图
+            </button>
+          </div>
+
+          <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-4">
+            <label className="text-xs font-medium text-slate-300">账户提示（可选）</label>
+            <input
+              value={screenshotAccount}
+              onChange={(event) => setScreenshotAccount(event.target.value)}
+              placeholder="如：长桥 / IBKR"
+              className="mt-2 w-full rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary-500"
+            />
+            <p className="mt-2 text-[11px] leading-5 text-slate-500">
+              截图本身看不出账户时才使用；截图能明确读到账户时，以截图内容为准。
+            </p>
+          </div>
+        </div>
+
+        {screenshotFiles.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {screenshotFiles.map((file, index) => (
+              <div
+                key={`${file.name}-${file.size}-${file.lastModified}`}
+                className="flex items-center justify-between gap-3 rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2"
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-sm text-slate-200">
+                    {index + 1}. {file.name}
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    {(file.size / 1024 / 1024).toFixed(2)} MB
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScreenshotFiles((files) => files.filter((_, itemIndex) => itemIndex !== index))
+                    setScreenshotResult(null)
+                  }}
+                  className="rounded p-1.5 text-slate-500 hover:bg-slate-700 hover:text-rose-300"
+                  aria-label="移除截图"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => void previewScreenshotInput()}
+            disabled={screenshotLoading || screenshotFiles.length === 0}
+            className="flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <ImagePlus className="h-4 w-4" />
+            {screenshotLoading ? '正在切图并识别…' : `识别 ${screenshotFiles.length || ''} 张截图`}
+          </button>
+          {screenshotFiles.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setScreenshotFiles([])
+                setScreenshotResult(null)
+              }}
+              disabled={screenshotLoading}
+              className="rounded-lg px-3 py-2 text-sm text-slate-400 hover:bg-slate-700 hover:text-slate-200 disabled:opacity-50"
+            >
+              清空截图
+            </button>
+          )}
+        </div>
+
+        {screenshotResult && (
+          <div className="mt-5 space-y-3">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
+                <div className="text-xs text-emerald-300">新订单</div>
+                <div className="mt-1 text-xl font-semibold text-white">{screenshotResult.events.length}</div>
+              </div>
+              <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3">
+                <div className="text-xs text-sky-300">自动去重 / 非成交</div>
+                <div className="mt-1 text-xl font-semibold text-white">
+                  {screenshotResult.extraction.duplicate_count}
+                </div>
+              </div>
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                <div className="text-xs text-amber-300">字段不完整</div>
+                <div className="mt-1 text-xl font-semibold text-white">
+                  {screenshotResult.extraction.unresolved_count}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-400">
+              <div>识别方式：{screenshotResult.extraction.model}</div>
+              {screenshotResult.extraction.images.map((image) => (
+                <div key={image.sha256} className="mt-1">
+                  {image.filename} · {image.width}×{image.height} · {image.tile_count} 个切片 ·
+                  识别原始行 {image.raw_rows}
+                </div>
+              ))}
+            </div>
+
+            {screenshotResult.extraction.warnings.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                <div className="text-xs font-medium text-amber-200">截图识别提醒</div>
+                <div className="mt-2 space-y-1">
+                  {Array.from(new Set(screenshotResult.extraction.warnings)).slice(0, 30).map((warning) => (
+                    <div key={warning} className="text-xs text-amber-100/80">
+                      • {warning}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {screenshotResult.extraction.duplicates.length > 0 && (
+              <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
+                <div className="text-xs font-medium text-sky-200">已自动去重 / 排除</div>
+                <div className="mt-2 space-y-1">
+                  {screenshotResult.extraction.duplicates.slice(0, 20).map((item, index) => (
+                    <div key={index} className="text-xs text-slate-400">
+                      • {String(item.raw.raw_text || item.raw.code || item.raw.filename || '重复记录')}
+                      <span className="ml-2 text-sky-400/80">[{item.duplicate_reason || 'duplicate'}]</span>
+                    </div>
+                  ))}
+                  {screenshotResult.extraction.duplicates.length > 20 && (
+                    <div className="text-xs text-slate-500">
+                      另有 {screenshotResult.extraction.duplicates.length - 20} 条未展开
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {screenshotResult.extraction.unresolved.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                <div className="text-xs font-medium text-amber-200">
+                  以下记录不会自动写入，请补充信息后重新识别
+                </div>
+                <div className="mt-2 space-y-2">
+                  {screenshotResult.extraction.unresolved.slice(0, 20).map((item, index) => (
+                    <div key={index} className="rounded border border-slate-700 bg-slate-900/50 p-2 text-xs">
+                      <div className="text-slate-300">
+                        {String(item.raw.raw_text || item.raw.code || item.raw.name || '无法完整识别的记录')}
+                      </div>
+                      <div className="mt-1 text-amber-300">
+                        缺少：{item.missing_fields.join('、') || '未知字段'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {pending && (

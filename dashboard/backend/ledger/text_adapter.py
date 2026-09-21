@@ -36,9 +36,18 @@ _EXPLICIT_PRICE_RE = re.compile(
     rf"(?:成交价|买入价|卖出价|均价|成本价|价格)\s*(?:是|为|[:：])?\s*(?P<value>{_NUMBER})",
     re.IGNORECASE,
 )
-_MONEY_PRICE_RE = re.compile(
+_PER_SHARE_PRICE_RE = re.compile(
     rf"(?P<value>{_NUMBER})\s*(?:美元|美金|港币|港元|人民币|元)"
-    r"(?:\s*(?:一股|每股|/股))?",
+    r"\s*(?:一股|每股|/股)",
+    re.IGNORECASE,
+)
+_TOTAL_AMOUNT_RE = re.compile(
+    rf"(?:总共|一共(?:花)?|总价|总金额|合计|花了|支付|付了)\s*"
+    rf"(?P<value>{_NUMBER})\s*(?:美元|美金|港币|港元|人民币|元)",
+    re.IGNORECASE,
+)
+_MONEY_VALUE_RE = re.compile(
+    rf"(?P<value>{_NUMBER})\s*(?:美元|美金|港币|港元|人民币|元)",
     re.IGNORECASE,
 )
 _SPLITTER = re.compile(r"(?:[；;\n]+|\s*(?:然后|接着|随后)\s*)")
@@ -73,32 +82,38 @@ def _decimal_token(token: Optional[str]) -> Optional[Decimal]:
     return Decimal(token.replace(",", ""))
 
 
-def _extract_fee_tax_price(text: str) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+def _extract_fee_tax_price(
+    text: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """Return fee, tax, per-unit price, and explicit total trade amount."""
     fee_match = _FEE_RE.search(text)
     tax_match = _TAX_RE.search(text)
     fee = _decimal_token(fee_match.group("value")) if fee_match else None
     tax = _decimal_token(tax_match.group("value")) if tax_match else None
 
     price_source = text
-    if fee_match:
-        price_source = price_source[:fee_match.start()] + " " + price_source[fee_match.end():]
-    tax_match_after = _TAX_RE.search(price_source)
-    if tax_match_after:
-        price_source = (
-            price_source[:tax_match_after.start()]
-            + " "
-            + price_source[tax_match_after.end():]
-        )
+    for pattern in (_FEE_RE, _TAX_RE):
+        match = pattern.search(price_source)
+        if match:
+            price_source = price_source[:match.start()] + " " + price_source[match.end():]
 
     explicit = _EXPLICIT_PRICE_RE.search(price_source)
     if explicit:
-        return fee, tax, _decimal_token(explicit.group("value"))
+        return fee, tax, _decimal_token(explicit.group("value")), None
+
+    per_share = _PER_SHARE_PRICE_RE.search(price_source)
+    if per_share:
+        return fee, tax, _decimal_token(per_share.group("value")), None
+
+    total = _TOTAL_AMOUNT_RE.search(price_source)
+    if total:
+        return fee, tax, None, _decimal_token(total.group("value"))
 
     money_values = [
         _decimal_token(match.group("value"))
-        for match in _MONEY_PRICE_RE.finditer(price_source)
+        for match in _MONEY_VALUE_RE.finditer(price_source)
     ]
-    return fee, tax, money_values[-1] if money_values else None
+    return fee, tax, money_values[-1] if money_values else None, None
 
 
 def _split_clauses(message: str) -> List[str]:
@@ -205,7 +220,7 @@ def parse_historical_bookkeeping_text(
             all_warnings.extend(warnings)
             continue
 
-        fee, tax, extracted_price = _extract_fee_tax_price(cleaned)
+        fee, tax, extracted_price, extracted_total = _extract_fee_tax_price(cleaned)
 
         for change in parsed_changes:
             child_action = str(change.get("action_type") or action)
@@ -230,15 +245,23 @@ def parse_historical_bookkeeping_text(
                         f"第{index + 1}条标的沿用上一条：{previous_asset['code']}"
                     )
 
+                quantity = change.get("quantity")
                 if extracted_price is not None:
                     change["cost_price"] = extracted_price
-                    quantity = change.get("quantity")
-                    if quantity is not None:
-                        change["total_cost"] = (
-                            Decimal(str(quantity)) * extracted_price
-                            + (fee or Decimal("0"))
-                            + (tax or Decimal("0"))
-                        )
+                elif extracted_total is not None and quantity not in (None, 0, "0"):
+                    quantity_decimal = Decimal(str(quantity))
+                    change["cost_price"] = extracted_total / quantity_decimal
+                    warnings.append(
+                        f"第{index + 1}条将明确的总成交金额{extracted_total}按数量{quantity_decimal}折算为单价；请核对"
+                    )
+
+                effective_price = change.get("cost_price")
+                if effective_price is not None and quantity is not None:
+                    change["total_cost"] = (
+                        Decimal(str(quantity)) * Decimal(str(effective_price))
+                        + (fee or Decimal("0"))
+                        + (tax or Decimal("0"))
+                    )
                 if fee is not None:
                     change["fee"] = fee
                 if tax is not None:
