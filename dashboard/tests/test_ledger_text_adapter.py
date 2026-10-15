@@ -89,6 +89,34 @@ class HistoricalTextAdapterTest(unittest.TestCase):
         self.assertEqual(event.price, Decimal('87.5'))
         self.assertEqual(event.fee, Decimal('1'))
 
+    def test_explicit_typed_codes_work_in_deterministic_fallback(self):
+        cases = [
+            (
+                '2025年3月12日在IBKR买了2股NVDA，成交价87.5美元，手续费1美元',
+                'NVDA',
+                'USD',
+            ),
+            (
+                '2025年10月21日在长桥买了200股01810.HK，成交价46.52港元',
+                '01810.HK',
+                'HKD',
+            ),
+            (
+                '2025年7月1日在银河买了500股002594，成交价102.384元',
+                '002594',
+                'CNY',
+            ),
+        ]
+        for text, code, currency in cases:
+            with self.subTest(code=code):
+                result = parse_historical_bookkeeping_text(text, reference=REF)
+                event = result.events[0]
+                self.assertEqual(event.code, code)
+                self.assertEqual(event.currency, currency)
+                self.assertTrue(
+                    any('显式证券代码' in warning for warning in result.warnings)
+                )
+
     def test_sell_without_explicit_or_inherited_account_fails(self):
         with self.assertRaisesRegex(ValueError, '缺少字段|缺少账户'):
             parse_historical_bookkeeping_text(

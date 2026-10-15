@@ -1,22 +1,67 @@
+import { useEffect, useRef } from 'react'
 import { RefreshCw, Bell } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { portfolioService } from '@/services'
 
+const FOREGROUND_REFRESH_MS = 60_000
+
 export default function Header() {
   const queryClient = useQueryClient()
+  const refreshingRef = useRef(false)
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio'],
-    queryFn: portfolioService.getLivePortfolio,
-    refetchInterval: 60000,
+    queryFn: portfolioService.getPortfolio,
     refetchOnWindowFocus: false,
   })
 
   const refreshMutation = useMutation({
-    mutationFn: portfolioService.refresh,
+    mutationFn: async () => {
+      if (refreshingRef.current) return null
+      refreshingRef.current = true
+      try {
+        return await portfolioService.refresh()
+      } finally {
+        refreshingRef.current = false
+      }
+    },
     onSuccess: async () => {
       await queryClient.refetchQueries({ queryKey: ['portfolio'], type: 'active' })
     },
   })
+
+  useEffect(() => {
+    let disposed = false
+
+    const refreshIfVisible = () => {
+      if (
+        disposed ||
+        document.visibilityState !== 'visible' ||
+        refreshingRef.current
+      ) {
+        return
+      }
+      refreshMutation.mutate()
+    }
+
+    // Opening/reloading the app should show fresh quotes without waiting for a timer.
+    refreshIfVisible()
+
+    const timer = window.setInterval(refreshIfVisible, FOREGROUND_REFRESH_MS)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        refreshIfVisible()
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+    // The mutation object is stable for the lifetime of this mounted Header.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const formatMoney = (value: number) => {
     return new Intl.NumberFormat('zh-CN', {

@@ -69,6 +69,8 @@ export interface LedgerPreview {
   historical_backfill: boolean
   events: LedgerEvent[]
   projected_state: LedgerState
+  confirm_blocked?: boolean
+  replay_error?: string | null
   interpretation?: {
     warnings: string[]
     clauses: LedgerClause[]
@@ -88,11 +90,78 @@ export interface ScreenshotImageSummary {
   sha256: string
   width: number
   height: number
-  tile_count: number
-  raw_rows: number
+  tile_count?: number
+  raw_rows?: number
+  kind?: string
+  ocr_rows?: number
+}
+
+export interface ReconciliationPositionSnapshot {
+  code?: string | null
+  reported_code?: string | null
+  name?: string | null
+  quantity?: string | null
+  average_cost?: string | null
+  current_price?: string | null
+  market_value?: string | null
+  currency?: string | null
+  unrealized_pnl?: string | null
+  confidence?: number | null
+  inferred_fields?: string[]
+  warnings?: string[]
+}
+
+export interface ReconciliationCashSnapshot {
+  currency: string
+  amount: string
+  label?: string
+  confidence?: number | null
+}
+
+export interface ReconciliationSnapshot {
+  snapshot_id?: string
+  captured_at: string
+  entered_at?: string
+  account: string
+  source: string
+  source_hash: string
+  filename: string
+  model_label: string
+  positions: ReconciliationPositionSnapshot[]
+  cash: ReconciliationCashSnapshot[]
+  metadata: Record<string, unknown>
+  warnings?: string[]
+}
+
+export interface ReconciliationComparisonPosition {
+  account: string
+  code: string
+  currency: string
+  name?: string
+  status: string
+  snapshot_quantity?: string | null
+  ledger_quantity?: string | null
+  quantity_difference?: string | null
+  snapshot_average_cost?: string | null
+  ledger_average_cost?: string | null
+  cost_difference?: string | null
+}
+
+export interface ReconciliationComparison {
+  status: string
+  summary: { matches: number; differences: number }
+  positions: ReconciliationComparisonPosition[]
+  cash: Array<Record<string, string | null>>
+  replay_error?: string | null
+}
+
+export interface ReconciliationPreviewItem {
+  snapshot: ReconciliationSnapshot
+  comparison: ReconciliationComparison
 }
 
 export interface LedgerScreenshotPreview {
+  image_kind?: 'trade_history' | 'holdings_snapshot'
   pending_id: string | null
   status: string
   created_at?: string | null
@@ -100,6 +169,9 @@ export interface LedgerScreenshotPreview {
   historical_backfill: boolean
   events: LedgerEvent[]
   projected_state: LedgerState
+  confirm_blocked?: boolean
+  replay_error?: string | null
+  reconciliation?: { snapshots: ReconciliationPreviewItem[] }
   extraction: {
     model: string
     images: ScreenshotImageSummary[]
@@ -180,15 +252,33 @@ export const ledgerService = {
   async previewScreenshots(
     images: File[],
     accountHint = '',
+    capturedAtHint = '',
   ): Promise<LedgerScreenshotPreview> {
     const form = new FormData()
     images.forEach((image) => form.append('images', image))
     if (accountHint.trim()) form.append('account_hint', accountHint.trim())
+    if (capturedAtHint.trim()) form.append('captured_at_hint', capturedAtHint.trim())
     const response = await api.post<LedgerScreenshotPreview>(
       '/ledger-v3/preview-screenshots',
       form,
       { timeout: 180000 },
     )
+    return response.data
+  },
+
+  async saveReconciliationSnapshot(snapshot: ReconciliationSnapshot): Promise<ReconciliationPreviewItem> {
+    const response = await api.post<ReconciliationPreviewItem>(
+      '/ledger-v3/reconciliation-snapshots',
+      snapshot,
+      { timeout: 30000 },
+    )
+    return response.data
+  },
+
+  async getReconciliationSnapshots(account?: string): Promise<{ count: number; snapshots: ReconciliationPreviewItem[] }> {
+    const response = await api.get('/ledger-v3/reconciliation-snapshots', {
+      params: account ? { account } : undefined,
+    })
     return response.data
   },
 

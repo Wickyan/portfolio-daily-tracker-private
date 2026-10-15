@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -22,6 +23,12 @@ from backend.ledger import (
     create_configured_vision_providers,
     create_local_ocr_fallback,
     transaction_fingerprint_key,
+)
+from backend.ledger.text_llm import parse_historical_bookkeeping_text_with_llm
+from backend.ledger.reconciliation import (
+    classify_screenshot,
+    compare_snapshot_to_ledger,
+    extract_holdings_snapshot,
 )
 
 
@@ -68,6 +75,18 @@ class LedgerTextPreviewRequest(BaseModel):
 class LedgerReverseRequest(BaseModel):
     reason: str = Field(default="", max_length=1000)
     ttl_seconds: int = Field(default=1800, ge=30, le=3600)
+
+
+class ReconciliationSnapshotRequest(BaseModel):
+    captured_at: str
+    account: str = Field(min_length=1, max_length=200)
+    source: str = "screenshot_reconciliation"
+    source_hash: str = Field(min_length=32, max_length=128)
+    filename: str = ""
+    model_label: str = ""
+    positions: List[Dict[str, Any]] = Field(default_factory=list)
+    cash: List[Dict[str, Any]] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 def get_repository() -> TransactionRepository:
@@ -234,6 +253,28 @@ async def preview_events(request: LedgerPreviewRequest):
     }
 
 
+async def interpret_text_input(message: str, *, reference, source: str):
+    try:
+        return await parse_historical_bookkeeping_text_with_llm(
+            message, reference=reference, source=source
+        )
+    except Exception as exc:
+        try:
+            fallback = parse_historical_bookkeeping_text(
+                message, reference=reference, source=source
+            )
+        except ValueError as fallback_exc:
+            raise ValueError(
+                "DeepSeek文字解析不可用，规则解析器也无法安全解析；"
+                f"请补充明确的账户、代码、数量和成交价。规则解析：{fallback_exc}"
+            ) from fallback_exc
+        fallback.warnings.insert(
+            0,
+            f"DeepSeek文字解析不可用，已自动使用规则解析器兜底：{type(exc).__name__}",
+        )
+        return fallback
+
+
 @router.post("/preview-text")
 async def preview_text(request: LedgerTextPreviewRequest):
     reference = None
@@ -251,7 +292,7 @@ async def preview_text(request: LedgerTextPreviewRequest):
         raise HTTPException(status_code=400, detail="source must be text or voice")
 
     try:
-        interpreted = parse_historical_bookkeeping_text(
+        interpreted = await interpret_text_input(
             request.message, reference=reference, source=request.source
         )
     except ValueError as exc:
@@ -303,6 +344,7 @@ def _screenshot_candidate_payload(candidate):
 async def preview_screenshots(
     images: List[UploadFile] = File(...),
     account_hint: str = Form(""),
+    captured_at_hint: str = Form(""),
     ttl_seconds: int = Form(1800),
 ):
     if not images:
@@ -328,6 +370,101 @@ async def preview_screenshots(
             raise HTTPException(status_code=413, detail="本次截图总大小超过150MB")
         payloads.append((image.filename or "screenshot", content))
 
+    try:
+        classifications = await asyncio.gather(
+            *(classify_screenshot(filename, content) for filename, content in payloads)
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"截图OCR/分类失败: {exc}") from exc
+
+    kinds = {str(item.get("kind") or "unknown") for item in classifications}
+    if "unknown" in kinds:
+        unknown_names = [
+            str(item.get("filename") or "screenshot")
+            for item in classifications
+            if item.get("kind") == "unknown"
+        ]
+        raise HTTPException(
+            status_code=400,
+            detail="无法安全判断截图类型，请确认是成交历史或持仓/资产页面：" + ", ".join(unknown_names),
+        )
+    if len(kinds) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="一次上传同时包含成交历史和持仓快照，请分两次上传，避免错误合并",
+        )
+
+    repository = get_repository()
+    existing_rows = repository.list_transactions()
+
+    if kinds == {"holdings_snapshot"}:
+        snapshot_items = []
+        extraction_warnings: List[str] = []
+        for classification in classifications:
+            try:
+                snapshot = await extract_holdings_snapshot(
+                    classification,
+                    account_hint=account_hint.strip(),
+                    captured_at_hint=captured_at_hint.strip(),
+                )
+            except Exception as exc:
+                snapshot = {
+                    "captured_at": captured_at_hint.strip() or datetime.now().astimezone().isoformat(),
+                    "account": account_hint.strip(),
+                    "source": "screenshot_reconciliation",
+                    "source_hash": str(classification.get("sha256") or ""),
+                    "filename": str(classification.get("filename") or ""),
+                    "model_label": "RapidOCR only (DeepSeek unavailable)",
+                    "positions": [],
+                    "cash": [],
+                    "metadata": {
+                        "ocr_row_count": len(classification.get("ocr_rows") or []),
+                        "parse_error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    },
+                    "warnings": [
+                        "已安全识别为持仓/资产快照，但DeepSeek结构化失败；未生成交易、未修改Ledger"
+                    ],
+                }
+            extraction_warnings.extend(snapshot.get("warnings") or [])
+            comparison = compare_snapshot_to_ledger(snapshot, existing_rows)
+            snapshot_items.append({"snapshot": snapshot, "comparison": comparison})
+
+        current_state = replay_transactions(existing_rows)
+        return {
+            "image_kind": "holdings_snapshot",
+            "pending_id": None,
+            "status": "reconciliation_preview",
+            "created_at": None,
+            "expires_at": None,
+            "historical_backfill": False,
+            "events": [],
+            "projected_state": _state_payload(current_state),
+            "extraction": {
+                "model": ", ".join(
+                    sorted({item["snapshot"].get("model_label", "") for item in snapshot_items})
+                ),
+                "images": [
+                    {
+                        "filename": item.get("filename"),
+                        "sha256": item.get("sha256"),
+                        "width": item.get("width"),
+                        "height": item.get("height"),
+                        "kind": item.get("kind"),
+                        "ocr_rows": len(item.get("ocr_rows") or []),
+                    }
+                    for item in classifications
+                ],
+                "warnings": list(dict.fromkeys(extraction_warnings)),
+                "duplicate_count": 0,
+                "duplicates": [],
+                "unresolved_count": sum(
+                    1 for item in snapshot_items if not item["snapshot"].get("positions")
+                ),
+                "unresolved": [],
+            },
+            "reconciliation": {"snapshots": snapshot_items},
+        }
+
     vision = []
     vision_error = None
     try:
@@ -350,8 +487,6 @@ async def preview_screenshots(
             detail += f"；本地OCR: {ocr_error}"
         raise HTTPException(status_code=503, detail=detail)
 
-    repository = get_repository()
-    existing_rows = repository.list_transactions()
     pending_rows = repository.list_active_pending_transactions()
     all_existing_rows = [*existing_rows, *pending_rows]
     existing_keys = {
@@ -384,19 +519,22 @@ async def preview_screenshots(
             pending = get_write_service().create_pending(
                 result.events,
                 ttl_seconds=ttl_seconds,
+                allow_incomplete_history=True,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if pending is not None:
         response = {
-            "pending_id": pending["pending_id"],
+            "pending_id": pending.get("pending_id"),
             "status": pending["status"],
-            "created_at": pending["created_at"],
-            "expires_at": pending["expires_at"],
+            "created_at": pending.get("created_at"),
+            "expires_at": pending.get("expires_at"),
             "historical_backfill": pending["historical_backfill"],
             "events": [_transaction_payload(tx) for tx in pending["events"]],
             "projected_state": _state_payload(pending["projected_state"]),
+            "confirm_blocked": bool(pending.get("confirm_blocked")),
+            "replay_error": pending.get("replay_error"),
         }
     else:
         current_state = replay_transactions(existing_rows)
@@ -410,6 +548,7 @@ async def preview_screenshots(
             "projected_state": _state_payload(current_state),
         }
 
+    response["image_kind"] = "trade_history"
     response["extraction"] = {
         "model": result.model_label,
         "images": result.image_summaries,
@@ -420,6 +559,44 @@ async def preview_screenshots(
         "unresolved": [_screenshot_candidate_payload(item) for item in result.unresolved],
     }
     return response
+
+
+@router.post("/reconciliation-snapshots")
+async def save_reconciliation_snapshot(request: ReconciliationSnapshotRequest):
+    raw_time = request.captured_at.strip()
+    candidate = raw_time[:-1] + "+00:00" if raw_time.endswith("Z") else raw_time
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="captured_at must be ISO datetime") from exc
+    if not request.positions and not request.cash:
+        raise HTTPException(status_code=400, detail="对账快照至少需要一条持仓或现金记录")
+
+    repository = get_repository()
+    try:
+        repository.backup_database()
+        saved = repository.save_reconciliation_snapshot(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    comparison = compare_snapshot_to_ledger(saved, repository.list_transactions())
+    return {"snapshot": saved, "comparison": comparison}
+
+
+@router.get("/reconciliation-snapshots")
+async def list_reconciliation_snapshots(account: Optional[str] = None):
+    repository = get_repository()
+    snapshots = repository.list_reconciliation_snapshots(account=account)
+    transactions = repository.list_transactions()
+    return {
+        "count": len(snapshots),
+        "snapshots": [
+            {
+                "snapshot": snapshot,
+                "comparison": compare_snapshot_to_ledger(snapshot, transactions),
+            }
+            for snapshot in snapshots
+        ],
+    }
 
 
 @router.post("/reverse/{transaction_id}/preview")

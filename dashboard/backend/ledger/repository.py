@@ -132,6 +132,23 @@ class TransactionRepository:
                     events_json TEXT NOT NULL,
                     confirmed_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    entered_at TEXT NOT NULL,
+                    account TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    filename TEXT NOT NULL DEFAULT '',
+                    model_label TEXT NOT NULL DEFAULT '',
+                    positions_json TEXT NOT NULL DEFAULT '[]',
+                    cash_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(account, source_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reconciliation_account_time
+                    ON reconciliation_snapshots(account, captured_at, entered_at);
                 """
             )
 
@@ -311,6 +328,96 @@ class TransactionRepository:
             raise
         finally:
             conn.close()
+
+    def save_reconciliation_snapshot(self, snapshot: Dict) -> Dict:
+        self.initialize()
+        snapshot_id = str(snapshot.get("snapshot_id") or uuid4())
+        entered_at = str(snapshot.get("entered_at") or datetime.now(timezone.utc).isoformat())
+        captured_at = str(snapshot.get("captured_at") or "").strip()
+        account = str(snapshot.get("account") or "").strip()
+        source = str(snapshot.get("source") or "screenshot").strip() or "screenshot"
+        source_hash = str(snapshot.get("source_hash") or "").strip()
+        filename = str(snapshot.get("filename") or "")
+        model_label = str(snapshot.get("model_label") or "")
+        positions = list(snapshot.get("positions") or [])
+        cash = list(snapshot.get("cash") or [])
+        metadata = dict(snapshot.get("metadata") or {})
+        if not captured_at:
+            raise ValueError("captured_at is required")
+        if not account:
+            raise ValueError("account is required")
+        if not source_hash:
+            raise ValueError("source_hash is required")
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO reconciliation_snapshots (
+                        snapshot_id, captured_at, entered_at, account, source,
+                        source_hash, filename, model_label, positions_json,
+                        cash_json, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id, captured_at, entered_at, account, source,
+                        source_hash, filename, model_label,
+                        json.dumps(positions, ensure_ascii=False, sort_keys=True),
+                        json.dumps(cash, ensure_ascii=False, sort_keys=True),
+                        json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"duplicate reconciliation snapshot for account/source: {account}"
+                ) from exc
+        result = self.get_reconciliation_snapshot(snapshot_id)
+        assert result is not None
+        return result
+
+    def get_reconciliation_snapshot(self, snapshot_id: str) -> Optional[Dict]:
+        self.initialize()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM reconciliation_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._snapshot_row_payload(row)
+
+    def list_reconciliation_snapshots(self, *, account: Optional[str] = None) -> List[Dict]:
+        self.initialize()
+        if account:
+            query = (
+                "SELECT * FROM reconciliation_snapshots WHERE account = ? "
+                "ORDER BY captured_at DESC, entered_at DESC"
+            )
+            params = (account,)
+        else:
+            query = (
+                "SELECT * FROM reconciliation_snapshots "
+                "ORDER BY captured_at DESC, entered_at DESC"
+            )
+            params = ()
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._snapshot_row_payload(row) for row in rows]
+
+    @staticmethod
+    def _snapshot_row_payload(row: sqlite3.Row) -> Dict:
+        return {
+            "snapshot_id": row["snapshot_id"],
+            "captured_at": row["captured_at"],
+            "entered_at": row["entered_at"],
+            "account": row["account"],
+            "source": row["source"],
+            "source_hash": row["source_hash"],
+            "filename": row["filename"],
+            "model_label": row["model_label"],
+            "positions": json.loads(row["positions_json"] or "[]"),
+            "cash": json.loads(row["cash_json"] or "[]"),
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+        }
 
     def get(self, transaction_id: str) -> Optional[Transaction]:
         self.initialize()

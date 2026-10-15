@@ -77,6 +77,8 @@ class LedgerApiTest(unittest.TestCase):
         ])
         self.original_get_repository = ledger_v3.get_repository
         self.original_create_vision = ledger_v3.create_configured_vision_providers
+        self.original_interpret_text_input = ledger_v3.interpret_text_input
+        self.original_classify_screenshot = ledger_v3.classify_screenshot
         ledger_v3.get_repository = lambda: self.repo
         ledger_v3.create_configured_vision_providers = lambda: [VisionProviderSpec(
             provider=FakeScreenshotVisionProvider(),
@@ -84,6 +86,23 @@ class LedgerApiTest(unittest.TestCase):
             model="fake",
             label="fake vision",
         )]
+        async def deterministic_text(message, *, reference, source):
+            return ledger_v3.parse_historical_bookkeeping_text(
+                message, reference=reference, source=source
+            )
+        ledger_v3.interpret_text_input = deterministic_text
+
+        async def fake_classify(filename, content):
+            return {
+                "kind": "trade_history",
+                "filename": filename,
+                "sha256": "f" * 64,
+                "width": 800,
+                "height": 1000,
+                "ocr_rows": [],
+                "ocr_text": "历史订单 已成交",
+            }
+        ledger_v3.classify_screenshot = fake_classify
         app = FastAPI()
         app.include_router(ledger_v3.router, prefix="/api/ledger-v3")
         self.client = TestClient(app)
@@ -91,6 +110,8 @@ class LedgerApiTest(unittest.TestCase):
     def tearDown(self):
         ledger_v3.get_repository = self.original_get_repository
         ledger_v3.create_configured_vision_providers = self.original_create_vision
+        ledger_v3.interpret_text_input = self.original_interpret_text_input
+        ledger_v3.classify_screenshot = self.original_classify_screenshot
         self.tmp.cleanup()
 
     def test_transactions_return_exact_decimal_strings(self):
@@ -274,6 +295,205 @@ class LedgerApiTest(unittest.TestCase):
             body["extraction"]["duplicates"][0]["duplicate_reason"],
             "already_in_ledger_or_pending",
         )
+
+    def test_incomplete_historical_screenshot_can_preview_but_cannot_confirm(self):
+        class MissingPrehistoryProvider:
+            async def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content=json.dumps({
+                        "rows": [{
+                            "event_type": "SELL",
+                            "effective_at": "2026-06-09T16:58:49-04:00",
+                            "account": "长桥",
+                            "code": "QQQM",
+                            "name": "QQQM",
+                            "currency": "USD",
+                            "quantity": "4",
+                            "price": "291.70",
+                            "fee": None,
+                            "tax": None,
+                            "order_id": None,
+                            "status": "已成交",
+                            "confidence": 0.99,
+                            "raw_text": "QQQM 卖出4股 已成交",
+                        }],
+                        "warnings": [],
+                    }, ensure_ascii=False),
+                    model="fake",
+                    usage={"prompt_tokens": 0, "completion_tokens": 0},
+                    finish_reason="stop",
+                )
+
+        original = ledger_v3.create_configured_vision_providers
+        ledger_v3.create_configured_vision_providers = lambda: [VisionProviderSpec(
+            provider=MissingPrehistoryProvider(),
+            family="openai",
+            model="fake",
+            label="fake",
+        )]
+        try:
+            response = self.client.post(
+                "/api/ledger-v3/preview-screenshots",
+                files={"images": ("orders.png", screenshot_bytes(), "image/png")},
+                data={"account_hint": "长桥"},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertTrue(body["confirm_blocked"])
+            self.assertIn("cannot sell missing position", body["replay_error"])
+            self.assertEqual(len(body["events"]), 1)
+            self.assertIsNone(body["pending_id"])
+            self.assertEqual(body["status"], "replay_blocked")
+            self.assertEqual(len(self.repo.list_active_pending_transactions()), 0)
+            self.assertEqual(len(self.repo.list_transactions()), 2)
+        finally:
+            ledger_v3.create_configured_vision_providers = original
+
+    def test_holdings_preview_and_save_never_modify_transactions(self):
+        original_classify = ledger_v3.classify_screenshot
+        original_extract = ledger_v3.extract_holdings_snapshot
+
+        async def holdings_classify(filename, content):
+            return {
+                "kind": "holdings_snapshot",
+                "filename": filename,
+                "sha256": "a" * 64,
+                "width": 800,
+                "height": 1000,
+                "ocr_rows": [],
+                "ocr_text": "当前持仓 总资产",
+            }
+
+        async def holdings_extract(classification, **kwargs):
+            return {
+                "captured_at": "2026-10-16T01:00:00+08:00",
+                "account": "IBKR",
+                "source": "screenshot_reconciliation",
+                "source_hash": "a" * 64,
+                "filename": classification["filename"],
+                "model_label": "fake",
+                "positions": [{
+                    "code": "AAPL",
+                    "name": "Apple",
+                    "quantity": "1",
+                    "average_cost": "100",
+                    "current_price": "150",
+                    "market_value": "150",
+                    "currency": "USD",
+                    "unrealized_pnl": "50",
+                    "confidence": 0.99,
+                    "inferred_fields": [],
+                    "warnings": [],
+                }],
+                "cash": [],
+                "metadata": {},
+                "warnings": [],
+            }
+
+        ledger_v3.classify_screenshot = holdings_classify
+        ledger_v3.extract_holdings_snapshot = holdings_extract
+        try:
+            before = len(self.repo.list_transactions())
+            response = self.client.post(
+                "/api/ledger-v3/preview-screenshots",
+                files={"images": ("holdings.png", screenshot_bytes(), "image/png")},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["image_kind"], "holdings_snapshot")
+            self.assertIsNone(body["pending_id"])
+            self.assertEqual(body["events"], [])
+            item = body["reconciliation"]["snapshots"][0]
+            self.assertEqual(item["comparison"]["status"], "match")
+            self.assertEqual(len(self.repo.list_transactions()), before)
+
+            saved = self.client.post(
+                "/api/ledger-v3/reconciliation-snapshots",
+                json=item["snapshot"],
+            )
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(len(self.repo.list_transactions()), before)
+            self.assertEqual(len(self.repo.list_reconciliation_snapshots()), 1)
+
+            duplicate = self.client.post(
+                "/api/ledger-v3/reconciliation-snapshots",
+                json=item["snapshot"],
+            )
+            self.assertEqual(duplicate.status_code, 409, duplicate.text)
+            self.assertEqual(len(self.repo.list_transactions()), before)
+        finally:
+            ledger_v3.classify_screenshot = original_classify
+            ledger_v3.extract_holdings_snapshot = original_extract
+
+    def test_holdings_llm_failure_is_safe_and_never_becomes_trade(self):
+        original_classify = ledger_v3.classify_screenshot
+        original_extract = ledger_v3.extract_holdings_snapshot
+
+        async def holdings_classify(filename, content):
+            return {
+                "kind": "holdings_snapshot",
+                "filename": filename,
+                "sha256": "b" * 64,
+                "width": 800,
+                "height": 1000,
+                "ocr_rows": [{"text": "当前持仓"}],
+                "ocr_text": "当前持仓 总资产",
+            }
+
+        async def fail_extract(*args, **kwargs):
+            raise RuntimeError("injected-deepseek-failure")
+
+        ledger_v3.classify_screenshot = holdings_classify
+        ledger_v3.extract_holdings_snapshot = fail_extract
+        try:
+            before = len(self.repo.list_transactions())
+            response = self.client.post(
+                "/api/ledger-v3/preview-screenshots",
+                files={"images": ("holdings.png", screenshot_bytes(), "image/png")},
+                data={"account_hint": "IBKR"},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["image_kind"], "holdings_snapshot")
+            self.assertEqual(body["events"], [])
+            self.assertIsNone(body["pending_id"])
+            self.assertTrue(any(
+                "未生成交易" in warning
+                for warning in body["extraction"]["warnings"]
+            ))
+            self.assertEqual(len(self.repo.list_transactions()), before)
+        finally:
+            ledger_v3.classify_screenshot = original_classify
+            ledger_v3.extract_holdings_snapshot = original_extract
+
+    def test_mixed_trade_and_holdings_images_are_rejected(self):
+        original = ledger_v3.classify_screenshot
+
+        async def mixed_classify(filename, content):
+            kind = "holdings_snapshot" if "hold" in filename else "trade_history"
+            return {
+                "kind": kind,
+                "filename": filename,
+                "sha256": ("a" if kind == "holdings_snapshot" else "b") * 64,
+                "width": 800,
+                "height": 1000,
+                "ocr_rows": [],
+                "ocr_text": "",
+            }
+
+        ledger_v3.classify_screenshot = mixed_classify
+        try:
+            response = self.client.post(
+                "/api/ledger-v3/preview-screenshots",
+                files=[
+                    ("images", ("trade.png", screenshot_bytes(), "image/png")),
+                    ("images", ("hold.png", screenshot_bytes(), "image/png")),
+                ],
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("分两次上传", response.json()["detail"])
+        finally:
+            ledger_v3.classify_screenshot = original
 
     def test_reverse_sell_preview_confirm_restores_position(self):
         rows = self.repo.list_transactions()

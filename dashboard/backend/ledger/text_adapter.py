@@ -116,6 +116,43 @@ def _extract_fee_tax_price(
     return fee, tax, money_values[-1] if money_values else None, None
 
 
+def _extract_explicit_security_code(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract a code the user literally typed; never searches or guesses."""
+    raw = str(text or "")
+    token_patterns = [
+        re.compile(
+            r"(?:\d+(?:\.\d+)?)\s*(?:股|份|个)\s*"
+            r"(?P<code>(?:HK)?\d{4,6}(?:\.HK)?|[A-Z]{1,7}(?:\.[A-Z]{1,3})?)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?P<code>(?:HK)?\d{4,6}(?:\.HK)?|[A-Z]{1,7}(?:\.[A-Z]{1,3})?)\b"
+            r"\s*(?:买入|卖出|买了|卖了|买|卖)",
+            re.IGNORECASE,
+        ),
+    ]
+    code = None
+    for pattern in token_patterns:
+        match = pattern.search(raw)
+        if match:
+            code = match.group("code").upper()
+            break
+    if not code:
+        return None, None
+
+    if code.startswith("HK") and code[2:].isdigit():
+        return f"{code[2:].zfill(5)}.HK", "HKD"
+    if code.endswith(".HK") and code[:-3].isdigit():
+        return f"{code[:-3].zfill(5)}.HK", "HKD"
+    if code.isdigit():
+        if len(code) == 6:
+            return code, "CNY"
+        if len(code) in {4, 5}:
+            return f"{code.zfill(5)}.HK", "HKD"
+    if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", code):
+        return code, "USD"
+    return None, None
+
 def _split_clauses(message: str) -> List[str]:
     return [part.strip(" ，,。") for part in _SPLITTER.split(str(message or "")) if part.strip(" ，,。")]
 
@@ -236,6 +273,16 @@ def parse_historical_bookkeeping_text(
                 change.pop("account", None)
 
             if child_action in _POSITION_ACTIONS:
+                if not change.get("code"):
+                    explicit_code, explicit_currency = _extract_explicit_security_code(cleaned)
+                    if explicit_code:
+                        change["code"] = explicit_code
+                        change["currency"] = change.get("currency") or explicit_currency
+                        change["asset_type"] = "stock"
+                        warnings.append(
+                            f"第{index + 1}条从用户原文读取显式证券代码：{explicit_code}"
+                        )
+
                 if not change.get("code") and previous_asset.get("code"):
                     change["code"] = previous_asset["code"]
                     change["name"] = previous_asset.get("name")

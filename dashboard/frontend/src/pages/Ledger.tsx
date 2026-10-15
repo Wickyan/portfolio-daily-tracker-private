@@ -6,8 +6,6 @@ import {
   Clock3,
   History,
   ImagePlus,
-  Mic,
-  MicOff,
   RefreshCw,
   Search,
   Send,
@@ -23,19 +21,6 @@ import ledgerService, {
   type LedgerScreenshotPreview,
   type LedgerState,
 } from '@/services/ledger'
-
-type SpeechRecognitionLike = {
-  lang: string
-  continuous: boolean
-  interimResults: boolean
-  onresult: ((event: any) => void) | null
-  onerror: ((event: any) => void) | null
-  onend: (() => void) | null
-  start: () => void
-  stop: () => void
-}
-
-type SpeechRecognitionCtor = new () => SpeechRecognitionLike
 
 const ACTION_LABELS: Record<string, string> = {
   BUY: '买入',
@@ -106,17 +91,8 @@ function eventDescription(event: LedgerEvent) {
     : event.code || event.name || '账户事件'
 }
 
-function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
-  const browserWindow = window as typeof window & {
-    SpeechRecognition?: SpeechRecognitionCtor
-    webkitSpeechRecognition?: SpeechRecognitionCtor
-  }
-  return browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition || null
-}
-
 export default function Ledger() {
   const [input, setInput] = useState('')
-  const [inputSource, setInputSource] = useState<'text' | 'voice'>('text')
   const [pending, setPending] = useState<LedgerPreview | null>(null)
   const [transactions, setTransactions] = useState<LedgerEvent[]>([])
   const [state, setState] = useState<LedgerState | null>(null)
@@ -126,14 +102,14 @@ export default function Ledger() {
   const [confirming, setConfirming] = useState(false)
   const [reversingId, setReversingId] = useState('')
   const [refreshing, setRefreshing] = useState(false)
-  const [listening, setListening] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [screenshotFiles, setScreenshotFiles] = useState<File[]>([])
   const [screenshotAccount, setScreenshotAccount] = useState('')
+  const [screenshotCapturedAt, setScreenshotCapturedAt] = useState('')
   const [screenshotLoading, setScreenshotLoading] = useState(false)
   const [screenshotResult, setScreenshotResult] = useState<LedgerScreenshotPreview | null>(null)
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
+  const [savingSnapshotHash, setSavingSnapshotHash] = useState('')
   const screenshotInputRef = useRef<HTMLInputElement | null>(null)
 
   const refreshAll = async (stateDate?: string) => {
@@ -155,7 +131,6 @@ export default function Ledger() {
 
   useEffect(() => {
     void refreshAll()
-    return () => recognitionRef.current?.stop()
   }, [])
 
   const filteredTransactions = useMemo(() => {
@@ -175,47 +150,6 @@ export default function Ledger() {
         .some((value) => String(value).toLowerCase().includes(needle)),
     )
   }, [transactions, filter])
-
-  const startVoice = () => {
-    setError('')
-    setNotice('')
-    const Recognition = getSpeechRecognitionCtor()
-    if (!Recognition) {
-      setError('当前浏览器不支持语音识别。可以先使用文字输入，或换用支持 Web Speech API 的浏览器。')
-      return
-    }
-
-    const recognition = new Recognition()
-    recognition.lang = 'zh-CN'
-    recognition.continuous = false
-    recognition.interimResults = false
-    const base = input.trim()
-
-    recognition.onresult = (event: any) => {
-      const transcript = String(event.results?.[0]?.[0]?.transcript || '').trim()
-      if (!transcript) return
-      setInput(base ? `${base}；${transcript}` : transcript)
-      setInputSource('voice')
-      setNotice('语音已转成文字，请先核对文字，再生成确认卡。')
-    }
-    recognition.onerror = (event: any) => {
-      setError(`语音识别失败：${event.error || '未知错误'}`)
-    }
-    recognition.onend = () => {
-      setListening(false)
-      recognitionRef.current = null
-    }
-
-    recognitionRef.current = recognition
-    setListening(true)
-    recognition.start()
-  }
-
-  const stopVoice = () => {
-    recognitionRef.current?.stop()
-    recognitionRef.current = null
-    setListening(false)
-  }
 
   const addScreenshotFiles = (incoming: File[]) => {
     const valid = incoming.filter((file) => {
@@ -248,19 +182,38 @@ export default function Ledger() {
 
   const previewScreenshotInput = async () => {
     if (!screenshotFiles.length) {
-      setError('请先选择至少一张订单截图。')
+      setError('请先选择至少一张截图。')
       return
     }
     setScreenshotLoading(true)
     setError('')
     setNotice('')
     try {
+      const capturedAtHint = screenshotCapturedAt
+        ? ledgerService.localReferenceTime(new Date(screenshotCapturedAt))
+        : ''
       const result = await ledgerService.previewScreenshots(
         screenshotFiles,
         screenshotAccount,
+        capturedAtHint,
       )
       setScreenshotResult(result)
-      if (result.pending_id && result.created_at && result.expires_at) {
+      if (result.image_kind === 'holdings_snapshot') {
+        setPending(null)
+        const snapshots = result.reconciliation?.snapshots || []
+        const differences = snapshots.reduce(
+          (sum, item) => sum + (item.comparison.summary?.differences || 0),
+          0,
+        )
+        setNotice(
+          `已识别为持仓/资产对账快照，共 ${snapshots.length} 张；当前发现 ${differences} 项账本差异。快照不会自动修改交易流水。`,
+        )
+      } else if (result.confirm_blocked && result.events.length > 0) {
+        setPending(null)
+        setNotice(
+          `截图识别出 ${result.events.length} 条成交记录，但当前历史前置数据不完整，暂不能写入Ledger。请先补更早交易、Opening Position或转仓来源；识别结果仍可核对。`,
+        )
+      } else if (result.pending_id && result.created_at && result.expires_at) {
         setPending({
           pending_id: result.pending_id,
           status: result.status,
@@ -269,6 +222,8 @@ export default function Ledger() {
           historical_backfill: result.historical_backfill,
           events: result.events,
           projected_state: result.projected_state,
+          confirm_blocked: result.confirm_blocked,
+          replay_error: result.replay_error,
         })
         setNotice(
           `截图识别出 ${result.events.length} 条新订单；已去重 ${result.extraction.duplicate_count} 条，无法确定 ${result.extraction.unresolved_count} 条。请核对确认卡后再写入。`,
@@ -286,9 +241,43 @@ export default function Ledger() {
     }
   }
 
+  const saveReconciliationSnapshot = async (index: number) => {
+    const item = screenshotResult?.reconciliation?.snapshots?.[index]
+    if (!item) return
+    if (!item.snapshot.account.trim()) {
+      setError('这张持仓截图没有识别到账户。请在“账户提示”填写账户后重新识别。')
+      return
+    }
+    if (!item.snapshot.positions.length && !item.snapshot.cash.length) {
+      setError('这张快照没有可保存的持仓或现金记录。')
+      return
+    }
+    setSavingSnapshotHash(item.snapshot.source_hash)
+    setError('')
+    try {
+      const saved = await ledgerService.saveReconciliationSnapshot(item.snapshot)
+      setScreenshotResult((current) => {
+        if (!current?.reconciliation) return current
+        const next = [...current.reconciliation.snapshots]
+        next[index] = saved
+        return {
+          ...current,
+          reconciliation: { snapshots: next },
+        }
+      })
+      setNotice(
+        `对账快照已保存：${saved.snapshot.account} · ${displayTime(saved.snapshot.captured_at)}。交易Ledger未被修改。`,
+      )
+    } catch (err) {
+      setError(getApiErrorMessage(err))
+    } finally {
+      setSavingSnapshotHash('')
+    }
+  }
+
   const previewInput = async () => {
     if (!input.trim()) {
-      setError('请先输入或说出一条交易记录。')
+      setError('请先输入一条交易记录。')
       return
     }
     setLoading(true)
@@ -297,7 +286,7 @@ export default function Ledger() {
     try {
       const result = await ledgerService.previewText(
         input.trim(),
-        inputSource,
+        'text',
         ledgerService.localReferenceTime(),
       )
       setPending(result)
@@ -328,7 +317,6 @@ export default function Ledger() {
       )
       setPending(null)
       setInput('')
-      setInputSource('text')
       if (confirmingScreenshot) {
         setScreenshotFiles([])
         setScreenshotResult(null)
@@ -414,34 +402,19 @@ export default function Ledger() {
             </p>
           </div>
           <span className="rounded-full bg-slate-700 px-2.5 py-1 text-xs text-slate-300">
-            {inputSource === 'voice' ? '语音来源' : '文字来源'}
+            文字输入
           </span>
         </div>
 
         <textarea
           value={input}
-          onChange={(event) => {
-            setInput(event.target.value)
-            setInputSource('text')
-          }}
+          onChange={(event) => setInput(event.target.value)}
           rows={4}
           placeholder="可以输入今天的交易，也可以一次性补录任意历史日期……"
           className="w-full resize-y rounded-lg border border-slate-600 bg-slate-900 px-3 py-3 text-sm text-slate-100 outline-none transition focus:border-primary-500"
         />
 
         <div className="mt-3 flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={listening ? stopVoice : startVoice}
-            className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition ${
-              listening
-                ? 'bg-rose-600 text-white hover:bg-rose-500'
-                : 'border border-slate-600 bg-slate-700 text-slate-100 hover:bg-slate-600'
-            }`}
-          >
-            {listening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-            {listening ? '停止聆听' : '语音输入'}
-          </button>
           <button
             type="button"
             onClick={() => void previewInput()}
@@ -458,8 +431,7 @@ export default function Ledger() {
               setPending(null)
               setError('')
               setNotice('')
-              setInputSource('text')
-            }}
+                    }}
             className="rounded-lg px-3 py-2 text-sm text-slate-400 hover:bg-slate-700 hover:text-slate-200"
           >
             清空
@@ -484,10 +456,10 @@ export default function Ledger() {
           <div>
             <h2 className="flex items-center gap-2 font-semibold text-white">
               <ImagePlus className="h-5 w-5 text-primary-400" />
-              历史订单截图导入
+              图片导入 / 对账
             </h2>
             <p className="mt-1 text-xs text-slate-400">
-              支持短截图、超长截图和多张截图。长图会自动重叠切片；相同订单会在切片、多图、待确认和已确认账本之间去重。
+              自动区分成交历史和持仓/资产快照。成交历史生成待确认交易；持仓快照只用于对账，不会直接修改Ledger。
             </p>
           </div>
           <span className="rounded-full border border-slate-600 bg-slate-900 px-2.5 py-1 text-xs text-slate-400">
@@ -532,6 +504,16 @@ export default function Ledger() {
             />
             <p className="mt-2 text-[11px] leading-5 text-slate-500">
               截图本身看不出账户时才使用；截图能明确读到账户时，以截图内容为准。
+            </p>
+            <label className="mt-4 block text-xs font-medium text-slate-300">快照时间（可选）</label>
+            <input
+              type="datetime-local"
+              value={screenshotCapturedAt}
+              onChange={(event) => setScreenshotCapturedAt(event.target.value)}
+              className="mt-2 w-full rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-primary-500"
+            />
+            <p className="mt-2 text-[11px] leading-5 text-slate-500">
+              仅持仓对账需要准确时间。留空时优先从截图文件名读取；读不到才使用当前时间。
             </p>
           </div>
         </div>
@@ -594,85 +576,261 @@ export default function Ledger() {
 
         {screenshotResult && (
           <div className="mt-5 space-y-3">
-            <div className="grid gap-2 sm:grid-cols-3">
-              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
-                <div className="text-xs text-emerald-300">新订单</div>
-                <div className="mt-1 text-xl font-semibold text-white">{screenshotResult.events.length}</div>
-              </div>
-              <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3">
-                <div className="text-xs text-sky-300">自动去重 / 非成交</div>
-                <div className="mt-1 text-xl font-semibold text-white">
-                  {screenshotResult.extraction.duplicate_count}
+            {screenshotResult.image_kind === 'holdings_snapshot' ? (
+              <>
+                <div className="rounded-lg border border-violet-500/30 bg-violet-500/10 p-4">
+                  <div className="font-medium text-violet-200">已识别为持仓 / 资产对账快照</div>
+                  <div className="mt-1 text-xs leading-5 text-violet-100/70">
+                    这些数据只用于和指定时点的 Ledger Replay 做对账。保存快照不会新增、删除或修改任何交易。
+                  </div>
                 </div>
-              </div>
-              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-                <div className="text-xs text-amber-300">字段不完整</div>
-                <div className="mt-1 text-xl font-semibold text-white">
-                  {screenshotResult.extraction.unresolved_count}
-                </div>
-              </div>
-            </div>
 
-            <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-400">
-              <div>识别方式：{screenshotResult.extraction.model}</div>
-              {screenshotResult.extraction.images.map((image) => (
-                <div key={image.sha256} className="mt-1">
-                  {image.filename} · {image.width}×{image.height} · {image.tile_count} 个切片 ·
-                  识别原始行 {image.raw_rows}
-                </div>
-              ))}
-            </div>
-
-            {screenshotResult.extraction.warnings.length > 0 && (
-              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-                <div className="text-xs font-medium text-amber-200">截图识别提醒</div>
-                <div className="mt-2 space-y-1">
-                  {Array.from(new Set(screenshotResult.extraction.warnings)).slice(0, 30).map((warning) => (
-                    <div key={warning} className="text-xs text-amber-100/80">
-                      • {warning}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {screenshotResult.extraction.duplicates.length > 0 && (
-              <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
-                <div className="text-xs font-medium text-sky-200">已自动去重 / 排除</div>
-                <div className="mt-2 space-y-1">
-                  {screenshotResult.extraction.duplicates.slice(0, 20).map((item, index) => (
-                    <div key={index} className="text-xs text-slate-400">
-                      • {String(item.raw.raw_text || item.raw.code || item.raw.filename || '重复记录')}
-                      <span className="ml-2 text-sky-400/80">[{item.duplicate_reason || 'duplicate'}]</span>
-                    </div>
-                  ))}
-                  {screenshotResult.extraction.duplicates.length > 20 && (
-                    <div className="text-xs text-slate-500">
-                      另有 {screenshotResult.extraction.duplicates.length - 20} 条未展开
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {screenshotResult.extraction.unresolved.length > 0 && (
-              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-                <div className="text-xs font-medium text-amber-200">
-                  以下记录不会自动写入，请补充信息后重新识别
-                </div>
-                <div className="mt-2 space-y-2">
-                  {screenshotResult.extraction.unresolved.slice(0, 20).map((item, index) => (
-                    <div key={index} className="rounded border border-slate-700 bg-slate-900/50 p-2 text-xs">
-                      <div className="text-slate-300">
-                        {String(item.raw.raw_text || item.raw.code || item.raw.name || '无法完整识别的记录')}
+                {(screenshotResult.reconciliation?.snapshots || []).map((item, index) => (
+                  <div
+                    key={item.snapshot.source_hash || index}
+                    className="rounded-lg border border-slate-700 bg-slate-900/60 p-4"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div className="font-medium text-slate-100">
+                          {item.snapshot.account || '账户未识别'}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          截图时间：{displayTime(item.snapshot.captured_at)} · {item.snapshot.filename}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          识别方式：{item.snapshot.model_label}
+                        </div>
                       </div>
-                      <div className="mt-1 text-amber-300">
-                        缺少：{item.missing_fields.join('、') || '未知字段'}
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`rounded-full border px-2.5 py-1 text-xs ${
+                            item.comparison.status === 'match'
+                              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                              : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                          }`}
+                        >
+                          {item.comparison.status === 'match'
+                            ? '账本一致'
+                            : `差异 ${item.comparison.summary?.differences || 0} 项`}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void saveReconciliationSnapshot(index)}
+                          disabled={
+                            !item.snapshot.account ||
+                            (!item.snapshot.positions.length && !item.snapshot.cash.length) ||
+                            savingSnapshotHash === item.snapshot.source_hash ||
+                            Boolean(item.snapshot.snapshot_id)
+                          }
+                          className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {item.snapshot.snapshot_id
+                            ? '已保存'
+                            : savingSnapshotHash === item.snapshot.source_hash
+                              ? '保存中…'
+                              : '保存对账快照'}
+                        </button>
                       </div>
                     </div>
+
+                    <div className="mt-4 overflow-x-auto rounded border border-slate-700">
+                      <table className="min-w-full text-xs">
+                        <thead className="bg-slate-800 text-left text-slate-400">
+                          <tr>
+                            <th className="px-3 py-2">标的</th>
+                            <th className="px-3 py-2 text-right">截图数量</th>
+                            <th className="px-3 py-2 text-right">账本数量</th>
+                            <th className="px-3 py-2 text-right">差异</th>
+                            <th className="px-3 py-2 text-right">截图成本</th>
+                            <th className="px-3 py-2 text-right">账本成本</th>
+                            <th className="px-3 py-2">状态</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {item.comparison.positions.map((row) => (
+                            <tr
+                              key={`${row.code}-${row.currency}`}
+                              className="border-t border-slate-700 text-slate-300"
+                            >
+                              <td className="px-3 py-2">
+                                <div>{row.code}</div>
+                                <div className="text-slate-500">{row.name}</div>
+                              </td>
+                              <td className="px-3 py-2 text-right">{compactNumber(row.snapshot_quantity)}</td>
+                              <td className="px-3 py-2 text-right">{compactNumber(row.ledger_quantity)}</td>
+                              <td className="px-3 py-2 text-right">{compactNumber(row.quantity_difference)}</td>
+                              <td className="px-3 py-2 text-right">{compactNumber(row.snapshot_average_cost)}</td>
+                              <td className="px-3 py-2 text-right">{compactNumber(row.ledger_average_cost)}</td>
+                              <td
+                                className={`px-3 py-2 ${
+                                  row.status === 'match' ? 'text-emerald-300' : 'text-amber-300'
+                                }`}
+                              >
+                                {row.status}
+                              </td>
+                            </tr>
+                          ))}
+                          {!item.comparison.positions.length && (
+                            <tr>
+                              <td colSpan={7} className="px-3 py-5 text-center text-slate-500">
+                                暂无可比较的证券持仓。若账户未识别，请填写上方“账户提示”后重新识别。
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {item.comparison.cash.length > 0 && (
+                      <div className="mt-3 overflow-x-auto rounded border border-slate-700">
+                        <table className="min-w-full text-xs">
+                          <thead className="bg-slate-800 text-left text-slate-400">
+                            <tr>
+                              <th className="px-3 py-2">现金币种</th>
+                              <th className="px-3 py-2 text-right">截图余额</th>
+                              <th className="px-3 py-2 text-right">账本余额</th>
+                              <th className="px-3 py-2 text-right">差异</th>
+                              <th className="px-3 py-2">状态</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {item.comparison.cash.map((row, cashIndex) => (
+                              <tr key={`${String(row.currency)}-${cashIndex}`} className="border-t border-slate-700 text-slate-300">
+                                <td className="px-3 py-2">{String(row.currency || '')}</td>
+                                <td className="px-3 py-2 text-right">{compactNumber(row.snapshot_amount as string | null)}</td>
+                                <td className="px-3 py-2 text-right">{compactNumber(row.ledger_amount as string | null)}</td>
+                                <td className="px-3 py-2 text-right">{compactNumber(row.difference as string | null)}</td>
+                                <td className={`px-3 py-2 ${row.status === 'match' ? 'text-emerald-300' : 'text-amber-300'}`}>
+                                  {String(row.status || '')}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {item.snapshot.positions.length > 0 && (
+                      <div className="mt-3 text-xs text-slate-500">
+                        截图解析到 {item.snapshot.positions.length} 个持仓
+                        {item.snapshot.cash.length ? ` · ${item.snapshot.cash.length} 个现金余额` : ''}
+                      </div>
+                    )}
+
+                    {(item.snapshot.warnings || []).length > 0 && (
+                      <div className="mt-3 rounded border border-amber-500/20 bg-amber-500/5 p-2">
+                        {(item.snapshot.warnings || []).slice(0, 15).map((warning) => (
+                          <div key={warning} className="text-xs text-amber-100/70">• {warning}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </>
+            ) : (
+              <>
+                {screenshotResult.confirm_blocked && (
+                  <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-4">
+                    <div className="font-medium text-rose-200">已识别，但历史前置数据尚未补齐</div>
+                    <div className="mt-1 text-xs leading-5 text-rose-100/70">
+                      {screenshotResult.replay_error || '需要先补更早交易、Opening Position 或转仓来源。'}
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      {screenshotResult.events.map((event, index) => (
+                        <div key={event.transaction_id} className="rounded border border-slate-700 bg-slate-900/50 p-2 text-xs text-slate-300">
+                          <span className="mr-2 text-slate-500">#{index + 1}</span>
+                          <span className="mr-2">{displayTime(event.effective_at)}</span>
+                          <span className="mr-2">{actionLabel(event.event_type)}</span>
+                          <span>{eventDescription(event)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
+                    <div className="text-xs text-emerald-300">新订单</div>
+                    <div className="mt-1 text-xl font-semibold text-white">{screenshotResult.events.length}</div>
+                  </div>
+                  <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3">
+                    <div className="text-xs text-sky-300">自动去重 / 非成交</div>
+                    <div className="mt-1 text-xl font-semibold text-white">
+                      {screenshotResult.extraction.duplicate_count}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                    <div className="text-xs text-amber-300">字段不完整</div>
+                    <div className="mt-1 text-xl font-semibold text-white">
+                      {screenshotResult.extraction.unresolved_count}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-400">
+                  <div>识别方式：{screenshotResult.extraction.model}</div>
+                  {screenshotResult.extraction.images.map((image) => (
+                    <div key={image.sha256} className="mt-1">
+                      {image.filename} · {image.width}×{image.height}
+                      {image.tile_count ? ` · ${image.tile_count} 个切片` : ''}
+                      {image.raw_rows !== undefined ? ` · 识别原始行 ${image.raw_rows}` : ''}
+                    </div>
                   ))}
                 </div>
-              </div>
+
+                {screenshotResult.extraction.warnings.length > 0 && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                    <div className="text-xs font-medium text-amber-200">截图识别提醒</div>
+                    <div className="mt-2 space-y-1">
+                      {Array.from(new Set(screenshotResult.extraction.warnings)).slice(0, 30).map((warning) => (
+                        <div key={warning} className="text-xs text-amber-100/80">
+                          • {warning}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {screenshotResult.extraction.duplicates.length > 0 && (
+                  <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
+                    <div className="text-xs font-medium text-sky-200">已自动去重 / 排除</div>
+                    <div className="mt-2 space-y-1">
+                      {screenshotResult.extraction.duplicates.slice(0, 20).map((item, index) => (
+                        <div key={index} className="text-xs text-slate-400">
+                          • {String(item.raw.raw_text || item.raw.code || item.raw.filename || '重复记录')}
+                          <span className="ml-2 text-sky-400/80">[{item.duplicate_reason || 'duplicate'}]</span>
+                        </div>
+                      ))}
+                      {screenshotResult.extraction.duplicates.length > 20 && (
+                        <div className="text-xs text-slate-500">
+                          另有 {screenshotResult.extraction.duplicates.length - 20} 条未展开
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {screenshotResult.extraction.unresolved.length > 0 && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+                    <div className="text-xs font-medium text-amber-200">
+                      以下记录不会自动写入，请补充信息后重新识别
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      {screenshotResult.extraction.unresolved.slice(0, 20).map((item, index) => (
+                        <div key={index} className="rounded border border-slate-700 bg-slate-900/50 p-2 text-xs">
+                          <div className="text-slate-300">
+                            {String(item.raw.raw_text || item.raw.code || item.raw.name || '无法完整识别的记录')}
+                          </div>
+                          <div className="mt-1 text-amber-300">
+                            缺少：{item.missing_fields.join('、') || '未知字段'}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -734,10 +892,19 @@ export default function Ledger() {
             </div>
           ) : null}
 
+          {pending.confirm_blocked && (
+            <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3">
+              <div className="text-sm font-medium text-rose-200">当前批次只能核对，暂不能确认写入</div>
+              <div className="mt-1 text-xs leading-5 text-rose-100/70">
+                Ledger Replay 检测到历史前置数据缺失：{pending.replay_error || '需要先补齐更早交易或期初持仓。'}
+              </div>
+            </div>
+          )}
+
           <div className="mt-4 flex flex-wrap gap-2">
             <button
               onClick={() => void confirmPending()}
-              disabled={confirming}
+              disabled={confirming || pending.confirm_blocked}
               className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
             >
               <CheckCircle2 className="h-4 w-4" />

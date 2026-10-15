@@ -7,8 +7,7 @@ export default function PortfolioPanel() {
   const queryClient = useQueryClient()
   const { data: portfolio, isLoading } = useQuery({
     queryKey: ['portfolio'],
-    queryFn: portfolioService.getLivePortfolio,
-    refetchInterval: 60000,
+    queryFn: portfolioService.getPortfolio,
     refetchOnWindowFocus: false,
   })
 

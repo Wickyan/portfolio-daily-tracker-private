@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { TrendingUp, TrendingDown, RefreshCw, Edit2, Trash2, X, Save, PlusCircle, RotateCcw } from 'lucide-react'
 import { portfolioService } from '@/services'
 import type { Position } from '@/types'
@@ -207,7 +207,6 @@ export default function Portfolio() {
   const queryClient = useQueryClient()
   const [editingPosition, setEditingPosition] = useState<Position | null>(null)
   const [showAddDialog, setShowAddDialog] = useState(false)
-  const [autoRefresh, setAutoRefresh] = useState(true)
 
   const {
     data: portfolio,
@@ -227,13 +226,6 @@ export default function Portfolio() {
     },
   })
 
-  useEffect(() => {
-    if (!autoRefresh) return
-    const timer = window.setInterval(() => {
-      if (!refreshQuotesMutation.isPending) refreshQuotesMutation.mutate()
-    }, 60000)
-    return () => window.clearInterval(timer)
-  }, [autoRefresh])
 
   const { data: operations = [], refetch: refetchOperations } = useQuery({
     queryKey: ['portfolio', 'operations'],
@@ -408,15 +400,6 @@ export default function Portfolio() {
         <div className="p-6 border-b border-slate-700 flex justify-between items-center">
           <div className="flex items-center space-x-4">
             <h2 className="text-xl font-semibold">持仓明细</h2>
-            <label className="flex items-center text-sm text-slate-400 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoRefresh}
-                onChange={(e) => setAutoRefresh(e.target.checked)}
-                className="mr-2 rounded"
-              />
-              自动刷新(60s)
-            </label>
           </div>
           <div className="flex gap-3">
             <button

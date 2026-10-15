@@ -328,7 +328,7 @@ def _ocr_tile_sync(tile: ImageTile) -> List[Dict[str, Any]]:
 
 
 def create_configured_text_provider() -> Tuple[LLMProvider, str]:
-    """Create the currently selected text LLM for OCR-to-transaction structuring."""
+    """Create the currently selected text LLM for structured interpretation."""
     config = get_config()
     group = config.get_current_api_group()
     model_id = config.get_current_model()
@@ -342,7 +342,7 @@ def create_configured_text_provider() -> Tuple[LLMProvider, str]:
         timeout=120,
     )
     provider = create_llm_provider(ptype, llm_config, group.get("headers"))
-    label = f"本地 RapidOCR + {group.get('name', 'Text LLM')} / {model_id}"
+    label = f"{group.get('name', 'Text LLM')} / {model_id}"
     return provider, label
 
 
@@ -438,7 +438,7 @@ class LocalOCRTextFallback:
 
 def create_local_ocr_fallback() -> LocalOCRTextFallback:
     provider, label = create_configured_text_provider()
-    return LocalOCRTextFallback(provider, label)
+    return LocalOCRTextFallback(provider, f"本地 RapidOCR + {label}")
 
 
 def _load_normalized_image(content: bytes) -> Image.Image:
