@@ -36,6 +36,23 @@ class FakeOCRFallback:
         return self.rows, ["使用OCR兜底"]
 
 
+class SequencedVisionProvider:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    async def chat(self, messages, **kwargs):
+        index = min(self.calls, len(self.responses) - 1)
+        self.calls += 1
+        payload = {'rows': self.responses[index], 'warnings': []}
+        return LLMResponse(
+            content=json.dumps(payload, ensure_ascii=False),
+            model='fake-sequence',
+            usage={'prompt_tokens': 0, 'completion_tokens': 0},
+            finish_reason='stop',
+        )
+
+
 class FakeVisionProvider:
     def __init__(self, rows):
         self.rows = rows
@@ -153,6 +170,176 @@ class ScreenshotExtractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(d.duplicate_reason == 'overlap_or_multi_image' for d in result.duplicates))
         self.assertEqual(result.events[0].account, '长桥')
         self.assertEqual(str(result.events[0].price), '87.5')
+
+    async def test_broker_market_prefix_codes_dedupe_across_images(self):
+        base = dict(self.row)
+        base.update({
+            'order_id': None,
+            'event_type': 'BUY',
+            'effective_at': '2026-02-03T11:51:01-05:00',
+            'code': 'ALLW',
+            'quantity': '62',
+            'price': '28.70',
+            'raw_text': 'USALLW 62 28.70 买入 已成交',
+        })
+        prefixed = dict(base)
+        prefixed['code'] = 'USALLW'
+
+        provider = SequencedVisionProvider([[base], [prefixed]])
+        extractor = ScreenshotLedgerExtractor(
+            VisionProviderSpec(provider=provider, family='openai', model='fake', label='fake')
+        )
+        result = await extractor.extract([
+            ('first.png', make_png(text='first')),
+            ('second.png', make_png(text='second')),
+        ])
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.events[0].code, 'ALLW')
+        self.assertEqual(len(result.duplicates), 1)
+        self.assertEqual(result.duplicates[0].duplicate_reason, 'overlap_or_multi_image')
+
+    async def test_date_only_overlap_prefers_full_execution_time(self):
+        date_only = dict(self.row)
+        date_only.update({
+            'order_id': None,
+            'event_type': 'SELL',
+            'effective_at': '2025-11-07',
+            'code': 'USTQQQ',
+            'quantity': '5',
+            'price': '100.96',
+            'raw_text': 'USTQQQ 5 100.96 卖出 已成交',
+        })
+        full_time = dict(date_only)
+        full_time['effective_at'] = '2025-11-07T12:48:18-05:00'
+
+        provider = SequencedVisionProvider([[date_only], [full_time]])
+        extractor = ScreenshotLedgerExtractor(
+            VisionProviderSpec(provider=provider, family='openai', model='fake', label='fake')
+        )
+        result = await extractor.extract([
+            ('first.png', make_png(text='first')),
+            ('second.png', make_png(text='second')),
+        ])
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.events[0].code, 'TQQQ')
+        self.assertEqual(result.events[0].effective_at, '2025-11-07T12:48:18-05:00')
+        self.assertEqual(len(result.duplicates), 1)
+
+    async def test_same_day_same_fill_but_different_times_are_not_deduped(self):
+        first = dict(self.row)
+        first.update({
+            'order_id': None,
+            'effective_at': '2025-11-07T12:48:18-05:00',
+            'code': 'TQQQ',
+            'quantity': '5',
+            'price': '100.96',
+        })
+        second = dict(first)
+        second['effective_at'] = '2025-11-07T13:01:02-05:00'
+
+        provider = SequencedVisionProvider([[first], [second]])
+        extractor = ScreenshotLedgerExtractor(
+            VisionProviderSpec(provider=provider, family='openai', model='fake', label='fake')
+        )
+        result = await extractor.extract([
+            ('first.png', make_png(text='first')),
+            ('second.png', make_png(text='second')),
+        ])
+        self.assertEqual(len(result.events), 2)
+        self.assertEqual(len(result.duplicates), 0)
+
+    async def test_incomplete_fragment_matches_complete_trade(self):
+        complete = dict(self.row)
+        complete.update({
+            'order_id': None,
+            'event_type': 'SELL',
+            'effective_at': '2026-05-13T11:00:01-04:00',
+            'code': 'NVDA',
+            'quantity': '1',
+            'price': '226.50',
+            'raw_text': 'USNVDA 卖出 1 226.50 已成交 11:00:01美东',
+        })
+        fragment = dict(complete)
+        fragment['code'] = 'USNVDA'
+        fragment['quantity'] = None
+        fragment['raw_text'] = 'USNVDA 卖出 226.50 已成交 11:00:01美东'
+
+        provider = SequencedVisionProvider([[complete], [fragment]])
+        extractor = ScreenshotLedgerExtractor(
+            VisionProviderSpec(provider=provider, family='openai', model='fake', label='fake')
+        )
+        result = await extractor.extract([
+            ('first.png', make_png(text='first')),
+            ('second.png', make_png(text='second')),
+        ])
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(len(result.unresolved), 0)
+        self.assertEqual(len(result.duplicates), 1)
+        self.assertEqual(result.duplicates[0].duplicate_reason, 'overlap_partial')
+
+    async def test_unresolved_overlap_is_folded_once(self):
+        first = dict(self.row)
+        first.update({
+            'order_id': None,
+            'event_type': 'SELL',
+            'effective_at': '2026-01-06T09:20:08',
+            'code': 'HK01810',
+            'currency': 'HKD',
+            'quantity': '400',
+            'price': None,
+            'raw_text': 'HK01810 400 卖出 已成交 2026.01.06 09:20:08',
+        })
+        second = dict(first)
+        second['code'] = '01810'
+        second['effective_at'] = '2026-01-06'
+
+        provider = SequencedVisionProvider([[first], [second]])
+        extractor = ScreenshotLedgerExtractor(
+            VisionProviderSpec(provider=provider, family='openai', model='fake', label='fake')
+        )
+        result = await extractor.extract([
+            ('first.png', make_png(text='first')),
+            ('second.png', make_png(text='second')),
+        ])
+        self.assertEqual(len(result.unresolved), 1)
+        self.assertEqual(len(result.duplicates), 1)
+        self.assertEqual(result.duplicates[0].duplicate_reason, 'overlap_unresolved')
+
+    async def test_broker_timezone_is_filled_from_raw_text(self):
+        row = dict(self.row)
+        row.update({
+            'order_id': None,
+            'effective_at': '2025-11-07T12:48:18',
+            'code': 'USTQQQ',
+            'quantity': '5',
+            'price': '100.96',
+            'raw_text': 'USTQQQ 5 100.96 已成交 12:48:18美东',
+        })
+        extractor, _provider = self.extractor([row])
+        result = await extractor.extract([('one.png', make_png())])
+        self.assertEqual(result.events[0].code, 'TQQQ')
+        self.assertEqual(
+            result.events[0].effective_at,
+            '2025-11-07T12:48:18-05:00',
+        )
+
+        hk = dict(self.row)
+        hk.update({
+            'order_id': None,
+            'effective_at': '2025-10-21T16:08:09',
+            'code': 'HK01810',
+            'currency': 'HKD',
+            'quantity': '200',
+            'price': '46.52',
+            'raw_text': 'HK01810 200 46.52 已成交 16:08:09',
+        })
+        extractor, _provider = self.extractor([hk])
+        hk_result = await extractor.extract([('hk.png', make_png(text='hk'))])
+        self.assertEqual(hk_result.events[0].code, '01810.HK')
+        self.assertEqual(
+            hk_result.events[0].effective_at,
+            '2025-10-21T16:08:09+08:00',
+        )
 
     async def test_existing_ledger_key_is_deduplicated(self):
         extractor, _provider = self.extractor()

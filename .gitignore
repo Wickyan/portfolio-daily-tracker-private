@@ -62,3 +62,6 @@ htmlcov/
 .env.*
 !.env.example
 docker-compose.override.yml
+
+# Local real brokerage screenshots used for acceptance testing
+e.g./

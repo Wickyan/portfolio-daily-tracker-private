@@ -22,6 +22,7 @@ import threading
 
 import httpx
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -366,8 +367,8 @@ Return only JSON:
       "price": "per-unit execution price or null",
       "total_amount": "explicit total trade amount or null",
       "amount": "cash-event amount or null",
-      "fee": "decimal or 0",
-      "tax": "decimal or 0",
+      "fee": "decimal or null",
+      "tax": "decimal or null",
       "order_id": "order/execution id if visible or null",
       "status": "exact status text if visible or null",
       "confidence": 0.0,
@@ -558,6 +559,234 @@ def _normalize_account(value: Any) -> str:
     return aliases.get(compact, raw)
 
 
+def _normalize_security_code(
+    code: Any,
+    currency: Optional[str],
+    raw_text: str = "",
+) -> Optional[str]:
+    """Normalize broker display codes without guessing the security identity.
+
+    Longbridge prefixes US/HK market identifiers in the UI (for example
+    USNVDA or HK01810). The LLM may return either the prefixed UI code or the
+    plain ticker, so dedupe must collapse both representations.
+    """
+    raw = re.sub(r"\s+", "", str(code or "").upper())
+    if not raw:
+        return None
+
+    text = re.sub(r"\s+", "", str(raw_text or "").upper())
+    currency = str(currency or "").upper().strip()
+
+    if currency == "USD":
+        if raw.startswith("US") and len(raw) > 2:
+            # If OCR visibly contains "US" + raw, raw itself is likely a real
+            # ticker beginning with US (e.g. USO shown as USUSO). Otherwise
+            # treat the first US as the broker market prefix.
+            if f"US{raw}" not in text:
+                candidate = raw[2:]
+                if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", candidate):
+                    raw = candidate
+        return raw
+
+    if currency == "HKD":
+        if raw.startswith("HK") and raw[2:].isdigit():
+            return f"{raw[2:].zfill(5)}.HK"
+        if raw.endswith(".HK") and raw[:-3].isdigit():
+            return f"{raw[:-3].zfill(5)}.HK"
+        if raw.isdigit() and len(raw) <= 5:
+            return f"{raw.zfill(5)}.HK"
+        return raw
+
+    if currency == "CNY":
+        match = re.fullmatch(r"(?:SH|SZ)(\d{6})", raw)
+        if match:
+            return match.group(1)
+
+    return raw
+
+
+def _normalize_reported_effective_at(
+    value: Any,
+    *,
+    raw_text: str,
+    currency: Optional[str],
+    code: Optional[str],
+) -> str:
+    normalized = normalize_event_time(value)
+    if _time_precision(value) != "datetime":
+        return normalized
+
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is not None:
+        return normalized
+
+    text = str(raw_text or "")
+    zone_name: Optional[str] = None
+    if "美东" in text or re.search(r"\b(?:ET|EST|EDT)\b", text, re.IGNORECASE):
+        zone_name = "America/New_York"
+    elif str(currency or "").upper() == "HKD" and str(code or "").upper().endswith(".HK"):
+        zone_name = "Asia/Hong_Kong"
+    elif str(currency or "").upper() == "CNY":
+        zone_name = "Asia/Shanghai"
+
+    if zone_name is None:
+        return normalized
+    return parsed.replace(tzinfo=ZoneInfo(zone_name)).isoformat()
+
+
+def _time_precision(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "missing"
+    # Date-only rows are common at screenshot/tile boundaries.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return "date"
+    return "datetime"
+
+
+def _event_day(value: Any) -> str:
+    try:
+        return normalize_event_time(value)[:10]
+    except ValueError:
+        return str(value or "").strip()[:10]
+
+
+def _overlap_signature_from_event(tx: Transaction) -> Tuple[str, ...]:
+    return (
+        tx.account,
+        tx.event_type.value,
+        str(tx.code or "").upper(),
+        str(tx.currency or "").upper(),
+        _event_day(tx.effective_at),
+        _canonical_decimal(tx.quantity),
+        _canonical_decimal(tx.price),
+        _canonical_decimal(tx.amount),
+    )
+
+
+def _unresolved_overlap_signature(
+    candidate: ScreenshotCandidate,
+    account_hint: str,
+) -> Tuple[str, ...]:
+    row = candidate.raw
+    event_type = _normalize_event_type(row.get("event_type") or row.get("action"))
+    account = _normalize_account(row.get("account") or account_hint)
+    currency = str(row.get("currency") or "").strip().upper() or None
+    raw_text = str(row.get("raw_text") or "")
+    code = _normalize_security_code(
+        row.get("code") or row.get("ticker"),
+        currency,
+        raw_text,
+    )
+    effective_at = str(
+        row.get("effective_at") or row.get("trade_time") or row.get("date") or ""
+    ).strip()
+    quantity = _money(row.get("quantity"))
+    price = _money(row.get("price"))
+    amount = _money(row.get("amount") or row.get("total_amount"))
+    return (
+        account,
+        event_type.value if event_type else "",
+        str(code or ""),
+        str(currency or ""),
+        _event_day(effective_at),
+        _canonical_decimal(quantity),
+        _canonical_decimal(price),
+        _canonical_decimal(amount),
+        ",".join(sorted(candidate.missing_fields)),
+    )
+
+
+def _unresolved_matches_event(
+    candidate: ScreenshotCandidate,
+    event: Transaction,
+    account_hint: str,
+) -> bool:
+    """Match an incomplete tile-boundary row to an already complete event."""
+    row = candidate.raw
+    event_type = _normalize_event_type(row.get("event_type") or row.get("action"))
+    if event_type is None or event_type != event.event_type:
+        return False
+
+    account = _normalize_account(row.get("account") or account_hint)
+    if account != event.account:
+        return False
+
+    currency = str(row.get("currency") or "").strip().upper() or None
+    if currency and currency != event.currency:
+        return False
+
+    raw_text = str(row.get("raw_text") or "")
+    code = _normalize_security_code(
+        row.get("code") or row.get("ticker"),
+        currency or event.currency,
+        raw_text,
+    )
+    if code and code != event.code:
+        return False
+
+    raw_effective_at = str(
+        row.get("effective_at") or row.get("trade_time") or row.get("date") or ""
+    ).strip()
+    if raw_effective_at:
+        if _event_day(raw_effective_at) != _event_day(event.effective_at):
+            return False
+        row_precision = _time_precision(raw_effective_at)
+        event_precision = str(event.metadata.get("time_precision") or "datetime")
+        normalized_row_time = _normalize_reported_effective_at(
+            raw_effective_at,
+            raw_text=raw_text,
+            currency=currency or event.currency,
+            code=code or event.code,
+        )
+        if not _times_are_compatible_for_overlap(
+            str(event.effective_at),
+            event_precision,
+            normalized_row_time,
+            row_precision,
+        ):
+            return False
+
+    quantity = _money(row.get("quantity"))
+    if quantity is not None and quantity != event.quantity:
+        return False
+    price = _money(row.get("price"))
+    if price is not None and price != event.price:
+        return False
+    amount = _money(row.get("amount") or row.get("total_amount"))
+    if amount is not None and amount != event.amount:
+        return False
+
+    # Require at least one substantive trade field besides identity/date.
+    return quantity is not None or price is not None or amount is not None
+
+
+def _times_are_compatible_for_overlap(
+    previous_time: str,
+    previous_precision: str,
+    current_time: str,
+    current_precision: str,
+) -> bool:
+    """Return True when two same-day economic rows can be screenshot overlap.
+
+    If both screenshots clearly report different execution times, they are
+    separate trades even when quantity/price happen to match. If either side
+    only contains a date (a common tile-boundary OCR loss), the richer row may
+    safely replace the date-only candidate while still requiring confirmation.
+    """
+    if previous_precision != "datetime" or current_precision != "datetime":
+        return True
+    try:
+        previous = datetime.fromisoformat(previous_time)
+        current = datetime.fromisoformat(current_time)
+    except ValueError:
+        return previous_time == current_time
+
+    if (previous.tzinfo is None) != (current.tzinfo is None):
+        return previous.replace(tzinfo=None) == current.replace(tzinfo=None)
+    return previous == current
+
+
 def _normalize_event_type(value: Any) -> Optional[TransactionType]:
     token = str(value or "").strip().upper()
     aliases = {
@@ -665,15 +894,24 @@ def _row_to_candidate(
     if not effective_at:
         missing.append("effective_at")
 
-    code = str(row.get("code") or row.get("ticker") or "").strip().upper() or None
     name = str(row.get("name") or "").strip() or None
     currency = str(row.get("currency") or "").strip().upper() or None
+    raw_text = str(row.get("raw_text") or "")
+    reported_code = str(row.get("code") or row.get("ticker") or "").strip().upper() or None
+    code = _normalize_security_code(reported_code, currency, raw_text)
     quantity = _money(row.get("quantity"))
     price = _money(row.get("price"))
     total_amount = _money(row.get("total_amount"))
+    fee_observed = row.get("fee") not in (None, "")
+    tax_observed = row.get("tax") not in (None, "")
     fee = _money(row.get("fee")) or Decimal("0")
     tax = _money(row.get("tax")) or Decimal("0")
     amount = _money(row.get("amount"))
+
+    if event_type in {TransactionType.BUY, TransactionType.SELL} and not fee_observed:
+        warnings.append("截图未显示手续费，暂按0计；如需精确成本/收益请用交割单或后续补录")
+    if event_type in {TransactionType.BUY, TransactionType.SELL} and not tax_observed:
+        warnings.append("截图未显示税费，暂按0计；如需精确成本/收益请用交割单或后续补录")
 
     if price is None and total_amount is not None and quantity not in (None, Decimal("0")):
         price = total_amount / quantity
@@ -701,7 +939,12 @@ def _row_to_candidate(
 
     assert event_type is not None
     try:
-        normalized_effective_at = normalize_event_time(effective_at)
+        normalized_effective_at = _normalize_reported_effective_at(
+            effective_at,
+            raw_text=raw_text,
+            currency=currency,
+            code=code,
+        )
     except ValueError:
         return ScreenshotCandidate(
             event=None,
@@ -727,10 +970,14 @@ def _row_to_candidate(
         "tile_y0": tile.y0,
         "tile_y1": tile.y1,
         "vision_confidence": row.get("confidence"),
-        "raw_text": str(row.get("raw_text") or "")[:1000],
+        "raw_text": raw_text[:1000],
+        "reported_code": reported_code or "",
         "order_id": str(row.get("order_id") or row.get("execution_id") or ""),
         "dedupe_basis": dedupe_basis,
         "fingerprint": fingerprint,
+        "time_precision": _time_precision(effective_at),
+        "fee_observed": fee_observed,
+        "tax_observed": tax_observed,
     }
 
     try:
@@ -785,8 +1032,8 @@ Return:
       "price": "per-unit execution price or null",
       "total_amount": "total trade amount if explicitly shown or null",
       "amount": "cash-event amount or null",
-      "fee": "decimal or 0",
-      "tax": "decimal or 0",
+      "fee": "decimal or null",
+      "tax": "decimal or null",
       "order_id": "broker order/execution id if visible or null",
       "status": "exact status text if visible or null",
       "confidence": 0.0,
@@ -915,6 +1162,11 @@ class ScreenshotLedgerExtractor:
         existing_fingerprints = set(existing_fingerprint_keys or [])
         seen_images: set[str] = set()
         seen_keys: set[Tuple[str, str]] = set()
+        # Multiple legitimate same-day trades can share quantity/price, so
+        # overlap signatures keep a list and only collapse rows whose reported
+        # times are compatible.
+        seen_overlap: Dict[Tuple[str, ...], List[Tuple[int, str, str]]] = {}
+        seen_unresolved: Dict[Tuple[str, ...], List[Tuple[str, str]]] = {}
         events: List[Transaction] = []
         duplicates: List[ScreenshotCandidate] = []
         unresolved: List[ScreenshotCandidate] = []
@@ -954,6 +1206,62 @@ class ScreenshotLedgerExtractor:
                         duplicates.append(candidate)
                         continue
                     if candidate.event is None:
+                        if any(
+                            _unresolved_matches_event(candidate, event, account_hint)
+                            for event in events
+                        ):
+                            candidate.duplicate_reason = "overlap_partial"
+                            candidate.warnings.append(
+                                "字段不完整的截图残片已与完整成交记录匹配并折叠"
+                            )
+                            duplicates.append(candidate)
+                            continue
+                        unresolved_signature = _unresolved_overlap_signature(candidate, account_hint)
+                        raw_effective_at = str(
+                            candidate.raw.get("effective_at")
+                            or candidate.raw.get("trade_time")
+                            or candidate.raw.get("date")
+                            or ""
+                        ).strip()
+                        unresolved_precision = _time_precision(raw_effective_at)
+                        unresolved_currency = str(
+                            candidate.raw.get("currency") or ""
+                        ).strip().upper() or None
+                        unresolved_raw_text = str(candidate.raw.get("raw_text") or "")
+                        unresolved_code = _normalize_security_code(
+                            candidate.raw.get("code") or candidate.raw.get("ticker"),
+                            unresolved_currency,
+                            unresolved_raw_text,
+                        )
+                        unresolved_time = (
+                            _normalize_reported_effective_at(
+                                raw_effective_at,
+                                raw_text=unresolved_raw_text,
+                                currency=unresolved_currency,
+                                code=unresolved_code,
+                            )
+                            if raw_effective_at
+                            else ""
+                        )
+                        prior_unresolved = seen_unresolved.get(unresolved_signature, [])
+                        compatible_unresolved = any(
+                            _times_are_compatible_for_overlap(
+                                previous_time,
+                                previous_precision,
+                                unresolved_time,
+                                unresolved_precision,
+                            )
+                            for previous_precision, previous_time in prior_unresolved
+                        )
+                        if compatible_unresolved:
+                            candidate.duplicate_reason = "overlap_unresolved"
+                            candidate.warnings.append(
+                                "与其他截图/切片中的同一条字段不完整订单重复，已折叠"
+                            )
+                            duplicates.append(candidate)
+                            continue
+                        prior_unresolved.append((unresolved_precision, unresolved_time))
+                        seen_unresolved[unresolved_signature] = prior_unresolved
                         unresolved.append(candidate)
                         continue
                     key = (candidate.event.account, str(candidate.event.external_trade_id or ""))
@@ -962,6 +1270,41 @@ class ScreenshotLedgerExtractor:
                         candidate.warnings.append("与本次上传已识别订单重复，已折叠")
                         duplicates.append(candidate)
                         continue
+                    overlap_signature = _overlap_signature_from_event(candidate.event)
+                    current_precision = str(
+                        candidate.event.metadata.get("time_precision") or "datetime"
+                    )
+                    current_time = str(candidate.event.effective_at)
+                    prior_overlap = seen_overlap.get(overlap_signature, [])
+                    matching_prior = next(
+                        (
+                            (event_index, previous_precision, previous_time)
+                            for event_index, previous_precision, previous_time in prior_overlap
+                            if _times_are_compatible_for_overlap(
+                                previous_time,
+                                previous_precision,
+                                current_time,
+                                current_precision,
+                            )
+                        ),
+                        None,
+                    )
+                    if matching_prior is not None:
+                        event_index, previous_precision, previous_time = matching_prior
+                        # Prefer the row that contains an actual execution time
+                        # over a boundary OCR row that only contains the date.
+                        if previous_precision != "datetime" and current_precision == "datetime":
+                            events[event_index] = candidate.event
+                            prior_overlap.remove(matching_prior)
+                            prior_overlap.append((event_index, current_precision, current_time))
+                        seen_keys.add(key)
+                        candidate.duplicate_reason = "overlap_or_multi_image"
+                        candidate.warnings.append(
+                            "与相邻截图/切片中的同一成交重复，已折叠"
+                        )
+                        duplicates.append(candidate)
+                        continue
+
                     if key in existing:
                         candidate.duplicate_reason = "already_in_ledger_or_pending"
                         candidate.warnings.append("账本或待确认批次中已存在相同订单，已去重")
@@ -979,7 +1322,27 @@ class ScreenshotLedgerExtractor:
                         )
                         duplicates.append(candidate)
                         continue
+                    resolved_fragment_indices = [
+                        index
+                        for index, unresolved_candidate in enumerate(unresolved)
+                        if _unresolved_matches_event(
+                            unresolved_candidate,
+                            candidate.event,
+                            account_hint,
+                        )
+                    ]
+                    for index in reversed(resolved_fragment_indices):
+                        fragment = unresolved.pop(index)
+                        fragment.duplicate_reason = "overlap_partial"
+                        fragment.warnings.append(
+                            "字段不完整的截图残片已与完整成交记录匹配并折叠"
+                        )
+                        duplicates.append(fragment)
+
                     seen_keys.add(key)
+                    seen_overlap.setdefault(overlap_signature, []).append(
+                        (len(events), current_precision, current_time)
+                    )
                     if candidate.warnings:
                         warnings.extend(
                             f"{filename} 第{tile.index + 1}片: {warning}"
